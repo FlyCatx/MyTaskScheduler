@@ -7,7 +7,6 @@
 生成的命令、不操作任何外部应用。依赖边 `A → B` 表示 **B 必须在 A 完成后执行**。
 
 - 设计与算法：见 [DESIGN.md](DESIGN.md)
-- 验证矩阵（哪些实测通过、哪些未执行）：见 [VERIFICATION.md](VERIFICATION.md)
 - 变更记录：见 [CHANGELOG.md](CHANGELOG.md)
 
 ---
@@ -43,9 +42,7 @@ Flutter 界面的构建、运行、目录结构与协议边界见 [flutter_app/R
 | 文件 | TXT/MD/PDF/DOCX/PPTX 本地文本提取（扫描 PDF 明确不支持 OCR；旧 .doc/.ppt 不支持）。 |
 | 关于 | 真实版本 0.05、检查更新灰色禁用、诊断信息默认折叠。 |
 
-详细 0.05 验收：[docs/TASKSCHEDULER_0_05_ACCEPTANCE_REPORT.md](docs/TASKSCHEDULER_0_05_ACCEPTANCE_REPORT.md)；
 需求映射：[docs/0_05_REQUIREMENTS_MAP.md](docs/0_05_REQUIREMENTS_MAP.md)。
-界面优化（七项）：[docs/UI_POLISH_ACCEPTANCE_REPORT.md](docs/UI_POLISH_ACCEPTANCE_REPORT.md)。
 
 关键约束（与 0.0.3 的既有行为一致）：
 
@@ -120,11 +117,6 @@ powershell -ExecutionPolicy Bypass -File scripts/build.ps1 -Test
 | 4 提示词 + libcurl multi 通信 / 取消 / 错误处理 / 有限重试 | 完成并实测（含本地模拟服务 29 场景） |
 | 5 Win32 GUI / 后台线程 / 120 秒提醒 / 本地编辑重排 | 完成；GUI 端到端 32 项断言实测 |
 | 6 TXT / JSON 导出 | 完成并实测（真实写盘 + 读回校验） |
-| 7 构建 / 配置 / 运行 / 本地模型切换 / 验证状态 | 完成（本文件 + [VERIFICATION.md](VERIFICATION.md)） |
-| 8 真实依赖构建 | 完成（见 [VERIFICATION.md](VERIFICATION.md) §2–3） |
-| 9 真实 DeepSeek 端到端 + 三类业务样例 | **已执行并成功**（见 §2–3 与 [VERIFICATION.md](VERIFICATION.md) §3.5–3.6） |
-| 10 便携 ZIP 打包 | 见 `scripts/make_release.ps1` 与 [VERIFICATION.md](VERIFICATION.md) §5 |
-| 11 Flutter 0.05 会话生命周期/快捷键/任务/迁移/通知/文件提取 | 完成并实测：C 测试全过、CTest 15/15、`flutter analyze` 0 issue、`flutter test` 328 passed/1 skipped、Release + 0.05 打包成功、真实 GUI 21 张截图；系统通知显示/点击、规模性能、真实云端未验证 |
 
 ---
 
@@ -134,7 +126,6 @@ powershell -ExecutionPolicy Bypass -File scripts/build.ps1 -Test
 TaskScheduler/
 ├─ CMakeLists.txt             构建定义（自动使用 third_party/curl）
 ├─ config.example.json        云端（DeepSeek）配置模板
-├─ README.md / DESIGN.md / VERIFICATION.md / CHANGELOG.md
 ├─ scripts/
 │  ├─ fetch_deps.ps1          获取真实 cJSON / libcurl / CA 证书包
 │  ├─ build.ps1               可复现构建（独立目录 + 可选测试）
@@ -157,7 +148,6 @@ TaskScheduler/
    ├─ test_*.c                控制台回归与集成测试
    ├─ mock_server.py          测试用本地 OpenAI 兼容模拟服务（仅测试）
    ├─ run_http_tests.ps1      一键跑本地 HTTP 集成测试
-   ├─ run_business_samples.ps1 + check_sample_result.py   三类业务样例验收
    └─ validate_*.py           静态校验脚本
 ```
 
@@ -197,7 +187,6 @@ TaskScheduler/
 
 ```powershell
 # 当前会话有效
-$env:DEEPSEEK_API_KEY = "sk-..."
 # 或永久写入用户环境变量（设置后需重开终端 / 重启程序）
 setx DEEPSEEK_API_KEY "sk-..."
 ```
@@ -403,9 +392,6 @@ powershell -ExecutionPolicy Bypass -File tests/run_http_tests.ps1
 # GUI 端到端验收（真实窗口 + 消息循环 + mock 响应）
 .\build-vs\Release\ts_test_gui.exe
 
-# 三类业务样例（需要 DEEPSEEK_API_KEY；会消耗少量额度）
-$env:DEEPSEEK_API_KEY = "sk-..."
-powershell -ExecutionPolicy Bypass -File tests/run_business_samples.ps1
 ```
 
 测试工具（`tests/mock_server.py`、Python 检查脚本）**只用于测试**，
@@ -425,7 +411,6 @@ powershell -ExecutionPolicy Bypass -File scripts/make_release.ps1
 - `libcurl-x64.dll`（唯一需要的非系统 DLL，依赖已用 `dumpbin` 核实）
 - `cacert.pem`（TLS 根证书包）
 - `config.example.json`（云端）与 `config.local.example.json`（本地兼容模型）——**不含密钥**
-- `README.md`、`DESIGN.md`、`VERIFICATION.md`、`CHANGELOG.md`、`VERSION.txt`
 - `licenses/`（cJSON、curl、LibreSSL、nghttp2/3、ngtcp2、brotli、zstd、zlib-ng、libssh2、libpsl）
 - `MANIFEST.sha256`（包内每个文件的 SHA-256）
 
