@@ -1,0 +1,35 @@
+# Build outputs
+/build*/
+/build-real/
+/build-vs/
+/out/
+/dist/
+.vs/
+.tooltmp/
+
+# Flutter and Dart generated files
+flutter_app/.dart_tool/
+flutter_app/build/
+flutter_app/test_tmp/
+flutter_app/windows/flutter/ephemeral/
+
+# Local logs, settings, and secret material
+*.log
+config.json
+.env
+.env.*
+!.env.example
+
+# Local AI and cloud acceptance inputs, outputs, captures, and reports
+/acceptance/
+/VERIFICATION.md
+/docs/acceptance/
+/docs/archive/
+/docs/screenshots*/
+/docs/*ACCEPTANCE_REPORT.md
+/docs/*.png
+/flutter_app/ts_probe_*.json
+/flutter_app/ts_bridge_dart_test.json
+/flutter_app/settings.json
+/tests/run_business_samples.ps1
+/tests/check_sample_result.py

@@ -1,0 +1,29 @@
+{
+  "endpoint_url": "https://api.deepseek.com/chat/completions",
+  "model": "deepseek-flash",
+  "api_key": "",
+  "api_key_env": "DEEPSEEK_API_KEY",
+  "ca_bundle_path": "cacert.pem",
+  "reasoning_effort": "high",
+  "connect_timeout_ms": 15000,
+  "wait_prompt_ms": 120000,
+  "request_timeout_ms": 0,
+  "max_output_tokens": 0,
+  "max_input_bytes": 262144,
+  "max_response_bytes": 2097152,
+  "json_mode": true,
+  "temperature": 0.2,
+  "reference_hours": 2.0,
+  "weights": {
+    "urgency": 0.35,
+    "impact": 0.30,
+    "blocking": 0.20,
+    "quick_win": 0.10,
+    "depth": 0.05
+  },
+  "max_tasks": 200,
+  "max_steps_per_task": 50,
+  "max_retry_attempts": 1,
+  "mock_mode": false
+}
+
