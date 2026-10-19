@@ -17,7 +17,6 @@ TaskScheduler is a Windows desktop application for turning notes and documents i
 - `tests/` — automated unit and local mock-service tests
 - `scripts/` — dependency, build, and packaging scripts
 - `third_party/` — vendored cJSON and libcurl files with licenses
-- `docs/` — design and requirements documents
 
 Local build outputs, user settings, logs, one-off AI acceptance inputs, UI captures, and temporary probe files are excluded from this repository.
 
