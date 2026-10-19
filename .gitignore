@@ -33,3 +33,10 @@ config.json
 /flutter_app/settings.json
 /tests/run_business_samples.ps1
 /tests/check_sample_result.py
+
+# One-off acceptance, UI probe, and demo-seed scripts
+/scripts/acceptance_ui*.ps1
+/scripts/capture_*.ps1
+/scripts/gui_probe.ps1
+/scripts/ui_*_probe.ps1
+/flutter_app/tool/seed_demo_data.dart
