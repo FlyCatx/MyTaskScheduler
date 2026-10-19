@@ -1,0 +1,28 @@
+name: taskscheduler_flutter
+description: "TaskScheduler 桌面界面（Flutter），复用现有 C 内核的校验、依赖与排序。"
+publish_to: 'none'
+version: 0.1.0+10
+
+environment:
+  sdk: ">=3.6.0 <4.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  # FFI helpers (malloc/Utf8) for talking to ts_bridge.dll.
+  ffi: ^2.1.0
+  # SHA-256 for the local execution signature (never model-provided).
+  crypto: ^3.0.3
+  # Local document text extraction (DOCX/PPTX zip + OOXML). Both are pure Dart
+  # and MIT licensed. `xml` is pinned below 6.6.0 so the project keeps its
+  # existing Dart >=3.6.0 lower bound (6.6+ requires Dart 3.8).
+  archive: ^4.5.2
+  xml: ">=6.5.0 <6.6.0"
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+
+flutter:
+  uses-material-design: true
+

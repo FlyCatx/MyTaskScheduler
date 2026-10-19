@@ -1,0 +1,18 @@
+include: package:flutter_lints/flutter.yaml
+
+analyzer:
+  language:
+    strict-casts: false
+  errors:
+    # Generated runner code is not ours to clean up.
+    unused_element: warning
+  exclude:
+    - build/**
+    - windows/**
+
+linter:
+  rules:
+    prefer_const_constructors: true
+    prefer_final_locals: true
+    avoid_print: true
+
