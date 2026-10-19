@@ -1,0 +1,62 @@
+{
+  "schema_version": "1.0",
+  "tasks": [
+    {
+      "id": "M1",
+      "name": "整理需求",
+      "depends_on": [],
+      "preconditions": [
+        {
+          "description": "已获得材料",
+          "status": "met"
+        }
+      ],
+      "steps": [
+        "通读材料",
+        "列出清单"
+      ],
+      "urgency": 4,
+      "urgency_reason": "M1 的紧迫性理由",
+      "impact": 5,
+      "impact_reason": "M1 的影响力理由",
+      "estimated_hours": 2.0,
+      "estimate_reason": "经验估计",
+      "deadline": null,
+      "source_refs": [
+        "句子1"
+      ]
+    },
+    {
+      "id": "M2",
+      "name": "搭建骨架",
+      "depends_on": [
+        "M1"
+      ],
+      "preconditions": [],
+      "steps": [
+        "创建目录",
+        "配置构建"
+      ],
+      "urgency": 3,
+      "urgency_reason": "M2 的紧迫性理由",
+      "impact": 4,
+      "impact_reason": "M2 的影响力理由",
+      "estimated_hours": null,
+      "estimate_reason": null,
+      "deadline": null,
+      "source_refs": [
+        "句子2"
+      ]
+    }
+  ],
+  "assumptions": [
+    "材料即为全部待办"
+  ],
+  "questions": [
+    "API Key 何时就绪？"
+  ],
+  "suggested_order": [
+    "M1",
+    "M2"
+  ]
+}

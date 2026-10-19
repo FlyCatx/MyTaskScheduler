@@ -1,0 +1,26 @@
+{
+  "schema_version": "1.0",
+  "tasks": [
+    {
+      "id": "M1",
+      "name": "任务一",
+      "depends_on": [
+        "NOPE"
+      ],
+      "preconditions": [],
+      "steps": [
+        "一步"
+      ],
+      "urgency": 3,
+      "urgency_reason": "M1 的紧迫性理由",
+      "impact": 3,
+      "impact_reason": "M1 的影响力理由",
+      "estimated_hours": 1.0,
+      "estimate_reason": "经验估计",
+      "deadline": null,
+      "source_refs": [
+        "句子1"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,17 @@
+{
+  "schema_version": "1.0",
+  "tasks": [
+    {
+      "id": "M1",
+      "name": "缺字段任务",
+      "urgency": 3,
+      "urgency_reason": "r",
+      "impact": 3,
+      "impact_reason": "r",
+      "estimated_hours": 1.0,
+      "estimate_reason": "r",
+      "deadline": null,
+      "source_refs": []
+    }
+  ]
+}
