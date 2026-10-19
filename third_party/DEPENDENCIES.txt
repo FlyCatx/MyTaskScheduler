@@ -1,0 +1,21 @@
+TaskScheduler 第三方依赖清单
+生成时间：2026-10-15 22:51:58
+
+来源：
+  cJSON v1.7.18    https://github.com/DaveGamble/cJSON
+  libcurl 8.23.0   https://curl.se/windows/  (curl-8.23.0_1-win64-mingw.zip)
+  cacert.pem       curl.se 官方 curl-ca-bundle.crt（Mozilla CA 列表）
+  libcurl.lib      由官方 libcurl-x64.def 经 MSVC lib.exe 生成（不含任何自写实现）
+
+文件                                                     字节  SHA-256
+------------------------------------------------------------------------------------------------------------------------
+third_party/cJSON.c                                 78800  75c51de8fa40ac9d7a99319c6330719bd692eb81c0a869265f3d4c682533f9b9
+third_party/cJSON.h                                 16193  0578cc29132912edbc88f83207a8fc76e5db3db0605497e909a9384ef3cc474b
+third_party/LICENSE                                  1084  a36dda207c36db5818729c54e7ad4e8b0c6fba847491ba64f372c1a2037b6d5c
+third_party/curl/include/curl/curl.h               136671  ad8989a81e79b407355e14d673410d51420bfec48287f4b890d0b211d9235ec3
+third_party/curl/include/curl/curlver.h              3052  fed299993c517a6a1785f44b19893d4ae65061a7d7b5ca43036b35bf998065b4
+third_party/curl/bin/libcurl-x64.dll              3717736  7619afe92079daff3e829ef2feffd6f20a662f12bcb9dab37dfb88a6718e57db
+third_party/curl/bin/cacert.pem                    188900  1fdcf2a55c9806c4c1e8391cb283871ee3b209d68a2879ce4c0898d949de2545
+third_party/curl/lib/libcurl-x64.def                 2537  db4bdf56c8961da1c321fddf6dc1b97f5b1fd15b91424a4a0eb0452b7f51968e
+third_party/curl/lib/libcurl.lib                    22718  db5245358e7b41361fa789c5ba8394d3e497b70732d04b36f905c227cda3e814
+
