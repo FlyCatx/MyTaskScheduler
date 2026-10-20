@@ -804,6 +804,48 @@ static int build_inputs(const cJSON *root, const TsConfig *cfg, TsInputs *out,
     return 0;
 }
 
+/*
+ * 把请求根上的 timetable 与 derived effectiveTimetable 合并成校验入口接受的
+ * 包装 JSON（owned）。任何一个字段形状不对都返回 NULL 并写 err。
+ */
+static char *timetable_payload_json(const cJSON *root, char *err, size_t err_sz)
+{
+    const cJSON *timetable = cJSON_GetObjectItemCaseSensitive(root, "timetable");
+    const cJSON *effective =
+        cJSON_GetObjectItemCaseSensitive(root, "effectiveTimetable");
+    cJSON *wrapper;
+    char *printed;
+
+    if (timetable == NULL || cJSON_IsNull(timetable)) return NULL;
+    if (!cJSON_IsObject(timetable)) {
+        snprintf(err, err_sz, "timetable 必须是对象");
+        return NULL;
+    }
+    if (effective != NULL && !cJSON_IsNull(effective) &&
+        !cJSON_IsObject(effective)) {
+        snprintf(err, err_sz, "effectiveTimetable 必须是对象");
+        return NULL;
+    }
+    wrapper = cJSON_CreateObject();
+    if (wrapper == NULL) {
+        snprintf(err, err_sz, "内存分配失败");
+        return NULL;
+    }
+    cJSON_AddItemToObject(wrapper, "timetable",
+                          cJSON_Duplicate(timetable, 1));
+    if (effective != NULL && !cJSON_IsNull(effective)) {
+        cJSON_AddItemToObject(wrapper, "effectiveTimetable",
+                              cJSON_Duplicate(effective, 1));
+    }
+    printed = cJSON_PrintUnformatted(wrapper);
+    cJSON_Delete(wrapper);
+    if (printed == NULL) {
+        snprintf(err, err_sz, "内存分配失败");
+        return NULL;
+    }
+    return printed;
+}
+
 static DWORD WINAPI analyze_worker(LPVOID param)
 {
     WorkerArg *arg = (WorkerArg *)param;
@@ -815,6 +857,9 @@ static DWORD WINAPI analyze_worker(LPVOID param)
     const cJSON *item;
     char *user_request = NULL;
     char *plan_context = NULL;
+    char *timetable_block = NULL;
+    char *timetable_payload = NULL;
+    int timetable_invalid = 0;
     int gen = 0;
     int have_inputs = 0;
 
@@ -842,6 +887,56 @@ static DWORD WINAPI analyze_worker(LPVOID param)
     item = cJSON_GetObjectItemCaseSensitive(root, "planContext");
     if (item != NULL && cJSON_IsString(item)) {
         plan_context = ts_strdup(cJSON_GetStringValue(item));
+    }
+
+    /*
+     * 正式分析也要看到结构化时间表：它被放进“本地生成事实”区块，而不是附件材料，
+     * 因此模型不会把它当作 source_refs 的原文。
+     *
+     * 有 timetable 但校验失败时必须显式失败：不能当成“没有时间表”继续排程，
+     * 否则模型会在缺少约束的情况下给出与本地占用冲突的计划。
+     */
+    item = cJSON_GetObjectItemCaseSensitive(root, "timetable");
+    if (item != NULL && !cJSON_IsNull(item)) {
+        timetable_payload = timetable_payload_json(root, errbuf, sizeof(errbuf));
+        if (timetable_payload != NULL) {
+            timetable_block = ts_constraints_timetable_block(timetable_payload);
+            cJSON_free(timetable_payload);
+            timetable_payload = NULL;
+        }
+        if (timetable_block == NULL) {
+            timetable_invalid = 1;
+        }
+    }
+
+    if (timetable_invalid) {
+        EnterCriticalSection(&b->lock);
+        job->result.error_kind = TS_MODEL_ERR_PROTOCOL;
+        job->result.error = ts_strdup(
+            errbuf[0] != '\0'
+                ? errbuf
+                : "请求里的时间表不合法，已停止分析（未发送不完整约束）");
+        job_finish_locked(job);
+        LeaveCriticalSection(&b->lock);
+        ts_inputs_free(&inputs);
+        ts_free(user_request);
+        ts_free(plan_context);
+        cJSON_Delete(root);
+        ts_free(arg);
+        return 0;
+    }
+
+    if (timetable_block != NULL) {
+        TsBuf merged;
+        ts_buf_init(&merged);
+        ts_buf_puts(&merged, timetable_block);
+        if (plan_context != NULL && plan_context[0] != '\0') {
+            ts_buf_puts(&merged, "\n\n");
+            ts_buf_puts(&merged, plan_context);
+        }
+        ts_free(timetable_block);
+        ts_free(plan_context);
+        plan_context = merged.data;
     }
 
     if (build_inputs(root, &job->cfg_snapshot, &inputs, errbuf, sizeof(errbuf)) == 0) {
@@ -896,6 +991,9 @@ static DWORD WINAPI constraints_worker(LPVOID param)
     char errbuf[768];
     const cJSON *item;
     char *user_request = NULL;
+    char *current_date = NULL;
+    char *timezone = NULL;
+    char *timetable_json = NULL;
     int gen = 0;
     int have_inputs = 0;
 
@@ -920,6 +1018,52 @@ static DWORD WINAPI constraints_worker(LPVOID param)
         user_request = ts_strdup(cJSON_GetStringValue(item));
     }
 
+    /* 请求捕获的日期/时区/时间表：相对日期一律以它为准，不依赖运行当天。 */
+    item = cJSON_GetObjectItemCaseSensitive(root, "context");
+    if (item != NULL && cJSON_IsObject(item)) {
+        const cJSON *d = cJSON_GetObjectItemCaseSensitive(item, "currentDate");
+        const cJSON *tz = cJSON_GetObjectItemCaseSensitive(item, "timezoneId");
+        const cJSON *off = cJSON_GetObjectItemCaseSensitive(item, "timezoneOffsetMinutes");
+        if (cJSON_IsString(d) && cJSON_GetStringValue(d)[0] != '\0') {
+            current_date = ts_strdup(cJSON_GetStringValue(d));
+        }
+        if (cJSON_IsString(tz) && cJSON_GetStringValue(tz)[0] != '\0') {
+            char buf[160];
+            if (cJSON_IsNumber(off)) {
+                int minutes = off->valueint;
+                int sign = minutes < 0 ? -1 : 1;
+                int abs_min = minutes < 0 ? -minutes : minutes;
+                snprintf(buf, sizeof(buf), "%s (UTC%c%02d:%02d)",
+                         cJSON_GetStringValue(tz), sign < 0 ? '-' : '+',
+                         abs_min / 60, abs_min % 60);
+            } else {
+                snprintf(buf, sizeof(buf), "%s", cJSON_GetStringValue(tz));
+            }
+            timezone = ts_strdup(buf);
+        }
+    }
+    item = cJSON_GetObjectItemCaseSensitive(root, "timetable");
+    if (item != NULL && !cJSON_IsNull(item)) {
+        char *payload = timetable_payload_json(root, errbuf, sizeof(errbuf));
+        if (payload == NULL) {
+            EnterCriticalSection(&b->lock);
+            job->constraints.error_kind = TS_MODEL_ERR_PROTOCOL;
+            job->constraints.error = ts_strdup(
+                errbuf[0] != '\0' ? errbuf : "请求里的时间表不合法");
+            job_finish_locked(job);
+            LeaveCriticalSection(&b->lock);
+            ts_inputs_free(&inputs);
+            ts_free(user_request);
+            ts_free(current_date);
+            ts_free(timezone);
+            cJSON_Delete(root);
+            ts_free(arg);
+            return 0;
+        }
+        /* 交给校验器时保留 timetable + effectiveTimetable 两份视图。 */
+        timetable_json = payload;
+    }
+
     if (build_inputs(root, &job->cfg_snapshot, &inputs, errbuf, sizeof(errbuf)) == 0) {
         have_inputs = 1;
     }
@@ -934,8 +1078,9 @@ static DWORD WINAPI constraints_worker(LPVOID param)
     } else {
         TsConstraintsResult local;
         ts_constraints_result_init(&local);
-        (void)ts_constraints_run(&job->cfg_snapshot, user_request, &inputs,
-                                 &job->cancel, gen, job_progress, arg, &local);
+        (void)ts_constraints_run_ex(&job->cfg_snapshot, user_request, &inputs,
+                                    current_date, timezone, timetable_json,
+                                    &job->cancel, gen, job_progress, arg, &local);
         EnterCriticalSection(&b->lock);
         if (job->constraints_ready) {
             ts_constraints_result_free(&job->constraints);
@@ -949,6 +1094,9 @@ static DWORD WINAPI constraints_worker(LPVOID param)
 
     ts_inputs_free(&inputs);
     ts_free(user_request);
+    ts_free(current_date);
+    ts_free(timezone);
+    ts_free(timetable_json);
     cJSON_Delete(root);
     ts_free(arg);
     return 0;
@@ -3373,4 +3521,3 @@ void ts_bridge_destroy(TsBridge *bridge)
     }
     ts_free(bridge);
 }
-
