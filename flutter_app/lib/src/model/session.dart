@@ -14,6 +14,7 @@ import 'calendar.dart';
 import 'calendar_proposals.dart';
 import 'plan.dart';
 import 'settings.dart';
+import 'timetable.dart';
 
 enum MessageRole { user, notice }
 
@@ -117,6 +118,10 @@ class PlanVersion {
   /// read as "no calendar data yet", never as "24/7 available".
   final CalendarSchedule calendar;
 
+  /// 0.1.1: 结构化周时间表（协议 v2）。旧版本没有该字段时由 [calendar] 推导，
+  /// 不把“尚未配置”当成全天可用。
+  final Timetable? timetable;
+
   /// Which profile/model produced this version. `null` means "来源未知": versions
   /// committed before 0.0.4 (and failed requests) carry no source, and the UI must say
   /// so rather than inventing a name.
@@ -138,6 +143,7 @@ class PlanVersion {
     this.reviewNotes = const [],
     this.commitReason = 'initial',
     this.calendar = const CalendarSchedule(),
+    this.timetable,
     this.modelSource,
   });
 
@@ -154,6 +160,7 @@ class PlanVersion {
     List<TaskRecord>? tasks,
     List<PlanNote>? notes,
     CalendarSchedule? calendar,
+    Timetable? timetable,
   }) =>
       PlanVersion(
         id: id,
@@ -171,6 +178,7 @@ class PlanVersion {
         reviewNotes: reviewNotes,
         commitReason: commitReason,
         calendar: calendar ?? this.calendar,
+        timetable: timetable ?? this.timetable,
         modelSource: modelSource,
       );
 
@@ -188,6 +196,8 @@ class PlanVersion {
         // 0.06: calendar data is additive. A version written before it simply has no
         // `calendar` key and reads back as "no calendar data yet".
         'calendar': calendar.toJson(),
+        // 0.1.1: 新字段；缺失时由 calendar 推导，旧文件读取不会失败。
+        'timetable': timetable?.toJson(),
         // Null for older versions; `fromJson` keeps that "unknown" instead of guessing.
         'modelSource': modelSource?.toJson(),
         'tasks': tasks.map((t) {
@@ -239,6 +249,7 @@ class PlanVersion {
           .map(ReviewNote.fromJson)
           .toList(growable: false),
       calendar: CalendarSchedule.fromJson(j['calendar'], now: DateTime.now()),
+      timetable: Timetable.tryParse(j['timetable']),
     );
   }
 }
@@ -400,6 +411,12 @@ class Conversation {
   /// Proposals are never applied automatically.
   final CalendarProposalSet? calendarProposals;
 
+  /// 0.1.1: 空会话在首次提交前也可以编辑时间表；取消不留附件，应用/保存才写入。
+  final Timetable? calendarDraft;
+
+  /// 是否把已提交的时间表随下一次模型请求发送。移除只影响请求附带项。
+  final bool includeTimetable;
+
   const Conversation({
     required this.id,
     required this.title,
@@ -417,6 +434,8 @@ class Conversation {
     this.ganttMode = 'relative',
     this.modelSelection,
     this.calendarProposals,
+    this.calendarDraft,
+    this.includeTimetable = true,
   }) : activityAt = activityAt ?? updatedAt;
 
   String get generatedTitle {
@@ -464,6 +483,9 @@ class Conversation {
     bool clearModelSelection = false,
     CalendarProposalSet? calendarProposals,
     bool clearCalendarProposals = false,
+    Timetable? calendarDraft,
+    bool clearCalendarDraft = false,
+    bool? includeTimetable,
   }) =>
       Conversation(
         id: id,
@@ -488,6 +510,9 @@ class Conversation {
         calendarProposals: clearCalendarProposals
             ? null
             : (calendarProposals ?? this.calendarProposals),
+        calendarDraft:
+            clearCalendarDraft ? null : (calendarDraft ?? this.calendarDraft),
+        includeTimetable: includeTimetable ?? this.includeTimetable,
       );
 
   Map<String, dynamic> toJson() => <String, dynamic>{
@@ -504,6 +529,8 @@ class Conversation {
         'ganttMode': ganttMode,
         'modelSelection': modelSelection?.toJson(),
         'calendarProposals': calendarProposals?.toJson(),
+        'calendarDraft': calendarDraft?.toJson(),
+        'includeTimetable': includeTimetable,
         'pendingRequest': pendingRequest?.toJson(),
         'messages': messages.map((m) => m.toJson()).toList(growable: false),
         'attachments': attachments.map((a) => a.toJson()).toList(growable: false),
@@ -543,6 +570,8 @@ class Conversation {
       // Older sessions have no cached proposals: that is "never analysed", not
       // "nothing found", so it stays null instead of becoming an empty set.
       calendarProposals: CalendarProposalSet.fromJson(j['calendarProposals']),
+      calendarDraft: Timetable.tryParse(j['calendarDraft']),
+      includeTimetable: j['includeTimetable'] != false,
     );
   }
 }
@@ -627,4 +656,3 @@ class ConversationSummary {
         meta: c.meta,
       );
 }
-

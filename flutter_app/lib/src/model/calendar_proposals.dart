@@ -1,21 +1,19 @@
-// Structured calendar constraints proposed by the model.
+// 模型返回的日历约束候选（proposals），不是最终决定。
 //
-// The model is asked (see `src/constraints.c`) to return *proposals*, never decisions:
+// 语义识别见 `src/domain/analysis/constraints.c`；本文件定义 Dart 侧的数据结构与
+// 内容派生 id。候选类型：
 //
-//   availability — "每天 8:00-24:00 可工作"  → a weekly open window,
-//   occupancy    — "周二/周四 8-10 上课"     → a course/activity/rest block,
-//   exception    — "2026-10-22 全天不可用"   → a closed date,
-//   unclear      — "中午吃饭 30 分钟"        → a question, never a guessed clock time.
+//   availability — “每天 8:00-24:00 可工作”  → 每周可用窗口
+//   occupancy    — “周二/周四 8-10 上课”     → 课程/活动/休息占用
+//   exception    — “2026-10-22 全天不可用”  → 具体日期关闭
+//   task         — “今天 14:00-15:00 写报告” → state=2 的任务安排/待绑定预留
+//   unclear      — “晚上有事，时间未定”      → 问题，绝不猜时间
 //
-// Every proposal carries: a stable id, its type, a title, weekday(s) or a concrete date,
-// the wall-clock window (or only a duration when the start is unknown), the original
-// evidence text and where it came from. Nothing here is applied by itself: the dialog
-// starts with every box unticked and only an explicit user tick writes it into the
-// real weekly / exceptions / occupancies data.
+// 每条候选带：稳定 id、类型、标题、星期或具体日期、墙钟窗口（或只有时长）、
+// 原文证据与来源。写入正式数据必须由用户在界面上勾选；解码器本身不会应用任何内容。
 //
-// Validation is strict and local: a payload with wrong types, impossible ranges, bad
-// dates or no evidence is rejected instead of being repaired into "everything is
-// available".
+// 校验是严格且本地的：类型错误、不可能的范围、非法日期或没有证据的候选会被拒绝，
+// 不会修复成“全部可用”。
 
 import 'dart:convert';
 
@@ -31,8 +29,11 @@ enum CalendarProposalKind {
   /// A course / activity / rest block that reduces available time.
   occupancy,
 
-  /// A date that does not follow the weekly rule (usually closed).
+  /// 日期例外（通常为整日不可用）。
   exception,
+
+  /// 已安排/待绑定的任务时间（state=2）。
+  task,
 
   /// Recognised as a constraint but not placeable — becomes a question, not a rule.
   unclear;
@@ -41,6 +42,7 @@ enum CalendarProposalKind {
         'availability' => CalendarProposalKind.availability,
         'occupancy' => CalendarProposalKind.occupancy,
         'exception' => CalendarProposalKind.exception,
+        'task' => CalendarProposalKind.task,
         'unclear' => CalendarProposalKind.unclear,
         _ => null,
       };
@@ -51,7 +53,17 @@ enum CalendarProposalKind {
         CalendarProposalKind.availability => '可用时间',
         CalendarProposalKind.occupancy => '占用',
         CalendarProposalKind.exception => '日期例外',
+        CalendarProposalKind.task => '任务安排',
         CalendarProposalKind.unclear => '待确认',
+      };
+
+  /// 协议 v2 的 state 编码；unclear 没有状态。
+  int? get stateCode => switch (this) {
+        CalendarProposalKind.availability => 1,
+        CalendarProposalKind.occupancy => 0,
+        CalendarProposalKind.exception => 0,
+        CalendarProposalKind.task => 2,
+        CalendarProposalKind.unclear => null,
       };
 }
 
@@ -87,6 +99,14 @@ class CalendarProposal {
   /// Where it came from, e.g. `材料2:第3段`. Never empty (a placeholder is substituted).
   final String source;
 
+  /// 协议 v2：来源身份与位置（与 [source] 同义的结构化形式）。
+  final String? sourceId;
+  final String? location;
+
+  /// 协议 v2：可绑定的真实任务 ID；未知时为 null，绝不按名称静默绑定。
+  final String? taskId;
+  final String? taskTitleHint;
+
   /// True when a start time still has to be supplied by the user.
   final bool needsTime;
 
@@ -105,6 +125,10 @@ class CalendarProposal {
     this.durationMinutes,
     required this.evidence,
     required this.source,
+    this.sourceId,
+    this.location,
+    this.taskId,
+    this.taskTitleHint,
     this.needsTime = false,
     this.question,
   });
@@ -118,8 +142,14 @@ class CalendarProposal {
   bool get isApplicable {
     if (kind == CalendarProposalKind.unclear || needsTime) return false;
     if (kind == CalendarProposalKind.exception) return closed || ranges.isNotEmpty;
+    if (kind == CalendarProposalKind.task) return ranges.isNotEmpty;
     return ranges.isNotEmpty;
   }
+
+  /// 任务安排若没有真实 taskId，只能是“待绑定预留”。
+  bool get isUnboundTask =>
+      kind == CalendarProposalKind.task &&
+      (taskId == null || taskId!.isEmpty);
 
   /// Weekday label list, e.g. `周一、周四`; `每天` when no weekday is set.
   String get weekdayLabel {
@@ -143,12 +173,17 @@ class CalendarProposal {
     if (kind == CalendarProposalKind.unclear) {
       return question ?? title;
     }
-    return '$kindText · $title · $weekdayLabel $rangeLabel';
+    final taskSuffix = kind == CalendarProposalKind.task
+        ? (isUnboundTask ? '（待绑定）' : '（已绑定任务）')
+        : '';
+    return '$kindText · $title$taskSuffix · $weekdayLabel $rangeLabel';
   }
 
   Map<String, dynamic> toJson() => <String, dynamic>{
         'id': id,
-        'kind': kind.wireName,        'title': title,
+        'kind': kind.wireName,
+        'state': kind.stateCode,
+        'title': title,
         'occupancyKind': occupancyKind,
         'weekdays': weekdays,
         'date': date,
@@ -157,6 +192,10 @@ class CalendarProposal {
         'durationMinutes': durationMinutes,
         'evidence': evidence,
         'source': source,
+        'sourceId': sourceId,
+        'location': location,
+        'taskId': taskId,
+        'taskTitleHint': taskTitleHint,
         'needsTime': needsTime,
         'question': question,
       };
@@ -186,36 +225,89 @@ class CalendarProposal {
         durationMinutes: durationMinutes,
         evidence: evidence,
         source: source,
+        sourceId: sourceId,
+        location: location,
+        taskId: taskId,
+        taskTitleHint: taskTitleHint,
         needsTime: false,
         question: question,
       );
 
-  factory CalendarProposal.fromJson(Map<String, dynamic> j) => CalendarProposal(
-        id: (j['id'] as String?) ?? '',
-        kind: CalendarProposalKind.tryParse(j['kind']) ??
-            CalendarProposalKind.unclear,
-        title: (j['title'] as String?) ?? '',
-        occupancyKind: (j['occupancyKind'] as String?) ?? 'activity',
-        weekdays: ((j['weekdays'] as List<dynamic>?) ?? const [])
-            .whereType<num>()
-            .map((e) => e.toInt())
-            .where((d) => d >= 1 && d <= 7)
-            .toSet()
-            .toList(growable: false)
-          ..sort(),
-        date: (j['date'] as String?)?.trim(),
-        closed: j['closed'] == true,
-        ranges: ((j['ranges'] as List<dynamic>?) ?? const [])
-            .whereType<Map>()
-            .map((e) => WallClockRange.fromJson(Map<String, dynamic>.from(e)))
-            .where((r) => r.isValid)
-            .toList(growable: false),
-        durationMinutes: (j['durationMinutes'] as num?)?.toInt(),
-        evidence: (j['evidence'] as String?) ?? '',
-        source: (j['source'] as String?) ?? '',
-        needsTime: j['needsTime'] == true,
-        question: (j['question'] as String?)?.trim(),
+  CalendarProposal copyWith({
+    String? taskId,
+    String? taskTitleHint,
+    bool clearTaskId = false,
+  }) =>
+      CalendarProposal(
+        id: id,
+        kind: kind,
+        title: title,
+        occupancyKind: occupancyKind,
+        weekdays: weekdays,
+        date: date,
+        closed: closed,
+        ranges: ranges,
+        durationMinutes: durationMinutes,
+        evidence: evidence,
+        source: source,
+        sourceId: sourceId,
+        location: location,
+        taskId: clearTaskId ? null : (taskId ?? this.taskId),
+        taskTitleHint: taskTitleHint ?? this.taskTitleHint,
+        needsTime: needsTime,
+        question: question,
       );
+
+  factory CalendarProposal.fromJson(Map<String, dynamic> j) {
+    final sourceRaw = j['source'];
+    final sourceMap = sourceRaw is Map ? sourceRaw : null;
+    final sourceId = sourceMap == null
+        ? (j['sourceId'] as String?)?.trim()
+        : '${sourceMap['sourceId'] ?? ''}'.trim();
+    final location = sourceMap == null
+        ? (j['location'] as String?)?.trim()
+        : '${sourceMap['location'] ?? ''}'.trim();
+    final sourceText = sourceRaw is String
+        ? sourceRaw
+        : <String>[
+            if (sourceId != null && sourceId.isNotEmpty) sourceId,
+            if (location != null && location.isNotEmpty) location,
+          ].join(':');
+    return CalendarProposal(
+      id: (j['id'] as String?) ?? '',
+      kind: CalendarProposalKind.tryParse(j['kind']) ??
+          CalendarProposalKind.unclear,
+      title: (j['title'] as String?) ?? '',
+      occupancyKind: (j['occupancyKind'] as String?) ?? 'activity',
+      weekdays: ((j['weekdays'] as List<dynamic>?) ?? const [])
+          .whereType<num>()
+          .map((e) => e.toInt())
+          .where((d) => d >= 1 && d <= 7)
+          .toSet()
+          .toList(growable: false)
+        ..sort(),
+      date: (j['date'] as String?)?.trim(),
+      closed: j['closed'] == true,
+      ranges: ((j['ranges'] as List<dynamic>?) ?? const [])
+          .whereType<Map>()
+          .map((e) => WallClockRange.fromJson(Map<String, dynamic>.from(e)))
+          .where((r) => r.isValid)
+          .toList(growable: false),
+      durationMinutes: (j['durationMinutes'] as num?)?.toInt(),
+      evidence: (j['evidence'] as String?) ?? '',
+      source: sourceText,
+      sourceId: (sourceId == null || sourceId.isEmpty) ? null : sourceId,
+      location: (location == null || location.isEmpty) ? null : location,
+      taskId: (j['taskId'] as String?)?.trim().isEmpty == true
+          ? null
+          : (j['taskId'] as String?)?.trim(),
+      taskTitleHint: (j['taskTitleHint'] as String?)?.trim().isEmpty == true
+          ? null
+          : (j['taskTitleHint'] as String?)?.trim(),
+      needsTime: j['needsTime'] == true,
+      question: (j['question'] as String?)?.trim(),
+    );
+  }
 
   static String _weekdayShort(int weekday) => switch (weekday) {
         1 => '周一',
@@ -243,6 +335,7 @@ String calendarProposalId({
   required String? date,
   required Iterable<WallClockRange> ranges,
   String? occupancyKind,
+  String? taskId,
 }) {
   final sortedDays = weekdays.toSet().toList()..sort();
   final sortedRanges = ranges
@@ -256,6 +349,7 @@ String calendarProposalId({
     sortedDays.join('+'),
     (date ?? '').trim(),
     sortedRanges.join(','),
+    (taskId ?? '').trim(),
   ].join('|');
   final digest = sha1.convert(utf8.encode(canonical)).toString();
   return 'cp-${digest.substring(0, 12)}';
@@ -263,8 +357,11 @@ String calendarProposalId({
 
 /// A whole validated answer from the model, plus the facts needed to keep it honest.
 class CalendarProposalSet {
-  /// Bumped when the wire format changes; older payloads are ignored, not guessed.
-  static const int schemaVersion = 1;
+  /// Bumped when the wire format changes; older payloads are upgraded, not guessed.
+  static const int schemaVersion = 2;
+
+  /// 可读取的版本：v1（0.0.x）与 v2（0.1.1）。
+  static const Set<int> readableVersions = <int>{1, 2};
 
   final List<CalendarProposal> proposals;
 
@@ -339,7 +436,7 @@ class CalendarProposalSet {
     if (raw is! Map) return null;
     final j = Map<String, dynamic>.from(raw);
     final version = (j['schemaVersion'] as num?)?.toInt();
-    if (version != schemaVersion) return null;
+    if (version != null && !readableVersions.contains(version)) return null;
     final created =
         DateTime.tryParse((j['createdAt'] as String?) ?? '') ?? DateTime.now();
     return CalendarProposalSet(
@@ -370,4 +467,3 @@ String materialSignature(List<String> parts) {
   if (joined.isEmpty) return '';
   return sha1.convert(utf8.encode(joined)).toString().substring(0, 16);
 }
-

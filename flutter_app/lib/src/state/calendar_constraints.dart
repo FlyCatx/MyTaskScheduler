@@ -1,16 +1,13 @@
-// Decoding + validating the calendar constraints the *model* returned.
+// 模型返回的日历约束：本地解码、语义校验、去重与应用。
 //
-// This file used to contain local keyword/regex "extraction" and call it AI. That was
-// wrong on two counts: it never saw the material the model sees, and a regex that finds
-// `08:00-10:00` cannot tell "上课" (a course, unavailable) from "可工作" (available).
-// The semantic work now happens in a real model request (`src/constraints.c`), and this
-// file only does what must be local and deterministic:
+// 语义识别在 C 侧的独立模型请求（`src/domain/analysis/constraints.c`）里完成；
+// 本文件只做本地、确定性的部分：
+//   * 校验模型返回的每个字段（类型、范围、日期、来源、证据、state/kind 一致）；
+//   * 分配内容派生的稳定 id，避免同一候选被导入两次；
+//   * 把“识别到但无法落格”的条目变成待确认问题，而不是猜测时段；
+//   * 用户勾选后，把候选写入每周可用/日期例外/占用数据，并跳过重复项。
 //
-//   * validate every field the model sent (type, range, date, source, evidence);
-//   * assign a stable id (so the same candidate is not imported twice);
-//   * turn "recognised but not placeable" items into questions, never into blocks;
-//   * apply accepted proposals to the real weekly / exceptions / occupancies data
-//     without duplicating something the user already confirmed.
+// 主要函数：decodeCalendarProposals、applyAcceptedProposals。
 
 import '../model/calendar.dart';
 import '../model/calendar_proposals.dart';
@@ -69,7 +66,12 @@ ProposalDecodeResult decodeCalendarProposals(
   if (raw is! Map) {
     return const ProposalDecodeResult.failure('模型返回的约束不是 JSON 对象');
   }
-  final map = Map<String, dynamic>.from(raw);
+  var map = Map<String, dynamic>.from(raw);
+  // 协议 v2 的正式位置是 `calendar` 对象；兼容旧版直接把 proposals 放在顶层。
+  final calendar = map['calendar'];
+  if (calendar is Map) {
+    map = Map<String, dynamic>.from(calendar);
+  }
   final rawProposals = map['proposals'];
   if (rawProposals is! List) {
     return const ProposalDecodeResult.failure('模型返回的约束缺少 proposals 数组');
@@ -146,7 +148,32 @@ _Decoded _decodeOne(Map<String, dynamic> j, {required int index}) {
   if (evidence.isEmpty) {
     return _Decoded.fail('$where（${kind.label}）：没有原文依据，无法核对');
   }
-  final source = '${j['source'] ?? ''}'.trim();
+  final sourceRaw = j['source'];
+  final sourceMap = sourceRaw is Map ? sourceRaw : null;
+  final sourceId = sourceMap == null
+      ? '${j['sourceId'] ?? ''}'.trim()
+      : '${sourceMap['sourceId'] ?? ''}'.trim();
+  final location = sourceMap == null
+      ? '${j['location'] ?? ''}'.trim()
+      : '${sourceMap['location'] ?? ''}'.trim();
+  final sourceText = sourceRaw is String && sourceRaw.trim().isNotEmpty
+      ? sourceRaw.trim()
+      : <String>[
+          if (sourceId.isNotEmpty) sourceId,
+          if (location.isNotEmpty) location,
+        ].join(':');
+
+  // 协议 v2 明确携带 state；存在时必须与 kind 一致。
+  final stateRaw = j['state'];
+  if (stateRaw != null) {
+    final state = stateRaw is num && stateRaw == stateRaw.roundToDouble()
+        ? stateRaw.toInt()
+        : null;
+    final expected = kind.stateCode;
+    if (state == null || (expected != null && state != expected)) {
+      return _Decoded.fail('$where：state=$stateRaw 与 kind=${kind.wireName} 不一致');
+    }
+  }
 
   // ---- ranges
   final ranges = <WallClockRange>[];
@@ -158,10 +185,10 @@ _Decoded _decodeOne(Map<String, dynamic> j, {required int index}) {
     if (r is! Map) {
       return _Decoded.fail('$where：时段不是 JSON 对象');
     }
-    final start = (r['start'] as num?)?.toInt();
-    final end = (r['end'] as num?)?.toInt();
+    final start = _strictInt(r['start']);
+    final end = _strictInt(r['end']);
     if (start == null || end == null) {
-      return _Decoded.fail('$where：时段缺少 start/end');
+      return _Decoded.fail('$where：时段 start/end 必须是整数分钟');
     }
     if (start < 0 || end <= start || end > 2880) {
       return _Decoded.fail('$where：时段 $start–$end 分钟不合法');
@@ -197,7 +224,10 @@ _Decoded _decodeOne(Map<String, dynamic> j, {required int index}) {
     }
   }
 
-  final duration = (j['durationMinutes'] as num?)?.toInt();
+  final duration = _strictInt(j['durationMinutes']);
+  if (j['durationMinutes'] != null && duration == null) {
+    return _Decoded.fail('$where：时长必须是整数分钟');
+  }
   if (duration != null && (duration <= 0 || duration > 1440)) {
     return _Decoded.fail('$where：时长 $duration 分钟不合法');
   }
@@ -214,6 +244,14 @@ _Decoded _decodeOne(Map<String, dynamic> j, {required int index}) {
   if (kind == CalendarProposalKind.exception && date == null) {
     return _Decoded.fail('$where：日期例外必须给出具体日期');
   }
+  // 待确认项必须给出可回答的问题；没有时段/时长也可以合法。
+  if (kind == CalendarProposalKind.unclear) {
+    final q = '${j['question'] ?? ''}'.trim();
+    if (ranges.isNotEmpty || duration != null) {
+      return _Decoded.fail('$where：待确认项不应带时段或时长');
+    }
+    if (q.isEmpty) return _Decoded.fail('$where：待确认项缺少补充问题');
+  }
 
   final title = '${j['title'] ?? ''}'.trim();
   final occupancyKind = switch ('${j['occupancyKind'] ?? ''}') {
@@ -228,8 +266,12 @@ _Decoded _decodeOne(Map<String, dynamic> j, {required int index}) {
           CalendarProposalKind.availability => '可用时间',
           CalendarProposalKind.occupancy => '占用',
           CalendarProposalKind.exception => '日期例外',
+          CalendarProposalKind.task => '任务安排',
           CalendarProposalKind.unclear => '待确认',
         };
+
+  final taskIdRaw = '${j['taskId'] ?? ''}'.trim();
+  final taskTitleHint = '${j['taskTitleHint'] ?? ''}'.trim();
 
   final id = calendarProposalId(
     kind: kind,
@@ -238,6 +280,7 @@ _Decoded _decodeOne(Map<String, dynamic> j, {required int index}) {
     date: date,
     ranges: ranges,
     occupancyKind: kind == CalendarProposalKind.occupancy ? occupancyKind : null,
+    taskId: taskIdRaw.isEmpty ? null : taskIdRaw,
   );
 
   final question = '${j['question'] ?? ''}'.trim();
@@ -252,10 +295,20 @@ _Decoded _decodeOne(Map<String, dynamic> j, {required int index}) {
     ranges: ranges,
     durationMinutes: duration,
     evidence: evidence,
-    source: source.isEmpty ? '（模型未注明来源）' : source,
+    source: sourceText.isEmpty ? '（模型未注明来源）' : sourceText,
+    sourceId: sourceId.isEmpty ? null : sourceId,
+    location: location.isEmpty ? null : location,
+    taskId: taskIdRaw.isEmpty ? null : taskIdRaw,
+    taskTitleHint: taskTitleHint.isEmpty ? null : taskTitleHint,
     needsTime: needsTime,
     question: question.isEmpty ? null : question,
   ));
+}
+
+int? _strictInt(Object? value) {
+  if (value is int) return value;
+  if (value is double && value == value.roundToDouble()) return value.toInt();
+  return null;
 }
 
 // ---------------------------------------------------------------- applying
@@ -381,6 +434,35 @@ AppliedProposals applyAcceptedProposals({
           ));
         }
         applied++;
+      case CalendarProposalKind.task:
+        final isDuplicate = nextOccupancies.any((o) =>
+            o.title.trim() == p.title.trim() &&
+            o.taskId == p.taskId &&
+            ((p.isRepeating && o.isWeekly && o.weekday == _firstWeekday(p)) ||
+                (!p.isRepeating && o.date == p.date)) &&
+            _sameRanges(o.ranges, p.ranges));
+        if (isDuplicate) {
+          skipped++;
+          break;
+        }
+        final taskDays = p.isRepeating
+            ? (p.weekdays.isEmpty ? const <int>[1] : p.weekdays)
+            : const <int>[0];
+        for (final d in taskDays) {
+          sequence++;
+          nextOccupancies.add(CalendarOccupancy(
+            id: '$idPrefix-res-$sequence-${p.id.substring(3, 9)}',
+            title: p.title.trim().isEmpty ? '任务安排' : p.title,
+            kind: 'activity',
+            date: p.isRepeating ? null : p.date,
+            weekday: p.isRepeating ? d : 0,
+            ranges: p.ranges,
+            provisional: p.taskId == null || p.taskId!.isEmpty,
+            taskId: p.taskId,
+            reservationId: 'res-${p.id.substring(3, 15)}',
+          ));
+        }
+        applied++;
       case CalendarProposalKind.exception:
         final existing = _exceptionOn(nextExceptions, p.date!);
         if (existing == null) {
@@ -447,4 +529,3 @@ List<WallClockRange> _merge(List<WallClockRange> input) {
   }
   return out;
 }
-

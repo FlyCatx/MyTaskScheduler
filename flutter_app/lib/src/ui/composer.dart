@@ -67,6 +67,11 @@ class Composer extends StatefulWidget {
   final String? modelLabel;
   final VoidCallback? onModelTap;
 
+  /// 0.1.1：加号右侧的时间图标打开与甘特“可用时间”相同的编辑器。
+  final VoidCallback? onOpenTimetable;
+  final String? timetableSummary;
+  final VoidCallback? onRemoveTimetable;
+
   /// Optional externally owned focus node (so a global "focus composer" action can
   /// request it). When null the composer owns one.
   final FocusNode? focusNode;
@@ -88,6 +93,9 @@ class Composer extends StatefulWidget {
     this.enterToSend = false,
     this.modelLabel,
     this.onModelTap,
+    this.onOpenTimetable,
+    this.timetableSummary,
+    this.onRemoveTimetable,
     this.focusNode,
     this.useCustomBindings = false,
     this.sendChord,
@@ -131,6 +139,7 @@ class _ComposerState extends State<Composer> {
       mainAxisSize: MainAxisSize.min,
       children: [
         if (widget.attachments.isNotEmpty) _fileLinks(),
+        if (widget.timetableSummary != null) _timetableChip(),
         // Same TextField instance/position in both states; only constraints change.
         SendShortcut(
           controller: widget.textController,
@@ -199,6 +208,34 @@ class _ComposerState extends State<Composer> {
     );
   }
 
+  /// 已提交时间表的摘要标记；点击移除会取消“随本次请求发送”，不删除日程。
+  Widget _timetableChip() {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 6),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(Icons.schedule_outlined, size: 14, color: TsColors.accent),
+          const SizedBox(width: 4),
+          Flexible(
+            child: Text(
+              widget.timetableSummary!,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(fontSize: 11.5, color: TsColors.textSecondary),
+            ),
+          ),
+          const SizedBox(width: 4),
+          InkWell(
+            key: const Key('composer-timetable-remove'),
+            onTap: widget.onRemoveTimetable,
+            child: Icon(Icons.close, size: 13, color: TsColors.accent),
+          ),
+        ],
+      ),
+    );
+  }
+
   /// Selected files, shown as blue link-style entries above the text.
   Widget _fileLinks() {
     return Padding(
@@ -238,6 +275,18 @@ class _ComposerState extends State<Composer> {
             onTap: enabled ? widget.onAddFile : null,
           ),
         ),
+        if (widget.onOpenTimetable != null) ...[
+          const SizedBox(width: 6),
+          Tooltip(
+            message: widget.timetableSummary == null
+                ? '编辑可用时间（手动填写 / 手动绘制）'
+                : '重新编辑随请求发送的时间表',
+            child: _IconSquare(
+              icon: Icons.schedule_outlined,
+              onTap: enabled ? widget.onOpenTimetable : null,
+            ),
+          ),
+        ],
         const SizedBox(width: 10),
         if (widget.running)
           Text('分析进行中，可继续编辑草稿',
@@ -479,4 +528,3 @@ class _SendIntent extends Intent {
 class _CollapseIntent extends Intent {
   const _CollapseIntent();
 }
-

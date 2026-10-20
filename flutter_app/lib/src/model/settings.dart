@@ -614,6 +614,108 @@ class ModelSource {
   String toString() => 'ModelSource($profileId@$profileRevision/$modelId)';
 }
 
+/// 默认编辑方式的两种入口；两者编辑同一份草稿。
+enum CalendarEditorMode {
+  fill('fill', '手动填写'),
+  drawing('drawing', '手动绘制');
+
+  const CalendarEditorMode(this.wireName, this.label);
+
+  final String wireName;
+  final String label;
+
+  static CalendarEditorMode parse(
+    Object? value, {
+    CalendarEditorMode fallback = CalendarEditorMode.drawing,
+  }) {
+    if (value is CalendarEditorMode) return value;
+    if (value is String) {
+      final text = value.trim().toLowerCase();
+      for (final m in values) {
+        if (m.wireName == text || m.name.toLowerCase() == text) return m;
+      }
+    }
+    return fallback;
+  }
+}
+
+/// 通用设置里的“默认不可用时间”一段（分钟，0 <= start < end <= 1440）。
+///
+/// 允许跨午夜：23:00-08:00 在保存时规范化为 [1380,1440) 与 [0,480) 两段。
+class UnavailableRange {
+  final int start;
+  final int end;
+
+  const UnavailableRange(this.start, this.end);
+
+  bool get isValid => start >= 0 && end > start && end <= 24 * 60;
+  bool get crossesMidnight => end > 24 * 60;
+
+  int get minutes => end - start;
+
+  Map<String, dynamic> toJson() => <String, dynamic>{'start': start, 'end': end};
+
+  static UnavailableRange? tryParse(Object? raw) {
+    if (raw is! Map) return null;
+    final start = raw['start'];
+    final end = raw['end'];
+    if (start is! int || end is! int) return null;
+    if (start < 0 || end <= start || end > 24 * 60) return null;
+    return UnavailableRange(start, end);
+  }
+
+  /// 把一组区间规范化为当日内的半开区间（跨午夜拆成两段），并合并重叠/相邻段。
+  static List<UnavailableRange> normalizeAll(Iterable<UnavailableRange> input) {
+    final split = <UnavailableRange>[];
+    for (final r in input) {
+      // 允许输入 23:00-08:00（end > 1440），再拆成两天内的段。
+      if (r.start < 0 || r.end <= r.start || r.end > 2 * 24 * 60) continue;
+      if (r.end <= 24 * 60) {
+        split.add(r);
+      } else {
+        split.add(UnavailableRange(r.start, 24 * 60));
+        final overflow = r.end - 24 * 60;
+        if (overflow > 0) split.add(UnavailableRange(0, overflow));
+      }
+    }
+    final sorted = split..sort((a, b) => a.start.compareTo(b.start));
+    final out = <UnavailableRange>[];
+    for (final r in sorted) {
+      if (out.isEmpty) {
+        out.add(r);
+        continue;
+      }
+      final last = out.last;
+      if (r.start <= last.end) {
+        if (r.end > last.end) {
+          out[out.length - 1] = UnavailableRange(last.start, r.end);
+        }
+      } else {
+        out.add(r);
+      }
+    }
+    return List<UnavailableRange>.unmodifiable(out);
+  }
+
+  static List<UnavailableRange> get defaults => const <UnavailableRange>[
+        UnavailableRange(0, 480),
+        UnavailableRange(720, 840),
+        UnavailableRange(1080, 1140),
+        UnavailableRange(1380, 1440),
+      ];
+
+  /// 每日不可用分钟数；用于设置页显示“每天可用 X 分钟”。
+  static int totalMinutes(Iterable<UnavailableRange> ranges) =>
+      ranges.fold<int>(0, (sum, r) => sum + r.minutes);
+
+  @override
+  bool operator ==(Object other) =>
+      other is UnavailableRange && other.start == start && other.end == end;
+
+  @override
+  int get hashCode => Object.hash(start, end);
+}
+
 /// Window theme choice. Pure Dart so the model layer stays Flutter-free; the UI maps
 /// this to `ThemeMode`.
 enum AppThemeMode {
@@ -684,6 +786,14 @@ class AppPreferences {
     this.notifyOnFailure = true,
     this.notifySystem = false,
     this.shortcutOverrides = const <String, KeyChord?>{},
+    this.weekStartsOn = 1,
+    this.defaultCalendarEditor = CalendarEditorMode.drawing,
+    this.defaultUnavailableRanges = const <UnavailableRange>[
+      UnavailableRange(0, 480),
+      UnavailableRange(720, 840),
+      UnavailableRange(1080, 1140),
+      UnavailableRange(1380, 1440),
+    ],
   });
 
   static const String kChartModeTree = 'tree';
@@ -709,6 +819,15 @@ class AppPreferences {
   /// Stable command id -> override. Absent = default, explicit null = unbound.
   final Map<String, KeyChord?> shortcutOverrides;
 
+  /// 每周第一天：1=周一 … 7=周日。只影响列顺序和导航周边界，协议始终 1=周一。
+  final int weekStartsOn;
+
+  /// 打开时间表编辑器时的默认方式。两种方式编辑同一份草稿。
+  final CalendarEditorMode defaultCalendarEditor;
+
+  /// 新建时间表时使用的默认不可用区间（已规范化为当日内的段）。
+  final List<UnavailableRange> defaultUnavailableRanges;
+
   bool get sendOnEnter => sendMode == SendMode.enter;
 
   /// True when the value is inside the supported slider range.
@@ -729,6 +848,11 @@ class AppPreferences {
         notifySystem: notifySystem,
         shortcutOverrides:
             Map<String, KeyChord?>.unmodifiable(shortcutOverrides),
+        weekStartsOn: weekStartsOn.clamp(1, 7),
+        defaultCalendarEditor: defaultCalendarEditor,
+        defaultUnavailableRanges: UnavailableRange.normalizeAll(
+          defaultUnavailableRanges,
+        ),
       );
 
   AppPreferences copyWith({
@@ -741,6 +865,9 @@ class AppPreferences {
     bool? notifyOnFailure,
     bool? notifySystem,
     Map<String, KeyChord?>? shortcutOverrides,
+    int? weekStartsOn,
+    CalendarEditorMode? defaultCalendarEditor,
+    List<UnavailableRange>? defaultUnavailableRanges,
   }) =>
       AppPreferences(
         themeMode: themeMode ?? this.themeMode,
@@ -752,6 +879,11 @@ class AppPreferences {
         notifyOnFailure: notifyOnFailure ?? this.notifyOnFailure,
         notifySystem: notifySystem ?? this.notifySystem,
         shortcutOverrides: shortcutOverrides ?? this.shortcutOverrides,
+        weekStartsOn: weekStartsOn ?? this.weekStartsOn,
+        defaultCalendarEditor:
+            defaultCalendarEditor ?? this.defaultCalendarEditor,
+        defaultUnavailableRanges:
+            defaultUnavailableRanges ?? this.defaultUnavailableRanges,
       );
 
   Map<String, dynamic> toJson() => <String, dynamic>{
@@ -763,6 +895,10 @@ class AppPreferences {
         'notifyOnSuccess': notifyOnSuccess,
         'notifyOnFailure': notifyOnFailure,
         'notifySystem': notifySystem,
+        'weekStartsOn': weekStartsOn,
+        'defaultCalendarEditor': defaultCalendarEditor.wireName,
+        'defaultUnavailableRanges':
+            defaultUnavailableRanges.map((r) => r.toJson()).toList(growable: false),
         'shortcuts': <String, dynamic>{
           for (final e in shortcutOverrides.entries)
             e.key: e.value?.toJson(),
@@ -785,6 +921,16 @@ class AppPreferences {
       notifyOnFailure: _boolOr(json['notifyOnFailure'], true),
       notifySystem: _boolOr(json['notifySystem'], false),
       shortcutOverrides: _shortcutsOr(json['shortcuts']),
+      weekStartsOn: _weekStartsOnOr(json['weekStartsOn']),
+      defaultCalendarEditor: CalendarEditorMode.parse(json['defaultCalendarEditor']),
+      // 字段缺失 = 旧偏好，使用有文档的默认值；显式 [] = 用户清空，全天可用。
+      defaultUnavailableRanges: json.containsKey('defaultUnavailableRanges')
+          ? UnavailableRange.normalizeAll(
+              ((json['defaultUnavailableRanges'] as List<dynamic>?) ?? const [])
+                  .map(UnavailableRange.tryParse)
+                  .whereType<UnavailableRange>(),
+            )
+          : UnavailableRange.defaults,
     );
   }
 
@@ -799,7 +945,20 @@ class AppPreferences {
       other.notifyOnSuccess == notifyOnSuccess &&
       other.notifyOnFailure == notifyOnFailure &&
       other.notifySystem == notifySystem &&
+      other.weekStartsOn == weekStartsOn &&
+      other.defaultCalendarEditor == defaultCalendarEditor &&
+      _sameUnavailableRanges(
+          other.defaultUnavailableRanges, defaultUnavailableRanges) &&
       _sameShortcuts(other.shortcutOverrides, shortcutOverrides);
+
+  static bool _sameUnavailableRanges(
+      List<UnavailableRange> a, List<UnavailableRange> b) {
+    if (a.length != b.length) return false;
+    for (var i = 0; i < a.length; i++) {
+      if (a[i] != b[i]) return false;
+    }
+    return true;
+  }
 
   static bool _sameShortcuts(
       Map<String, KeyChord?> a, Map<String, KeyChord?> b) {
@@ -820,13 +979,17 @@ class AppPreferences {
         notifyOnSuccess,
         notifyOnFailure,
         notifySystem,
+        weekStartsOn,
+        defaultCalendarEditor,
+        Object.hashAll(defaultUnavailableRanges),
         Object.hashAllUnordered(shortcutOverrides.entries
             .map((e) => '${e.key}=${e.value?.signature ?? 'null'}')),
       );
 
   @override
   String toString() => 'AppPreferences(${themeMode.wireName}, scale=$fontScale, '
-      'chart=$defaultChartMode, send=${sendMode.wireName})';
+      'chart=$defaultChartMode, send=${sendMode.wireName}, '
+      'weekStart=$weekStartsOn)';
 }
 
 /// Parses the stable shortcuts map. Invalid chords are dropped so a corrupt file
@@ -863,3 +1026,7 @@ int _intOr(Object? value, int fallback) => value is num ? value.toInt() : fallba
 
 double? _doubleOr(Object? value) => value is num ? value.toDouble() : null;
 
+int _weekStartsOnOr(Object? value) {
+  final v = value is num ? value.toInt() : 1;
+  return v >= 1 && v <= 7 ? v : 1;
+}

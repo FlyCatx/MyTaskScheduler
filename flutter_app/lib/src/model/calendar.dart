@@ -333,6 +333,12 @@ class CalendarOccupancy {
   /// Inferred / not confirmed by the user yet.
   final bool provisional;
 
+  /// 0.1.1: 绑定到真实任务时写入；未绑定的蓝色预留为 null。
+  final String? taskId;
+
+  /// 0.1.1: 蓝色预留的稳定身份（绑定前后保持不变）。
+  final String? reservationId;
+
   const CalendarOccupancy({
     required this.id,
     required this.title,
@@ -341,6 +347,8 @@ class CalendarOccupancy {
     this.weekday = 0,
     this.ranges = const [],
     this.provisional = false,
+    this.taskId,
+    this.reservationId,
   });
 
   bool get isWeekly => date == null || date!.isEmpty;
@@ -377,6 +385,8 @@ class CalendarOccupancy {
         'weekday': weekday,
         'ranges': ranges.map((r) => r.toJson()).toList(),
         'provisional': provisional,
+        'taskId': taskId,
+        'reservationId': reservationId,
       };
 
   factory CalendarOccupancy.fromJson(Map<String, dynamic> j) => CalendarOccupancy(
@@ -391,6 +401,12 @@ class CalendarOccupancy {
             .where((r) => r.isValid)
             .toList(growable: false),
         provisional: j['provisional'] == true,
+        taskId: (j['taskId'] as String?)?.trim().isEmpty == true
+            ? null
+            : j['taskId'] as String?,
+        reservationId: (j['reservationId'] as String?)?.trim().isEmpty == true
+            ? null
+            : j['reservationId'] as String?,
       );
 }
 
@@ -753,4 +769,3 @@ class SchedulingTask {
         orderIndex: orderIndex,
       );
 }
-
