@@ -294,8 +294,7 @@ class TsSizes {
 
   /// Never let a fixed height clip an enlarged label.
   static double textScaleAwareHeight(BuildContext context, double base) {
-    final scale = MediaQuery.textScalerOf(context).scale(base);
-    return base * scale > base * 1.35 ? base * 1.35 : base;
+    final scale = MediaQuery.textScalerOf(context).scale(1).clamp(1.0, 1.6);
+    return base * scale;
   }
 }
-
