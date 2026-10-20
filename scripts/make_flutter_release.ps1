@@ -20,7 +20,7 @@
 
 [CmdletBinding()]
 param(
-    [string]$Version = '0.1.0',
+    [string]$Version = '0.1.2',
     [string]$ApiKey = '',
     [string]$Model = 'deepseek-flash',
     [string]$Endpoint = 'https://api.deepseek.com/chat/completions',
@@ -42,10 +42,10 @@ if ([string]::IsNullOrWhiteSpace($ApiKey)) { $ApiKey = $env:TS_RELEASE_API_KEY }
 if ([string]::IsNullOrWhiteSpace($ApiKey) -and -not $NoApiKey) {
     throw 'API key is required: pass -ApiKey, set $env:TS_RELEASE_API_KEY, or use -NoApiKey for a key-free package'
 }
-# Product version and pubspec/build version must agree: 0.05 == 0.0.5, 0.06 == 0.0.6, 0.07 == 0.0.7, 0.08 == 0.0.8, 0.09 == 0.0.9, 0.1.0 == 0.1.0.
+# Product version and pubspec/build version must agree: 0.05 == 0.0.5, 0.06 == 0.0.6, 0.07 == 0.0.7, 0.08 == 0.0.8, 0.09 == 0.0.9, 0.1.0 == 0.1.0, 0.1.1 == 0.1.1, 0.1.2 == 0.1.2.
 $pubVersion = (Select-String -Path (Join-Path $appDir 'pubspec.yaml') -Pattern '^version:\s*([0-9]+\.[0-9]+\.[0-9]+)' |
     Select-Object -First 1).Matches.Groups[1].Value
-$versionAliases = @{ '0.05' = '0.0.5'; '0.06' = '0.0.6'; '0.07' = '0.0.7'; '0.08' = '0.0.8'; '0.09' = '0.0.9'; '0.1.0' = '0.1.0' }
+$versionAliases = @{ '0.05' = '0.0.5'; '0.06' = '0.0.6'; '0.07' = '0.0.7'; '0.08' = '0.0.8'; '0.09' = '0.0.9'; '0.1.0' = '0.1.0'; '0.1.1' = '0.1.1'; '0.1.2' = '0.1.2' }
 if ($versionAliases.ContainsKey($Version) -and $pubVersion -ne $versionAliases[$Version]) {
     throw "version mismatch: product $Version requires pubspec $($versionAliases[$Version]) (found $pubVersion)"
 }
@@ -175,7 +175,7 @@ Bridge size     : $($bridgeItem.Length) bytes (ts_bridge.dll)
 
 Verification of this build:
   - $verification
-  - Detailed commands, exit codes and screenshots: docs/TASKSCHEDULER_0_1_0_ACCEPTANCE_REPORT.md
+  - Detailed commands, exit codes and screenshots: TASKSCHEDULER_0_1_2_ACCEPTANCE_REPORT.md (next to this package)
 
 Data location (default): <program folder>\TaskSchedulerData
   (falls back to %LOCALAPPDATA%\TaskSchedulerFlutter etc. when the program folder is
@@ -212,5 +212,4 @@ Write-Host ("api key : " + $(if ($hasEmbeddedKey) { 'embedded in config.json (no
 if (-not $KeepUnzipped) {
     # Keep the folder so the user can run it without unzipping; only report.
 }
-
 
