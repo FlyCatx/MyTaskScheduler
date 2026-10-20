@@ -37,6 +37,10 @@ class BezierMenuItem<T> {
   /// A hairline separator drawn *before* this row.
   final bool dividerBefore;
 
+  /// Right-aligned accelerator text (for example `Ctrl+Z`). Purely informational:
+  /// the menu row does not synthesize key events.
+  final String? shortcut;
+
   const BezierMenuItem({
     required this.value,
     required this.label,
@@ -44,6 +48,7 @@ class BezierMenuItem<T> {
     this.enabled = true,
     this.danger = false,
     this.dividerBefore = false,
+    this.shortcut,
   });
 }
 
@@ -207,14 +212,26 @@ class _BezierMenuRowState<T> extends State<_BezierMenuRow<T>> {
               style: TextStyle(fontSize: 13, color: color),
             ),
           ),
+          if (item.shortcut != null)
+            Padding(
+              padding: const EdgeInsets.only(left: 12),
+              child: Text(
+                item.shortcut!,
+                maxLines: 1,
+                style: TextStyle(
+                  fontSize: 11.5,
+                  color: item.enabled ? TsColors.textFaint : color,
+                ),
+              ),
+            ),
         ],
       ),
     );
 
     if (!item.enabled) {
-      // Inert: no pointer, no ripple, no hover feedback. A disabled action must not look
-      // clickable — but it stays visible so the user knows it exists.
-      return IgnorePointer(child: content);
+      // 惰性：没有指针、没有水波纹、没有悬停反馈；AbsorbPointer 同时避免
+      // 点击“穿到”菜单外的遮罩把菜单关掉（禁用项应保持菜单打开）。
+      return AbsorbPointer(child: content);
     }
     return MouseRegion(
       cursor: SystemMouseCursors.click,
@@ -228,4 +245,3 @@ class _BezierMenuRowState<T> extends State<_BezierMenuRow<T>> {
     );
   }
 }
-
