@@ -1,42 +1,55 @@
-# Build outputs
-/build*/
-/build-real/
+# Build outputs and local state — never commit.
+/build/
 /build-vs/
+/build-real/
+/build-flutter/
+/build-flutter-stale/
 /out/
 /dist/
-.vs/
-.tooltmp/
-
-# Flutter and Dart generated files
-flutter_app/.dart_tool/
-flutter_app/build/
-flutter_app/test_tmp/
-flutter_app/windows/flutter/ephemeral/
-
-# Local logs, settings, and secret material
-*.log
-config.json
-.env
-.env.*
-!.env.example
-
-# Local AI and cloud acceptance inputs, outputs, captures, and reports
 /acceptance/
-/VERIFICATION.md
-/docs/acceptance/
-/docs/archive/
-/docs/screenshots*/
-/docs/*ACCEPTANCE_REPORT.md
-/docs/*.png
-/flutter_app/ts_probe_*.json
-/flutter_app/ts_bridge_dart_test.json
-/flutter_app/settings.json
-/tests/run_business_samples.ps1
-/tests/check_sample_result.py
+/.vs/
+/.tooltmp/
+/flutter_app/build/
+/flutter_app/.dart_tool/
+/flutter_app/.flutter-plugins
+/flutter_app/.flutter-plugins-dependencies
+/flutter_app/windows/flutter/ephemeral/
+/flutter_app/android/
+/flutter_app/ios/
+/flutter_app/linux/
+/flutter_app/macos/
+/flutter_app/web/
 
-# One-off acceptance, UI probe, and demo-seed scripts
-/scripts/acceptance_ui*.ps1
-/scripts/capture_*.ps1
-/scripts/gui_probe.ps1
-/scripts/ui_*_probe.ps1
-/flutter_app/tool/seed_demo_data.dart
+# Third-party binaries and CA bundles are fetched by scripts; keep them out of source history.
+/third_party/
+
+# Local configuration may contain a key. Only config.example.json is tracked.
+/config.json
+**/config.json
+
+# Logs, caches, temporary probes.
+*.log
+*.tmp
+*.bak
+ts_test_gui_diag.log
+/docs/acceptance/
+/docs/screenshots/
+/docs/screenshots-0.07/
+
+# IDE / OS noise.
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+
+/docs/archive/
+/docs/*_ACCEPTANCE_REPORT.md
+/docs/0.09-app-startup.png
+/docs/0.1.0-settings.png
+/docs/0.1.2-*.png
+/docs/smoke-0.08-window.png
+/scripts/window_frame_probe.ps1
+/flutter_app/settings.json
+/flutter_app/ts_bridge_dart_test.json
+/flutter_app/ts_probe_filter.json
+/flutter_app/ts_probe_seed.json
