@@ -23,6 +23,7 @@ import '../model/display.dart';
 import '../model/plan.dart';
 import '../model/session.dart';
 import '../model/settings.dart';
+import '../model/timetable.dart';
 import 'calendar_constraints.dart';
 import 'calendar_planner.dart';
 import 'commit_gate.dart';
@@ -189,6 +190,14 @@ class AppController extends ChangeNotifier {
     return run != null && c != null && run.conversationId == c.id;
   }
 
+  /// 时间表可以在“没有计划版本的空会话”里编辑（先存草稿），也可以在当前版本上编辑；
+  /// 历史版本只读，分析进行中禁止提交。
+  bool get canEditTimetable {
+    if (hasActiveRunForCurrent) return false;
+    if (_viewVersion == null) return _conversation != null;
+    return isViewingCurrentVersion;
+  }
+
   // ------------------------------------------------------------- lifecycle
 
   Future<void> initialize() async {
@@ -227,6 +236,8 @@ class AppController extends ChangeNotifier {
   }
 
   Future<void> openConversation(String id) async {
+    // 切换会话前先落盘当前草稿：防抖窗口里的输入不能因为切换而丢失。
+    await flushPendingWrites();
     _busy = true;
     _notify();
     try {
@@ -388,7 +399,51 @@ class AppController extends ChangeNotifier {
       activityAt: DateTime.now(),
     );
     _cache[c.id] = _conversation!;
+    // 只在内存里立即生效；落盘走防抖，避免每个按键都写一次文件。
+    _draftDirty.add(c.id);
+    if (_inFlutterTest) {
+      // `flutter test` 会检查残留 Timer；测试环境立即落盘，行为与关闭时 flush 一致。
+      await flushPendingWrites();
+    } else {
+      _draftTimer?.cancel();
+      _draftTimer = Timer(const Duration(milliseconds: 450), () {
+        unawaited(flushPendingWrites());
+      });
+    }
     _notify();
+  }
+
+  static final bool _inFlutterTest =
+      Platform.environment['FLUTTER_TEST'] == 'true';
+
+  final Set<String> _draftDirty = <String>{};
+  Timer? _draftTimer;
+  bool _flushingDrafts = false;
+
+  /// Flushes debounced writes (draft text). Called before switching/closing and by tests.
+  Future<void> flushPendingWrites() async {
+    if (_draftDirty.isEmpty || _flushingDrafts) return;
+    _flushingDrafts = true;
+    _draftTimer?.cancel();
+    _draftTimer = null;
+    try {
+      while (_draftDirty.isNotEmpty) {
+        final id = _draftDirty.first;
+        _draftDirty.remove(id);
+        final c = _cache[id];
+        if (c == null) continue;
+        try {
+          await store.saveConversation(c);
+        } catch (e) {
+          _draftDirty.add(id);
+          _errorMessage = '草稿未能写入本地存储：$e';
+          _notify();
+          break;
+        }
+      }
+    } finally {
+      _flushingDrafts = false;
+    }
   }
 
   // ----------------------------------------------------------- attachments
@@ -398,9 +453,10 @@ class AppController extends ChangeNotifier {
     if (_disposed) return false;
     final file = File(path);
     final name = file.uri.pathSegments.isEmpty ? path : file.uri.pathSegments.last;
-    final current = _conversation;
-    if (current != null &&
-        current.attachments.any(
+    final startConversation = _conversation;
+    final targetId = startConversation?.id;
+    if (startConversation != null &&
+        startConversation.attachments.any(
             (a) => (a.originalPath ?? '') == path || a.label == name)) {
       _errorMessage = '这个文件已经添加过：$name';
       _notify();
@@ -426,8 +482,23 @@ class AppController extends ChangeNotifier {
         _notify();
         return false;
       }
-      // Only create a conversation once the file is known to be usable.
-      final c = current ?? await ensureConversation();
+      // 提取是异步的：完成后必须合并到“最近”的会话，不能用提取前的旧快照覆盖。
+      final latest = targetId == null
+          ? _conversation
+          : (_cache[targetId] ?? (targetId == _conversation?.id ? _conversation : null));
+      if (targetId != null && latest == null) {
+        _errorMessage = '文件提取完成时会话已被关闭或删除，未添加：$name';
+        _notify();
+        return false;
+      }
+      if (latest != null &&
+          latest.attachments.any(
+              (a) => (a.originalPath ?? '') == path || a.label == name)) {
+        _errorMessage = '这个文件已经添加过：$name';
+        _notify();
+        return false;
+      }
+      final c = latest ?? await ensureConversation();
       if (_disposed) return false;
       final attachment = Attachment(
         id: IdGenerator.next('att'),
@@ -438,13 +509,16 @@ class AppController extends ChangeNotifier {
         byteLength: utf8.encode(text).length,
       );
       await store.saveAttachment(attachment);
-      _conversation = c.copyWith(
-        attachments: [...c.attachments, attachment],
+      // 合并最新状态，保留提取期间用户新加的附件、改过的草稿和切换过的版本。
+      final current = _cache[c.id] ?? c;
+      final updated = current.copyWith(
+        attachments: [...current.attachments, attachment],
         updatedAt: DateTime.now(),
         activityAt: DateTime.now(),
       );
-      _cache[c.id] = _conversation!;
-      await store.saveConversation(_conversation!);
+      _cache[c.id] = updated;
+      if (_conversation?.id == c.id) _conversation = updated;
+      await store.saveConversation(updated);
       _errorMessage = null;
       if (doc.warning != null) _statusMessage = doc.warning;
       _notify();
@@ -470,6 +544,103 @@ class AppController extends ChangeNotifier {
 
   // -------------------------------------------------------------- analysis
 
+  /// 构造正式分析请求。独立成方法，测试可以直接断言请求形状而不启动网络。
+  ///
+  /// 时间表同时发送权威规则（timetable）与同一快照的派生日期区间
+  /// （effectiveTimetable）；派生失败时两份都不发送，由 [validateTimetableForRequest]
+  /// 在开始请求前给出明确错误，绝不把不完整数据交给模型。
+  Map<String, dynamic> buildAnalysisRequest({
+    required Conversation conversation,
+    required PlanVersion? version,
+    required String requestId,
+    required String draft,
+    String? planContext,
+  }) {
+    final clock = (version?.calendar.settings ?? calendar.settings).clock;
+    final wallNow = clock.toWall(DateTime.now());
+    final requestTimetable = conversation.includeTimetable
+        ? (version?.timetable ?? conversation.calendarDraft)
+        : null;
+    Map<String, dynamic>? effectiveTimetable;
+    if (requestTimetable != null) {
+      try {
+        effectiveTimetable = deriveEffectiveTimetable(requestTimetable);
+      } on TimetableRequestException {
+        effectiveTimetable = null;
+      }
+    }
+    return <String, dynamic>{
+      'requestSchemaVersion': 2,
+      'conversationId': conversation.id,
+      'requestId': requestId,
+      'baseVersionId': version?.id,
+      'baseRevision': version?.revision ?? 0,
+      'calendarRevision':
+          requestTimetable?.revision ?? version?.timetable?.revision ?? 0,
+      'context': <String, dynamic>{
+        'currentDate': WallClock.formatDateKey(
+            wallNow.year, wallNow.month, wallNow.day),
+        'timezoneId':
+            requestTimetable?.timezoneId ?? calendar.settings.timezoneId,
+        'timezoneOffsetMinutes': requestTimetable?.timezoneOffsetMinutes ??
+            calendar.settings.timezoneOffsetMinutes,
+      },
+      'userRequest': draft,
+      'planContext': planContext,
+      if (requestTimetable != null && effectiveTimetable != null) ...{
+        'timetable': requestTimetable.toJson(),
+        'effectiveTimetable': effectiveTimetable,
+      },
+      if (version != null)
+        'knownTasks': <Map<String, dynamic>>[
+          for (final t in version.tasks)
+            if (!t.isDone)
+              <String, dynamic>{
+                'id': t.id,
+                'title': t.name,
+                'estimatedMinutes': t.estimatedHours == null
+                    ? null
+                    : (t.estimatedHours! * 60).round(),
+              },
+        ],
+      'sources': <Map<String, dynamic>>[
+        if (draft.isNotEmpty)
+          {'kind': 'text', 'label': '文段1', 'text': draft},
+        for (final a in conversation.attachments)
+          if (a.kind == 'file' && a.originalPath != null)
+            {'kind': 'file', 'path': a.originalPath}
+          else
+            {'kind': 'text', 'label': a.label, 'text': a.text},
+        if (draft.isEmpty &&
+            conversation.attachments.isEmpty &&
+            requestTimetable != null)
+          {
+            'kind': 'text',
+            'label': '时间表',
+            'text': '（本次请求仅含已提交的结构化时间表，没有额外文字材料。）',
+          },
+      ],
+    };
+  }
+
+  /// 请求前置校验：非法时间表必须明确失败，而不是省略后继续当“没有约束”排程。
+  String? validateTimetableForRequest(Timetable? timetable) {
+    if (timetable == null) return null;
+    try {
+      deriveEffectiveTimetable(timetable);
+      return null;
+    } on TimetableRequestException catch (e) {
+      return '时间表数据不合法，未发送请求：${e.message}';
+    }
+  }
+
+  /// 是否有会随请求发送的已提交时间表（空会话草稿也算）。
+  bool get hasRequestTimetable {
+    final c = _conversation;
+    if (c == null || !c.includeTimetable) return false;
+    return (_viewVersion?.timetable ?? c.calendarDraft) != null;
+  }
+
   Future<void> startAnalysis() async {
     if (_run != null) return;
     // Sending from a brand-new session must work without clicking "新建会话" first.
@@ -477,8 +648,19 @@ class AppController extends ChangeNotifier {
     if (_disposed) return;
     final version = c.currentVersion;
     final draft = c.draftText.trim();
-    if (draft.isEmpty && c.attachments.isEmpty) {
-      _errorMessage = '请先粘贴材料或添加文本文件';
+    if (draft.isEmpty && c.attachments.isEmpty && !hasRequestTimetable) {
+      _errorMessage = '请先粘贴材料、添加文本文件，或先设置时间表';
+      _notify();
+      return;
+    }
+
+    // 非法时间表明确失败：不能把“带了非法约束”当成“没有约束”继续排程。
+    final requestTimetable = c.includeTimetable
+        ? (version?.timetable ?? c.calendarDraft)
+        : null;
+    final timetableError = validateTimetableForRequest(requestTimetable);
+    if (timetableError != null) {
+      _errorMessage = timetableError;
       _notify();
       return;
     }
@@ -544,23 +726,13 @@ class AppController extends ChangeNotifier {
     await store.saveConversation(withPending);
 
     final planContext = version == null ? null : _buildPlanContext(version);
-    final request = <String, dynamic>{
-      'conversationId': c.id,
-      'requestId': requestId,
-      'baseVersionId': version?.id,
-      'baseRevision': version?.revision ?? 0,
-      'userRequest': draft,
-      'planContext': planContext,
-      'sources': [
-        if (draft.isNotEmpty)
-          {'kind': 'text', 'label': '文段1', 'text': draft},
-        for (final a in c.attachments)
-          if (a.kind == 'file' && a.originalPath != null)
-            {'kind': 'file', 'path': a.originalPath}
-          else
-            {'kind': 'text', 'label': a.label, 'text': a.text},
-      ],
-    };
+    final request = buildAnalysisRequest(
+      conversation: c,
+      version: version,
+      requestId: requestId,
+      draft: draft,
+      planContext: planContext,
+    );
 
     try {
       final jobId = gw.analyzeAsync(request, modelSelection: selection);
@@ -800,6 +972,25 @@ class AppController extends ChangeNotifier {
       );
     }).toList(growable: false);
 
+    final liveIds = reconciled.tasks.map((t) => t.id).toSet();
+    final inheritedTimetable =
+        (base?.timetable ?? c.calendarDraft)?.inheritedBy(liveIds);
+    CalendarSchedule committedCalendar;
+    if (base == null && inheritedTimetable != null) {
+      // 空会话先画了时间表，再发送分析：首个版本必须把草稿时间表变成可用时间，
+      // 否则甘特图会显示“没有可用时间”。
+      final blank = CalendarSchedule.blank(now: DateTime.now()).settings;
+      final derived = inheritedTimetable.toCalendarSettings(blank);
+      committedCalendar = CalendarSchedule(
+        settings: derived,
+        segments: inheritedTimetable.taskSegments(derived.clock),
+      );
+    } else {
+      committedCalendar = (base?.calendar ??
+              CalendarSchedule.blank(now: DateTime.now()))
+          .inheritedBy(liveIds);
+    }
+
     final newVersion = PlanVersion(
       id: IdGenerator.next('ver'),
       conversationId: c.id,
@@ -819,9 +1010,8 @@ class AppController extends ChangeNotifier {
       // Calendar arrangements follow the tasks that still exist and keep their stable
       // id; segments of removed tasks are dropped (their work no longer exists) and
       // segments of a task whose estimate changed are re-checked by the conflict pass.
-      calendar: (base?.calendar ??
-              CalendarSchedule.blank(now: DateTime.now()))
-          .inheritedBy(reconciled.tasks.map((t) => t.id).toSet()),
+      calendar: committedCalendar,
+      timetable: inheritedTimetable,
     );
 
     final allowed = canCommit(
@@ -1146,7 +1336,8 @@ class AppController extends ChangeNotifier {
   /// Commits one calendar edit atomically: segments, estimated hours and revision move
   /// together, the C core re-validates, and storage is written once. A validation
   /// failure leaves memory *and* disk untouched.
-  Future<bool> applyCalendarEdit(CalendarEditOutcome outcome) async {
+  Future<bool> applyCalendarEdit(CalendarEditOutcome outcome,
+      {Timetable? timetable}) async {
     if (!outcome.ok) {
       _errorMessage = outcome.error;
       _notify();
@@ -1163,6 +1354,7 @@ class AppController extends ChangeNotifier {
       calendar: outcome.schedule,
       tasks: outcome.tasks ?? v.tasks,
       revision: v.revision + 1,
+      timetable: timetable ?? v.timetable,
     );
     final ok = await _applyTasks(next);
     if (ok) {
@@ -1251,6 +1443,128 @@ class AppController extends ChangeNotifier {
     ));
   }
 
+  // ------------------------------------------------ structured timetable
+
+  int get weekStartsOn => settings?.prefs.weekStartsOn ?? 1;
+
+  CalendarEditorMode get defaultCalendarEditor =>
+      settings?.prefs.defaultCalendarEditor ?? CalendarEditorMode.drawing;
+
+  List<UnavailableRange> get defaultUnavailableRanges =>
+      settings?.prefs.defaultUnavailableRanges ?? UnavailableRange.defaults;
+
+  /// 当前会话使用的时间表：版本数据 → 空会话草稿 → 由旧版设置推导/新建默认。
+  ///
+  /// [createDefault] 只应由“打开编辑器”调用：它会在内存里生成一份默认周表，
+  /// 不会写盘；取消后不会留下空附件。
+  Timetable currentTimetable() {
+    final v = _viewVersion;
+    final draft = _conversation?.calendarDraft;
+    if (v?.timetable != null) return v!.timetable!;
+    if (draft != null) return draft;
+    final wall = calendar.settings.clock.toWall(DateTime.now());
+    final today = WallClock.formatDateKey(wall.year, wall.month, wall.day);
+    final anchor = calendar.settings.planningStartDate.isEmpty
+        ? today
+        : calendar.settings.planningStartDate;
+    final weekStart = weekStartFor(anchor, weekStartsOn);
+    if (v == null || !v.calendar.settings.hasAvailability && v.calendar.segments.isEmpty) {
+      return Timetable.withDefaults(
+        weekStart: weekStart,
+        timezoneId: calendar.settings.timezoneId,
+        timezoneOffsetMinutes: calendar.settings.timezoneOffsetMinutes,
+        unavailable: <WallClockRange>[
+          for (final r in defaultUnavailableRanges)
+            WallClockRange(r.start, r.end),
+        ],
+      );
+    }
+    return Timetable.fromSchedule(v.calendar, weekStart: weekStart);
+  }
+
+  /// 输入框里的时间表摘要；没有可发送的时间表时为 null。
+  String? get timetableSummary {
+    final c = _conversation;
+    if (c == null || !c.includeTimetable) return null;
+    final tt = c.currentVersion?.timetable ?? c.calendarDraft;
+    if (tt == null) return null;
+    final free = tt.freeMinutesPerWeek;
+    final tasks = tt.taskEntries.length;
+    final bound = tt.boundMinutesByTask().values.fold<int>(0, (a, b) => a + b);
+    return '时间表：本周可用 ${free ~/ 60} 小时 ${free % 60} 分 · '
+        '蓝色 $tasks 段（已绑定 $bound 分钟）';
+  }
+
+  /// 移除随请求发送的时间表；不会删除已保存的日程数据。
+  Future<void> removeTimetableFromRequest() async {
+    final c = _conversation;
+    if (c == null) return;
+    final updated = c.copyWith(includeTimetable: false, updatedAt: DateTime.now());
+    _conversation = updated;
+    _cache[updated.id] = updated;
+    await store.saveConversation(updated);
+    _notify();
+  }
+
+  /// 应用编辑器的结果：时间表与 CalendarSettings 一起提交，并按需重新安排。
+  Future<bool> applyTimetableSettings(
+    CalendarSettings settings,
+    Timetable timetable, {
+    bool reschedule = true,
+  }) async {
+    final v = _viewVersion;
+    if (v == null) {
+      // 空会话：只保存草稿时间表，不创建空计划版本。
+      final c = _conversation;
+      if (c == null) return false;
+      final updated = c.copyWith(
+        calendarDraft: timetable.copyWith(revision: timetable.revision + 1),
+        includeTimetable: true,
+        updatedAt: DateTime.now(),
+        activityAt: DateTime.now(),
+      );
+      _conversation = updated;
+      _cache[updated.id] = updated;
+      await store.saveConversation(updated);
+      _statusMessage = '时间表已保存；发送时会随请求一起提交';
+      _notify();
+      return true;
+    }
+    final clock = settings.clock;
+    final nextTimetable = timetable.copyWith(revision: timetable.revision + 1);
+    final derived = nextTimetable.toCalendarSettings(settings);
+    final auto =
+        v.calendar.segments.where((s) => s.source == SegmentSource.auto);
+    final manual = nextTimetable.taskSegments(clock);
+    var schedule = v.calendar.copyWith(
+      settings: derived,
+      segments: List<ScheduleSegment>.unmodifiable(<ScheduleSegment>[
+        ...auto,
+        ...manual,
+      ]..sort((a, b) => a.start.compareTo(b.start))),
+    );
+    if (reschedule) {
+      final plan = autoSchedule(
+        current: schedule,
+        tasks: schedulingTasks(),
+        suggestedOrder: _display?.order ?? const <String>[],
+        now: DateTime.now(),
+        keepManual: true,
+      );
+      _calendarTaskNotes = plan.taskNotes;
+      schedule = plan.schedule;
+    }
+    return applyCalendarEdit(
+      CalendarEditOutcome(
+        schedule: schedule,
+        tasks: v.tasks,
+        label: '更新时间表',
+        message: reschedule ? '已保存时间表并重新安排' : '已保存时间表',
+      ),
+      timetable: nextTimetable,
+    );
+  }
+
   // ---------------------------------------- AI calendar-constraint proposals
 
   /// The material a constraint scan is allowed to see: everything the user actually
@@ -1280,9 +1594,15 @@ class AppController extends ChangeNotifier {
 
   /// Signature of the material above; a cached proposal set is only reused when this
   /// still matches, so "材料变化" can never silently keep an outdated answer.
-  String get calendarProposalSignature => materialSignature(<String>[
-        for (final s in calendarMaterialSources()) s.text,
-      ]);
+  String get calendarProposalSignature {
+    final tt = currentTimetable();
+    return materialSignature(<String>[
+      for (final s in calendarMaterialSources()) s.text,
+      'calendarRevision=${tt.revision}',
+      'dateFrom=${tt.dateFrom}',
+      'timezone=${tt.timezoneId}/${tt.timezoneOffsetMinutes}',
+    ]);
+  }
 
   /// Cached, validated proposal set for the current conversation (null = never asked).
   CalendarProposalSet? get calendarProposals => _conversation?.calendarProposals;
@@ -1356,9 +1676,44 @@ class AppController extends ChangeNotifier {
 
     final cid = c.id;
     final requestId = IdGenerator.next('cst');
+    final tt = currentTimetable();
+    // 识别请求同样携带同一快照的两份视图；非法数据明确失败。
+    final timetableError = validateTimetableForRequest(tt);
+    if (timetableError != null) {
+      return CalendarProposalOutcome.failure(timetableError);
+    }
+    Map<String, dynamic>? effectiveTimetable;
+    try {
+      effectiveTimetable = deriveEffectiveTimetable(tt);
+    } on TimetableRequestException catch (e) {
+      return CalendarProposalOutcome.failure(e.message);
+    }
+    final clock = (c.currentVersion?.calendar.settings ?? calendar.settings).clock;
+    final wallNow = clock.toWall(DateTime.now());
     final request = <String, dynamic>{
+      'requestSchemaVersion': 2,
       'conversationId': cid,
       'requestId': requestId,
+      'calendarRevision': tt.revision,
+      'context': <String, dynamic>{
+        'currentDate': WallClock.formatDateKey(
+            wallNow.year, wallNow.month, wallNow.day),
+        'timezoneId': tt.timezoneId,
+        'timezoneOffsetMinutes': tt.timezoneOffsetMinutes,
+      },
+      'timetable': tt.toJson(),
+      'effectiveTimetable': effectiveTimetable,
+      'knownTasks': <Map<String, dynamic>>[
+        for (final t in c.currentVersion?.tasks ?? const <TaskRecord>[])
+          if (!t.isDone)
+            <String, dynamic>{
+              'id': t.id,
+              'title': t.name,
+              'estimatedMinutes': t.estimatedHours == null
+                  ? null
+                  : (t.estimatedHours! * 60).round(),
+            },
+      ],
       'userRequest': sources.length > 1 ? sources.first.text : '',
       'sources': [
         for (final s in sources) {'kind': 'text', 'label': s.label, 'text': s.text},
@@ -1943,8 +2298,17 @@ class AppController extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// 关闭前等待防抖写入完成；返回后可以安全地销毁控制器。
+  Future<void> shutdown() async {
+    _draftTimer?.cancel();
+    _draftTimer = null;
+    await flushPendingWrites();
+  }
+
   @override
   void dispose() {
+    _draftTimer?.cancel();
+    unawaited(flushPendingWrites());
     _disposed = true;
     _stopTimers();
     interaction.dispose();
@@ -1957,4 +2321,3 @@ class _UndoEntry {
   final Future<void> Function() run;
   const _UndoEntry(this.label, this.run);
 }
-
