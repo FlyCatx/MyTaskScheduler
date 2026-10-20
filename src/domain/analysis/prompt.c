@@ -5,6 +5,7 @@
  */
 
 #include "prompt.h"
+#include "constraints.h"
 #include "mem.h"
 #include "text.h"
 #include "profile.h"
@@ -115,7 +116,19 @@ static const char *const SYSTEM_PROMPT =
 
 char *ts_prompt_build_system(void)
 {
-    return ts_strdup(SYSTEM_PROMPT);
+    /*
+     * 正式分析与约束识别共用同一段时间表语义：它是可信系统提示的一部分，
+     * 不随用户材料变化。时间表数据本身仍在 user 提示词的本地事实区块里。
+     */
+    TsBuf b;
+    ts_buf_init(&b);
+    if (ts_buf_puts(&b, SYSTEM_PROMPT) != 0 ||
+        ts_buf_puts(&b, "\n") != 0 ||
+        ts_buf_puts(&b, ts_constraints_timetable_semantics()) != 0) {
+        ts_buf_free(&b);
+        return NULL;
+    }
+    return b.data;
 }
 
 /* ------------------------------------------------------------------ */
@@ -529,4 +542,3 @@ oom:
     snprintf(err, err_sz, "构造请求失败（内存分配失败）");
     return 1;
 }
-

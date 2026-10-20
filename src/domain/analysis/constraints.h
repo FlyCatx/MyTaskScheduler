@@ -62,6 +62,35 @@ int ts_constraints_run(const TsConfig *cfg,
                        TsConstraintsResult *out);
 
 /*
+ * 协议 v2 入口：额外携带请求捕获的日期/时区与已提交的结构化时间表。
+ *
+ * - current_date 形如 "2026-10-20"；NULL 时回退到本机时间。
+ * - timezone 形如 "Asia/Shanghai (+08:00)"；NULL 时回退到本机时区。
+ * - timetable_json 是请求里的 timetable 对象原文；NULL/空表示没有时间表。
+ *   非空时会被原样嵌入 user 提示词的【结构化时间表】区块（仍是数据，不是指令）。
+ * - generation 之后所有相对日期都以 current_date 为准，不依赖运行当天。
+ */
+int ts_constraints_run_ex(const TsConfig *cfg,
+                          const char *user_request, const TsInputs *inputs,
+                          const char *current_date, const char *timezone,
+                          const char *timetable_json,
+                          const TsCancel *cancel, int generation,
+                          TsAnalyzeProgressFn progress, void *progress_userdata,
+                          TsConstraintsResult *out);
+
+/*
+ * 结构化时间表的可信语义（system 提示词共用）。返回静态字符串，调用方不得释放。
+ * 正式分析与约束识别两条提示词路径都必须包含它。
+ */
+const char *ts_constraints_timetable_semantics(void);
+
+/*
+ * 把请求里的 timetable JSON 规范化成提示词区块文本（owned）。
+ * 失败返回 NULL；用于约束识别与正式分析共用的输入边界。
+ */
+char *ts_constraints_timetable_block(const char *timetable_json);
+
+/*
  * 校验并规范化模型正文。成功返回 0，*out 为 owned 规范化 JSON。
  * 失败返回非 0，err 写入可展示原因（用于触发一次修复请求）。
  * 单独导出以便单元测试直接覆盖校验器。
@@ -74,4 +103,3 @@ int ts_constraints_validate(const char *body, size_t len,
 #endif
 
 #endif /* TS_CONSTRAINTS_H */
-
