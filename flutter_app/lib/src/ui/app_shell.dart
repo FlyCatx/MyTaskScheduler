@@ -24,6 +24,7 @@ import '../state/settings_controller.dart';
 import 'calendar_gantt.dart';
 import 'calendar_settings_dialog.dart';
 import 'composer.dart';
+import 'desktop_window.dart';
 import './widgets/bezier_ui.dart';
 import './widgets/bezier_menu.dart';
 import 'dag_graph.dart';
@@ -38,6 +39,7 @@ import 'summary_bar.dart';
 import 'task_edit_dialog.dart';
 import 'task_list.dart';
 import 'theme.dart';
+import 'title_bar.dart';
 import 'user_menu.dart';
 
 enum ChartMode { tree, gantt }
@@ -86,6 +88,12 @@ class _AppShellState extends State<AppShell> {
   Timer? _notificationPoll;
   String? _notifiedConversationId;
 
+  /// 自绘标题栏使用的窗口端口；原生不可用时所有调用安全降级。
+  final DesktopWindow _window = DesktopWindow();
+
+  /// 关闭流程去重：保存进行中再次点击关闭不会启动第二份流程。
+  bool _closing = false;
+
   AppController get c => widget.controller;
   SettingsController get s => widget.settings;
 
@@ -118,6 +126,24 @@ class _AppShellState extends State<AppShell> {
         // Older DLL / notification unavailable: stay silent instead of crashing.
       }
     });
+    // 原生关闭（标题栏 X、菜单退出、Alt+F4、任务栏关闭）统一走保存流程。
+    _window.onCloseRequested = _handleWindowClose;
+    _window.attach().then((_) {
+      if (mounted) _window.setCloseGuard(true);
+    });
+  }
+
+  /// 统一关闭流程：先落盘必要数据，再真正销毁窗口。
+  Future<void> _handleWindowClose() async {
+    if (_closing) return;
+    _closing = true;
+    try {
+      await c.flushPendingWrites();
+    } catch (_) {
+      // 即使落盘失败也要让用户能关闭窗口；失败信息已经由存储层记录。
+    }
+    await _window.confirmClose();
+    _closing = false;
   }
 
   @override
@@ -127,6 +153,8 @@ class _AppShellState extends State<AppShell> {
     c.interaction.removeListener(_onControllerChanged);
     _draft.dispose();
     _notificationPoll?.cancel();
+    _window.onCloseRequested = null;
+    _window.dispose();
     _rootFocus.dispose();
     _composerFocus.dispose();
     _searchFocus.dispose();
@@ -294,8 +322,19 @@ class _AppShellState extends State<AppShell> {
                */
               return Column(
                 children: [
+                  // 自绘标题栏：替代 Windows 原生标题栏的可见部分；拖动/吸附/缩放
+                  // 仍由原生 WM_NCHITTEST 处理。
+                  AppTitleBar(
+                    window: _window,
+                    sidebarVisible: showSidebar,
+                    onToggleSidebar: () =>
+                        setState(() => _showHistory = !_showHistory),
+                    onOpenAbout: _openAbout,
+                    onExit: _exitApplication,
+                  ),
                   SizedBox(
-                    height: kTopBarHeight,
+                    // 顶栏随文字缩放增高，1.5 倍字号下标题与副标题不会纵向溢出。
+                    height: TsSizes.textScaleAwareHeight(context, kTopBarHeight),
                     child: Row(
                       crossAxisAlignment: CrossAxisAlignment.stretch,
                       children: [
@@ -405,7 +444,8 @@ class _AppShellState extends State<AppShell> {
                               canSend: run == null &&
                                   (c.conversation != null) &&
                                   ((_draft.text.trim().isNotEmpty) ||
-                                      (conv?.attachments.isNotEmpty ?? false)),
+                                      (conv?.attachments.isNotEmpty ?? false) ||
+                                      c.hasRequestTimetable),
                               onSend: () => c.startAnalysis(),
                               onAddFile: _addFile,
                               onRemoveAttachment: (id) => c.removeAttachment(id),
@@ -423,6 +463,9 @@ class _AppShellState extends State<AppShell> {
                                   conv?.modelSelection ??
                                       s.defaultSelection),
                               onModelTap: _changeModel,
+                              onOpenTimetable: _openTimetableEditor,
+                              timetableSummary: c.timetableSummary,
+                              onRemoveTimetable: c.removeTimetableFromRequest,
                             ),
                           ),
                         ),
@@ -581,6 +624,18 @@ class _AppShellState extends State<AppShell> {
                                                         reschedule: reschedule),
                                                 ensureReady: c.ensureCalendarReady,
                                                 taskNotes: c.calendarTaskNotes,
+                                                timetable: c.viewVersion?.timetable ??
+                                                    c.conversation?.calendarDraft,
+                                                weekStartsOn: c.weekStartsOn,
+                                                defaultEditor: c.defaultCalendarEditor,
+                                                defaultUnavailableRanges:
+                                                    c.defaultUnavailableRanges,
+                                                taskNames: c.taskNamesById,
+                                                applyTimetable: (settings, timetable,
+                                                        {required bool reschedule}) =>
+                                                    c.applyTimetableSettings(
+                                                        settings, timetable,
+                                                        reschedule: reschedule),
                                               )
                                             : CalendarActions(
                                                 canEdit: false,
@@ -754,15 +809,22 @@ class _AppShellState extends State<AppShell> {
   }
 
   /// Opens the settings window. Unsaved changes are handled inside the dialog.
-  Future<void> _openSettings() async {
+  Future<void> _openSettings({SettingsSection initial = SettingsSection.account}) async {
     await showSettingsDialog(
       context,
       controller: s,
+      initial: initial,
       storageSource: c.storageSource,
       storageMemoryOnly: !c.storageIsPersistent,
     );
     if (mounted) _rootFocus.requestFocus();
   }
+
+  /// 「应用 → 关于 TaskScheduler」：复用设置窗口的“关于”页和未保存保护。
+  Future<void> _openAbout() => _openSettings(initial: SettingsSection.about);
+
+  /// 「应用 → 退出」和标题栏关闭按钮：交给统一关闭流程（保存后真正退出）。
+  Future<void> _exitApplication() => _window.requestClose();
 
   /// Selects the model for *this* conversation's future requests. The current plan is
   /// not regenerated — only the next supplement request uses the new selection.
@@ -781,6 +843,42 @@ class _AppShellState extends State<AppShell> {
     if (!mounted) return;
     if (error != null) _showSnack(error);
     _rootFocus.requestFocus();
+  }
+
+  /// 加号右侧的时间图标：与甘特图“可用时间”打开同一个编辑器、同一份时间表。
+  Future<void> _openTimetableEditor() async {
+    if (c.conversation == null) await c.ensureConversation();
+    if (!mounted) return;
+    if (!c.canEditTimetable) {
+      _showSnack('当前查看的是历史版本（或正在分析），不能修改时间表');
+      return;
+    }
+    final conv = c.conversation;
+    final settings = c.viewVersion?.calendar.settings ?? c.calendar.settings;
+    final timetable = c.currentTimetable();
+    final result = await showCalendarSettingsDialog(
+      context,
+      settings: settings,
+      now: DateTime.now(),
+      timetable: timetable,
+      weekStartsOn: c.weekStartsOn,
+      initialMode: c.defaultCalendarEditor,
+      defaultUnavailableRanges: c.defaultUnavailableRanges,
+      taskNames: c.taskNamesById,
+      useDefaultTimetable: conv?.calendarDraft == null && c.viewVersion == null,
+      onApply: (r) => c.applyTimetableSettings(
+        r.settings,
+        r.timetable ?? timetable,
+        reschedule: true,
+      ),
+    );
+    if (result == null || !mounted) return;
+    final ok = await c.applyTimetableSettings(
+      result.settings,
+      result.timetable ?? timetable,
+      reschedule: true,
+    );
+    if (!ok && mounted) _showSnack(c.errorMessage ?? '时间表未能保存');
   }
 
   /// Opens the NATIVE Windows file dialog (ts_bridge_pick_file → GetOpenFileNameW).
@@ -1465,4 +1563,3 @@ class _ToggleSidebarIntent extends Intent {
 class _StopAnalysisIntent extends Intent {
   const _StopAnalysisIntent();
 }
-

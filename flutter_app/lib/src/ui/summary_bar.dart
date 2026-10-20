@@ -1,9 +1,9 @@
-// Top title bar of the right pane — a FIXED-HEIGHT row (kTopBarHeight) so it lines up
-// with the sidebar's "会话" header.
+// Top title bar of the right pane. Its height comes from AppShell and grows with the
+// text scale so it lines up with the sidebar's header without clipping.
 //
-// Because the height is fixed, nothing that can wrap lives here: counts are on one
-// small subtitle line, and long messages (errors, storage fallback) are rendered by
-// [StatusStrip] inside the content area instead.
+// Nothing that can wrap lives here: counts are on one small subtitle line, and long
+// messages (errors, storage fallback) are rendered by [StatusStrip] inside the content
+// area instead.
 
 import 'package:flutter/material.dart';
 
@@ -49,7 +49,7 @@ class SummaryBar extends StatelessWidget {
             : conversation!.listTitle);
 
     return Container(
-      height: kTopBarHeight,
+      // 高度由 AppShell 的顶栏 SizedBox 决定（随文字缩放增高），这里不再固定。
       decoration: BoxDecoration(
         color: TsColors.surface,
         border: Border(bottom: BorderSide(color: TsColors.border)),
@@ -358,4 +358,3 @@ class WaitPromptBar extends StatelessWidget {
 
 /// Height shared with the sidebar so both title rows line up exactly.
 const double kSummaryBarHeight = kTopBarHeight;
-

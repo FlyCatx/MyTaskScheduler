@@ -1,14 +1,22 @@
 // “可用时间与占用时间”编辑框：排程范围、时区、每周可用时间、日期例外、
 // 占用/休息时段与拖动吸附步长；模型识别出的约束以“默认不勾选”的候选形式呈现。
 //
+// 0.1.1 起同一草稿有“手动填写 / 手动绘制”两种编辑方式：分段开关切换，不丢失任何
+// 已输入内容；底部为 取消 / 应用 / 保存。应用提交并留在窗口，保存提交后关闭。
+//
 // 主要函数/类型：showCalendarSettingsDialog、CalendarSettingsResult、CalendarDialogFrame。
+
+import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 
 import '../model/calendar.dart';
 import '../model/calendar_proposals.dart';
+import '../model/settings.dart';
+import '../model/timetable.dart';
 import '../state/calendar_constraints.dart';
 import '../state/time_ranges.dart';
+import './calendar_grid.dart';
 import './widgets/bezier_ui.dart';
 import 'theme.dart';
 
@@ -44,18 +52,34 @@ class CalendarSettingsResult {
   final int appliedProposals;
   final int skippedProposals;
 
+  /// 0.1.1：编辑后的结构化周时间表；绘图模式的修改也在这里。
+  final Timetable? timetable;
+
   const CalendarSettingsResult({
     required this.settings,
     this.appliedProposals = 0,
     this.skippedProposals = 0,
+    this.timetable,
   });
 }
 
+/// 打开编辑器。
+///
+/// [onApply] 只在“应用”时调用：提交成功返回 true，窗口保持打开并把当前状态设为
+/// 新的撤销基线；返回 false 时保留草稿并显示错误。
 Future<CalendarSettingsResult?> showCalendarSettingsDialog(
   BuildContext context, {
   required CalendarSettings settings,
   required DateTime now,
   CalendarProposalSource? proposals,
+  Timetable? timetable,
+  int weekStartsOn = 1,
+  CalendarEditorMode initialMode = CalendarEditorMode.fill,
+  List<UnavailableRange> defaultUnavailableRanges =
+      const <UnavailableRange>[],
+  Map<String, String> taskNames = const <String, String>{},
+  bool useDefaultTimetable = false,
+  Future<bool> Function(CalendarSettingsResult result)? onApply,
 }) {
   return showDialog<CalendarSettingsResult>(
     context: context,
@@ -63,6 +87,13 @@ Future<CalendarSettingsResult?> showCalendarSettingsDialog(
       settings: settings,
       now: now,
       proposals: proposals,
+      timetable: timetable,
+      weekStartsOn: weekStartsOn,
+      initialMode: initialMode,
+      defaultUnavailableRanges: defaultUnavailableRanges,
+      taskNames: taskNames,
+      useDefaultTimetable: useDefaultTimetable,
+      onApply: onApply,
     ),
   );
 }
@@ -139,11 +170,25 @@ class _CalendarSettingsDialog extends StatefulWidget {
   final CalendarSettings settings;
   final DateTime now;
   final CalendarProposalSource? proposals;
+  final Timetable? timetable;
+  final int weekStartsOn;
+  final CalendarEditorMode initialMode;
+  final List<UnavailableRange> defaultUnavailableRanges;
+  final Map<String, String> taskNames;
+  final bool useDefaultTimetable;
+  final Future<bool> Function(CalendarSettingsResult result)? onApply;
 
   const _CalendarSettingsDialog({
     required this.settings,
     required this.now,
     this.proposals,
+    this.timetable,
+    this.weekStartsOn = 1,
+    this.initialMode = CalendarEditorMode.fill,
+    this.defaultUnavailableRanges = const <UnavailableRange>[],
+    this.taskNames = const <String, String>{},
+    this.useDefaultTimetable = false,
+    this.onApply,
   });
 
   @override
@@ -162,7 +207,19 @@ class _CalendarSettingsDialogState extends State<_CalendarSettingsDialog> {
   final List<_ProposalRow> _proposalRows = <_ProposalRow>[];
   late final List<String> _pendingNotes;
   final ScrollController _scroll = ScrollController();
+
+  /// 绘制网格的纵向滚动位置：切换“填写/绘制”时保留，不因重建网格 State 归零。
+  final ScrollController _gridScroll = ScrollController();
   String? _error;
+
+  /// 0.1.1：模式、周导航与共享时间表草稿。
+  late CalendarEditorMode _mode;
+  late String _weekStart;
+  bool _weeklyMode = false;
+  late TimetableDraft _draft;
+  late TimetableGridController _grid;
+  late CalendarSettings _applied;
+  String? _applyStatus;
 
   // Proposal section state.
   CalendarProposalSet? _proposalSet;
@@ -213,6 +270,44 @@ class _CalendarSettingsDialogState extends State<_CalendarSettingsDialog> {
     }
     final cached = widget.proposals?.cached;
     if (cached != null) _installProposalSet(cached);
+
+    _mode = widget.initialMode;
+    _applied = widget.settings;
+    final anchor = widget.settings.planningStartDate.isEmpty
+        ? WallClock.formatDateKey(
+            clock.toWall(widget.now).year,
+            clock.toWall(widget.now).month,
+            clock.toWall(widget.now).day,
+          )
+        : widget.settings.planningStartDate;
+    _weekStart = weekStartFor(anchor, widget.weekStartsOn);
+    final Timetable initial;
+    if (widget.timetable != null) {
+      initial = widget.timetable!;
+    } else if (widget.useDefaultTimetable) {
+      initial = Timetable.withDefaults(
+        weekStart: _weekStart,
+        timezoneId: widget.settings.timezoneId,
+        timezoneOffsetMinutes: widget.settings.timezoneOffsetMinutes,
+        unavailable: <WallClockRange>[
+          for (final r in widget.defaultUnavailableRanges)
+            WallClockRange(r.start, r.end),
+        ],
+      );
+    } else {
+      initial = Timetable.fromSchedule(
+        CalendarSchedule(settings: widget.settings),
+        weekStart: _weekStart,
+      );
+    }
+    _draft = TimetableDraft(initial.copyWith(
+      dateFrom: _weekStart,
+      dateTo: addDaysToDateKey(_weekStart, 6),
+    ));
+    _grid = TimetableGridController(draft: _draft);
+    _grid.addListener(() {
+      if (mounted) setState(() {});
+    });
   }
 
   @override
@@ -236,6 +331,8 @@ class _CalendarSettingsDialogState extends State<_CalendarSettingsDialog> {
   void dispose() {
     if (_proposalLoading) widget.proposals?.cancel?.call();
     _scroll.dispose();
+    _gridScroll.dispose();
+    _grid.dispose();
     _startDate.dispose();
     _planningDays.dispose();
     _snap.dispose();
@@ -314,6 +411,12 @@ class _CalendarSettingsDialogState extends State<_CalendarSettingsDialog> {
       case CalendarProposalKind.exception:
         return _exceptions
             .any((e) => e.date.text.trim() == p.date && p.closed && e.closed);
+      case CalendarProposalKind.task:
+        return _draft.timetable.dates.any((e) =>
+            e.state == TimetableState.task &&
+            e.taskId == p.taskId &&
+            e.start == (p.ranges.isEmpty ? -1 : p.ranges.first.startMinute) &&
+            e.end == (p.ranges.isEmpty ? -1 : p.ranges.first.endMinute));
       case CalendarProposalKind.unclear:
         return false;
     }
@@ -361,29 +464,30 @@ class _CalendarSettingsDialogState extends State<_CalendarSettingsDialog> {
     return parseTimeRangesOrError(text, onError: onError);
   }
 
-  void _submit() {
+  /// 校验表单并得到基础 CalendarSettings；失败返回 null 并写入 [_error]。
+  CalendarSettings? _baseSettings() {
     String? error;
     void fail(String message) => error ??= message;
 
     final dateKey = parseDateKey(_startDate.text);
     if (dateKey == null) {
       setState(() => _error = '排程起始日期需为 yyyy-MM-dd');
-      return;
+      return null;
     }
     final days = int.tryParse(_planningDays.text.trim());
     if (days == null || days < 1 || days > 366) {
       setState(() => _error = '规划范围需为 1–366 天');
-      return;
+      return null;
     }
     final snap = int.tryParse(_snap.text.trim());
     if (snap == null || snap < 1 || snap > 120) {
       setState(() => _error = '吸附步长需为 1–120 分钟');
-      return;
+      return null;
     }
     final offset = int.tryParse(_offset.text.trim());
     if (offset == null || offset < -720 || offset > 840) {
       setState(() => _error = '时区偏移需为 -720–840 分钟（如 +480 表示东八区）');
-      return;
+      return null;
     }
 
     final weekly = <int, List<WallClockRange>>{};
@@ -394,7 +498,7 @@ class _CalendarSettingsDialogState extends State<_CalendarSettingsDialog> {
     }
     if (error != null) {
       setState(() => _error = error);
-      return;
+      return null;
     }
 
     final exceptions = <CalendarDateException>[];
@@ -419,7 +523,7 @@ class _CalendarSettingsDialogState extends State<_CalendarSettingsDialog> {
     }
     if (error != null) {
       setState(() => _error = error);
-      return;
+      return null;
     }
 
     final occupancies = <CalendarOccupancy>[];
@@ -454,69 +558,318 @@ class _CalendarSettingsDialogState extends State<_CalendarSettingsDialog> {
     }
     if (error != null) {
       setState(() => _error = error);
-      return;
+      return null;
     }
 
-    // Only the rows the user actually ticked are written into the real data. A
-    // duration-only row needs its time field filled in first; until then it stays a
-    // question instead of becoming a guessed block.
+    return CalendarSettings(
+      timezoneId: widget.settings.timezoneId,
+      timezoneOffsetMinutes: offset,
+      planningStartDate: dateKey,
+      planningDays: days,
+      weekly: WeeklyAvailability(weekly),
+      exceptions: exceptions,
+      occupancies: occupancies,
+      snapMinutes: snap,
+      chunkMinutes: widget.settings.chunkMinutes,
+      pendingNotes: _pendingNotes,
+    );
+  }
+
+  /// 收集被勾选的候选；时长型候选必须由用户填入具体时段。
+  List<CalendarProposal>? _acceptedProposals(
+      void Function(String) fail) {
     final accepted = <CalendarProposal>[];
     for (final row in _proposalRows) {
       if (!row.accepted) continue;
       final controller = row.ranges;
       if (controller != null) {
         final typed = _parse(controller.text, fail);
-        if (typed == null) break;
+        if (typed == null) return null;
         if (typed.isEmpty) {
           fail('「${row.proposal.title}」需要先填写具体时段（例如 12:00-12:30）');
-          break;
+          return null;
         }
         accepted.add(row.proposal.withRanges(typed));
       } else {
         accepted.add(row.proposal);
       }
     }
-    if (error != null) {
-      setState(() => _error = error);
-      return;
+    return accepted;
+  }
+
+  /// 生成待提交结果；失败时返回 null 且不关闭窗口。
+  CalendarSettingsResult? _buildResult() {
+    final base = _baseSettings();
+    if (base == null) return null;
+    String? error;
+    final accepted = _acceptedProposals((message) => error ??= message);
+    if (accepted == null || error != null) {
+      setState(() => _error = error ?? '候选内容不合法');
+      return null;
+    }
+
+    if (_mode == CalendarEditorMode.drawing) {
+      final derived = _draft.timetable.toCalendarSettings(base);
+      final settings = derived.copyWith(pendingNotes: _pendingNotes);
+      return CalendarSettingsResult(
+        settings: settings,
+        timetable: _draft.timetable,
+      );
     }
 
     final applied = applyAcceptedProposals(
       accepted: accepted,
-      weekly: weekly,
-      exceptions: exceptions,
-      occupancies: occupancies,
+      weekly: <int, List<WallClockRange>>{
+        for (final e in base.weekly.byWeekday.entries) e.key: [...e.value],
+      },
+      exceptions: base.exceptions,
+      occupancies: base.occupancies,
       pendingNotes: _pendingNotes,
       idPrefix: 'p${DateTime.now().millisecondsSinceEpoch}',
     );
-
-    Navigator.of(context).pop(CalendarSettingsResult(
-      settings: CalendarSettings(
-        timezoneId: widget.settings.timezoneId,
-        timezoneOffsetMinutes: offset,
-        planningStartDate: dateKey,
-        planningDays: days,
+    return CalendarSettingsResult(
+      settings: base.copyWith(
         weekly: WeeklyAvailability(applied.weekly),
         exceptions: applied.exceptions,
         occupancies: applied.occupancies,
-        snapMinutes: snap,
-        chunkMinutes: widget.settings.chunkMinutes,
         pendingNotes: applied.pendingNotes,
       ),
       appliedProposals: applied.applied,
       skippedProposals: applied.skipped,
-    ));
+      timetable: _draft.timetable,
+    );
+  }
+
+  Future<void> _apply() async {
+    final result = _buildResult();
+    if (result == null) return;
+    final callback = widget.onApply;
+    if (callback != null) {
+      final ok = await callback(result);
+      if (!mounted) return;
+      if (!ok) {
+        setState(() => _error ??= '提交失败，修改仍保留在编辑器中');
+        return;
+      }
+    }
+    setState(() {
+      _error = null;
+      _applyStatus = '已应用';
+      _applied = result.settings;
+      _draft.markApplied();
+    });
+  }
+
+  void _save() {
+    final result = _buildResult();
+    if (result == null) return;
+    Navigator.of(context).pop(result);
+  }
+
+  /// 手动填写 ↔ 手动绘制：先把当前表单内容并入草稿，避免切换丢修改。
+  void _setMode(CalendarEditorMode mode) {
+    if (mode == _mode) return;
+    final base = _baseSettings();
+    if (base == null) return;
+    if (mode == CalendarEditorMode.fill) {
+      // 绘制 → 填写：把当前周表推导出的周可用/日期例外/占用写回表单。
+      final derived = _draft.timetable.toCalendarSettings(base);
+      for (final d in _weekdays) {
+        _weekly[d]!.text = formatTimeRanges(derived.weekly.forWeekday(d));
+      }
+      for (final row in _exceptions) {
+        row.dispose();
+      }
+      _exceptions
+        ..clear()
+        ..addAll(derived.exceptions.map(_ExceptionRow.new));
+      for (final row in _occupancies) {
+        row.dispose();
+      }
+      _occupancies
+        ..clear()
+        ..addAll(derived.occupancies.map(_OccupancyRow.new));
+    } else {
+      // 填写 → 绘制：用当前表单重建时间表（保留已画的日期规则）。
+      final rebuilt = Timetable.fromSchedule(
+        CalendarSchedule(settings: base),
+        weekStart: _weekStart,
+      );
+      final merged = _mergeTimetables(rebuilt, _draft.timetable);
+      _draft.reset(merged.copyWith(
+        dateFrom: _weekStart,
+        dateTo: addDaysToDateKey(_weekStart, 6),
+      ));
+    }
+    setState(() {
+      _mode = mode;
+      _error = null;
+    });
+  }
+
+  /// 表单重建的周规则 + 已绘制草稿的日期规则；同一周的同一天以草稿为准。
+  Timetable _mergeTimetables(Timetable fromForm, Timetable drawn) {
+    final dateKeys = drawn.dates.map((e) => e.date!).toSet();
+    final dates = <TimetableEntry>[
+      for (final e in fromForm.dates)
+        if (!dateKeys.contains(e.date)) e,
+      ...drawn.dates,
+    ];
+    return drawn.copyWith(weekly: fromForm.weekly, dates: dates);
+  }
+
+  void _shiftWeek(int days) {
+    final next = addDaysToDateKey(_weekStart, days);
+    setState(() {
+      _weekStart = next;
+      _draft.reset(_draft.timetable.copyWith(
+        dateFrom: next,
+        dateTo: addDaysToDateKey(next, 6),
+      ));
+    });
+  }
+
+  Future<void> _pickMonth() async {
+    final picked = await showTimetableMonthPicker(
+      context,
+      initialDate: _weekStart,
+      weekStartsOn: widget.weekStartsOn,
+    );
+    if (picked == null || !mounted) return;
+    setState(() {
+      _weekStart = weekStartFor(picked, widget.weekStartsOn);
+      _draft.reset(_draft.timetable.copyWith(
+        dateFrom: _weekStart,
+        dateTo: addDaysToDateKey(_weekStart, 6),
+      ));
+    });
+  }
+
+  Future<void> _pickYear() async {
+    final picked = await showTimetableYearPicker(
+      context,
+      initialDate: _weekStart,
+    );
+    if (picked == null || !mounted) return;
+    final selected = await showTimetableMonthPicker(
+      context,
+      initialDate: picked,
+      weekStartsOn: widget.weekStartsOn,
+    );
+    if (selected == null || !mounted) return;
+    setState(() {
+      _weekStart = weekStartFor(selected, widget.weekStartsOn);
+      _draft.reset(_draft.timetable.copyWith(
+        dateFrom: _weekStart,
+        dateTo: addDaysToDateKey(_weekStart, 6),
+      ));
+    });
   }
 
   // ---------------------------------------------------------------- build
 
+  /// 绘制模式的弹窗尺寸：可用客户区约 93% 宽、88–90% 高，四周 24–48 逻辑像素。
+  /// 填写模式使用较小但同一外壳的尺寸，两种模式之间平滑过渡。
+  ({double width, double height}) _dialogSize(MediaQueryData media) {
+    final insets = media.viewInsets;
+    final usableWidth = math.max(320.0, media.size.width - insets.horizontal);
+    final usableHeight = math.max(240.0, media.size.height - insets.vertical);
+    final drawing = _mode == CalendarEditorMode.drawing;
+    if (drawing) {
+      final marginX = (usableWidth * 0.035).clamp(24.0, 48.0).toDouble();
+      final marginY = (usableHeight * 0.05).clamp(24.0, 48.0).toDouble();
+      return (
+        width: math.max(320.0, usableWidth - marginX * 2),
+        height: math.max(240.0, usableHeight - marginY * 2),
+      );
+    }
+    return (
+      width: math.min(680.0, math.max(360.0, usableWidth - 96)),
+      height: math.min(640.0, math.max(320.0, usableHeight - 80)),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
-    return AlertDialog(
-      titlePadding: const EdgeInsets.fromLTRB(20, 14, 12, 6),
-      contentPadding: const EdgeInsets.fromLTRB(20, 0, 20, 0),
-      actionsPadding: const EdgeInsets.fromLTRB(20, 10, 20, 14),
-      title: Row(
+    final media = MediaQuery.of(context);
+    final size = _dialogSize(media);
+    final reduceMotion = media.disableAnimations;
+    final duration =
+        reduceMotion ? Duration.zero : const Duration(milliseconds: 200);
+    final drawing = _mode == CalendarEditorMode.drawing;
+
+    return Dialog(
+      // 尺寸完全由内容决定，不叠加 AlertDialog 的默认边距与 560 宽度上限。
+      insetPadding: EdgeInsets.zero,
+      child: AnimatedContainer(
+        duration: duration,
+        curve: Curves.easeOutCubic,
+        width: size.width,
+        height: size.height,
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            _titleRow(context),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(20, 0, 20, 0),
+              child: _editorHeader(),
+            ),
+            const SizedBox(height: 6),
+            Expanded(
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 20),
+                child: AnimatedSwitcher(
+                  duration: duration,
+                  switchInCurve: Curves.easeOutCubic,
+                  switchOutCurve: Curves.easeInCubic,
+                  transitionBuilder: (child, animation) {
+                    // 淡入 + 轻微位移；正在淡出的旧子树不接收指针，避免两份可交互表单。
+                    final outgoing =
+                        animation.status == AnimationStatus.reverse;
+                    final curved = CurvedAnimation(
+                      parent: animation,
+                      curve: Curves.easeOutCubic,
+                      reverseCurve: Curves.easeInCubic,
+                    );
+                    return IgnorePointer(
+                      ignoring: outgoing,
+                      child: FadeTransition(
+                        opacity: curved,
+                        child: SlideTransition(
+                          position: Tween<Offset>(
+                            begin: const Offset(0, 0.015),
+                            end: Offset.zero,
+                          ).animate(curved),
+                          child: child,
+                        ),
+                      ),
+                    );
+                  },
+                  child: KeyedSubtree(
+                    key: ValueKey<CalendarEditorMode>(_mode),
+                    child: drawing ? _drawContent() : _fillContent(),
+                  ),
+                ),
+              ),
+            ),
+            if (_error != null)
+              Padding(
+                padding: const EdgeInsets.fromLTRB(20, 6, 20, 0),
+                child: Text(_error!,
+                    key: const Key('calendar-settings-error'),
+                    style: TextStyle(fontSize: 11.5, color: TsColors.blocked)),
+              ),
+            _footer(context),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _titleRow(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(20, 14, 12, 4),
+      child: Row(
         children: [
           const Expanded(
             child: Text('可用时间与占用时间', style: TextStyle(fontSize: 15)),
@@ -529,159 +882,409 @@ class _CalendarSettingsDialogState extends State<_CalendarSettingsDialog> {
           ),
         ],
       ),
-      content: SizedBox(
-        width: 660,
-        child: ConstrainedBox(
-          constraints: const BoxConstraints(maxHeight: 560),
-          child: Scrollbar(
-            controller: _scroll,
-            // Always visible: a hidden scrollbar is what made the 0.06 build look like
-            // the buttons were simply cut off at the window edge.
-            thumbVisibility: true,
-            child: SingleChildScrollView(
-              controller: _scroll,
-              padding: const EdgeInsets.only(right: _scrollbarGutter),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  _sectionTitle('排程范围'),
-                  _rangeRow(),
-                  const SizedBox(height: 8),
-                  _offsetRow(),
-                  const SizedBox(height: 14),
-                  _sectionTitle('每周可用时间（留空 = 该天不可用）'),
-                  _presets(),
-                  const SizedBox(height: 6),
-                  for (final d in _weekdays)
-                    Padding(
-                      padding: const EdgeInsets.only(bottom: 5),
-                      child: Row(
-                        children: [
-                          SizedBox(
-                            width: 52,
-                            child: Text(_weekdayLabel(d),
-                                style: TextStyle(
-                                    fontSize: 11.5,
-                                    color: TsColors.textSecondary)),
-                          ),
-                          Expanded(
-                            child: TextField(
-                              key: Key('calendar-weekday-$d'),
-                              controller: _weekly[d],
-                              style: const TextStyle(fontSize: 12),
-                              decoration: const InputDecoration(
-                                hintText: '例如 08:00-12:00, 14:00-18:00',
-                                isDense: true,
-                              ),
-                              // Live total: the visible sum must follow typing, not the
-                              // next unrelated rebuild.
-                              onChanged: (_) => setState(() {}),
-                            ),
-                          ),
-                        ],
+    );
+  }
+
+  /// 填写模式：固定标题/模式开关/底部按钮，只有中间表单滚动。
+  Widget _fillContent() {
+    return ScrollConfiguration(
+      behavior: ScrollConfiguration.of(context).copyWith(scrollbars: false),
+      child: Scrollbar(
+        controller: _scroll,
+        // Always visible: a hidden scrollbar is what made the 0.06 build look like
+        // the buttons were simply cut off at the window edge.
+        thumbVisibility: true,
+        child: SingleChildScrollView(
+          controller: _scroll,
+          padding: const EdgeInsets.only(right: _scrollbarGutter, bottom: 8),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              _sectionTitle('排程范围'),
+              _rangeRow(),
+              const SizedBox(height: 8),
+              _offsetRow(),
+              const SizedBox(height: 14),
+              _sectionTitle('每周可用时间（留空 = 该天不可用）'),
+              _presets(),
+              const SizedBox(height: 6),
+              for (final d in _weekdays)
+                Padding(
+                  padding: const EdgeInsets.only(bottom: 5),
+                  child: Row(
+                    children: [
+                      SizedBox(
+                        width: 52,
+                        child: Text(_weekdayLabel(d),
+                            style: TextStyle(
+                                fontSize: 11.5,
+                                color: TsColors.textSecondary)),
                       ),
-                    ),
-                  const SizedBox(height: 4),
-                  Text(
-                    '每周可用合计：${_weeklyMinutes()} 分钟'
-                    '（${(_weeklyMinutes() / 60).toStringAsFixed(1)} 小时）',
-                    key: const Key('calendar-weekly-total'),
-                    style: TextStyle(fontSize: 10.5, color: TsColors.textFaint),
-                  ),
-                  const SizedBox(height: 14),
-                  _sectionTitle('日期例外'),
-                  for (var i = 0; i < _exceptions.length; i++)
-                    Padding(
-                      padding: const EdgeInsets.only(bottom: 6),
-                      child: _exceptionRow(i),
-                    ),
-                  _addButton(
-                    key: const Key('calendar-add-exception'),
-                    label: '新增日期例外',
-                    icon: Icons.add,
-                    onTap: () =>
-                        setState(() => _exceptions.add(_ExceptionRow.blank())),
-                  ),
-                  const SizedBox(height: 14),
-                  _sectionTitle('课程 / 活动 / 休息占用'),
-                  for (var i = 0; i < _occupancies.length; i++)
-                    Padding(
-                      padding: const EdgeInsets.only(bottom: 8),
-                      child: _occupancyRow(i),
-                    ),
-                  Padding(
-                    padding: const EdgeInsets.only(bottom: 4, top: 2),
-                    child: Text(
-                      '日期留空 = 每周重复（按上面选的星期）；'
-                      '填 yyyy-MM-dd = 只影响该天。',
-                      style: TextStyle(
-                          fontSize: 10.5, color: TsColors.textFaint),
-                    ),
-                  ),
-                  _addButton(
-                    key: const Key('calendar-add-occupancy'),
-                    label: '新增占用',
-                    icon: Icons.add,
-                    onTap: () =>
-                        setState(() => _occupancies.add(_OccupancyRow.blank())),
-                  ),
-                  const SizedBox(height: 14),
-                  _proposalSection(),
-                  if (_pendingNotes.isNotEmpty) ...[
-                    const SizedBox(height: 14),
-                    _sectionTitle('待确认（未结构化，不会自动使用）'),
-                    for (final note in _pendingNotes)
-                      Padding(
-                        padding: const EdgeInsets.only(bottom: 4),
-                        child: Row(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Padding(
-                              padding: const EdgeInsets.only(top: 2),
-                              child: Icon(Icons.help_outline,
-                                  size: 13, color: TsColors.pending),
-                            ),
-                            const SizedBox(width: 6),
-                            Expanded(
-                              child: Text(note,
-                                  style: TextStyle(
-                                      fontSize: 10.5,
-                                      height: 1.5,
-                                      color: TsColors.textSecondary)),
-                            ),
-                          ],
+                      Expanded(
+                        child: TextField(
+                          key: Key('calendar-weekday-$d'),
+                          controller: _weekly[d],
+                          style: const TextStyle(fontSize: 12),
+                          decoration: const InputDecoration(
+                            hintText: '例如 08:00-12:00, 14:00-18:00',
+                            isDense: true,
+                          ),
+                          // Live total: the visible sum must follow typing, not the
+                          // next unrelated rebuild.
+                          onChanged: (_) => setState(() {}),
                         ),
                       ),
-                  ],
-                  if (_error != null) ...[
-                    const SizedBox(height: 10),
-                    Text(_error!,
-                        style:
-                            TextStyle(fontSize: 11.5, color: TsColors.blocked)),
-                  ],
-                  const SizedBox(height: 4),
-                ],
+                    ],
+                  ),
+                ),
+              const SizedBox(height: 4),
+              Text(
+                '每周可用合计：${_weeklyMinutes()} 分钟'
+                '（${(_weeklyMinutes() / 60).toStringAsFixed(1)} 小时）',
+                key: const Key('calendar-weekly-total'),
+                style: TextStyle(fontSize: 10.5, color: TsColors.textFaint),
               ),
-            ),
+              const SizedBox(height: 14),
+              _sectionTitle('日期例外'),
+              for (var i = 0; i < _exceptions.length; i++)
+                Padding(
+                  padding: const EdgeInsets.only(bottom: 6),
+                  child: _exceptionRow(i),
+                ),
+              _addButton(
+                key: const Key('calendar-add-exception'),
+                label: '新增日期例外',
+                icon: Icons.add,
+                onTap: () =>
+                    setState(() => _exceptions.add(_ExceptionRow.blank())),
+              ),
+              const SizedBox(height: 14),
+              _sectionTitle('课程 / 活动 / 休息占用'),
+              for (var i = 0; i < _occupancies.length; i++)
+                Padding(
+                  padding: const EdgeInsets.only(bottom: 8),
+                  child: _occupancyRow(i),
+                ),
+              Padding(
+                padding: const EdgeInsets.only(bottom: 4, top: 2),
+                child: Text(
+                  '日期留空 = 每周重复（按上面选的星期）；'
+                  '填 yyyy-MM-dd = 只影响该天。',
+                  style: TextStyle(fontSize: 10.5, color: TsColors.textFaint),
+                ),
+              ),
+              _addButton(
+                key: const Key('calendar-add-occupancy'),
+                label: '新增占用',
+                icon: Icons.add,
+                onTap: () =>
+                    setState(() => _occupancies.add(_OccupancyRow.blank())),
+              ),
+              const SizedBox(height: 14),
+              _proposalSection(),
+              if (_pendingNotes.isNotEmpty) ...[
+                const SizedBox(height: 14),
+                _sectionTitle('待确认（未结构化，不会自动使用）'),
+                for (final note in _pendingNotes)
+                  Padding(
+                    padding: const EdgeInsets.only(bottom: 4),
+                    child: Row(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Padding(
+                          padding: const EdgeInsets.only(top: 2),
+                          child: Icon(Icons.help_outline,
+                              size: 13, color: TsColors.pending),
+                        ),
+                        const SizedBox(width: 6),
+                        Expanded(
+                          child: Text(note,
+                              style: TextStyle(
+                                  fontSize: 10.5,
+                                  height: 1.5,
+                                  color: TsColors.textSecondary)),
+                        ),
+                      ],
+                    ),
+                  ),
+              ],
+              const SizedBox(height: 4),
+            ],
           ),
         ),
       ),
-      actions: [
-        _action(
-          key: const Key('calendar-settings-cancel'),
-          label: '取消',
-          filled: false,
-          onPressed: () => Navigator.of(context).pop(),
-        ),
-        const SizedBox(width: 10),
-        _action(
-          key: const Key('calendar-settings-save'),
-          label: '保存并重新安排',
-          filled: true,
-          onPressed: _submit,
+    );
+  }
+
+  Widget _footer(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.fromLTRB(20, 10, 20, 14),
+      child: Row(
+        children: [
+          if (_applyStatus != null)
+            Expanded(
+              child: Text(_applyStatus!,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(fontSize: 11, color: TsColors.ready)),
+            )
+          else
+            const Spacer(),
+          _action(
+            key: const Key('calendar-settings-cancel'),
+            label: '取消',
+            filled: false,
+            onPressed: () => Navigator.of(context).pop(),
+          ),
+          const SizedBox(width: 10),
+          _action(
+            key: const Key('calendar-settings-apply'),
+            label: '应用',
+            filled: false,
+            onPressed: _apply,
+          ),
+          const SizedBox(width: 10),
+          _action(
+            key: const Key('calendar-settings-save'),
+            label: '保存并重新安排',
+            filled: true,
+            onPressed: _save,
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _editorHeader() {
+    // Wrap 而不是固定 Row：弹窗在两种尺寸之间动画过渡时，较窄的一帧会把
+    // 周导航推到下一行，而不是溢出；宽窗口仍然是一行。
+    return Wrap(
+      spacing: 4,
+      runSpacing: 4,
+      crossAxisAlignment: WrapCrossAlignment.center,
+      children: [
+        EditorModeSwitch(mode: _mode, onChanged: _setMode),
+        if (_mode == CalendarEditorMode.drawing) ...[
+          const SizedBox(width: 8),
+          _navButton(Icons.calendar_month_outlined, '月视图', _pickMonth),
+          _navButton(Icons.date_range_outlined, '年视图', _pickYear),
+          const SizedBox(width: 2),
+          IconButton(
+            key: const Key('timetable-prev-week'),
+            tooltip: '上一周',
+            onPressed: () => _shiftWeek(-7),
+            icon: const Icon(Icons.chevron_left, size: 18),
+          ),
+          Text(
+            _weekRangeLabel(),
+            key: const Key('timetable-week-label'),
+            style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w600),
+          ),
+          IconButton(
+            key: const Key('timetable-next-week'),
+            tooltip: '下一周',
+            onPressed: () => _shiftWeek(7),
+            icon: const Icon(Icons.chevron_right, size: 18),
+          ),
+          TextButton(
+            key: const Key('timetable-this-week'),
+            onPressed: _goThisWeek,
+            child: const Text('本周'),
+          ),
+          const SizedBox(width: 8),
+          FilterChip(
+            key: const Key('timetable-weekly-mode'),
+            label: const Text('每周重复'),
+            selected: _weeklyMode,
+            onSelected: (value) => setState(() => _weeklyMode = value),
+          ),
+        ],
+      ],
+    );
+  }
+
+  Widget _navButton(IconData icon, String tooltip, VoidCallback onTap) {
+    return IconButton(
+      tooltip: tooltip,
+      onPressed: onTap,
+      icon: Icon(icon, size: 17),
+    );
+  }
+
+  void _goThisWeek() {
+    final wall = _applied.clock.toWall(widget.now);
+    final today = WallClock.formatDateKey(wall.year, wall.month, wall.day);
+    setState(() {
+      _weekStart = weekStartFor(today, widget.weekStartsOn);
+      _draft.reset(_draft.timetable.copyWith(
+        dateFrom: _weekStart,
+        dateTo: addDaysToDateKey(_weekStart, 6),
+      ));
+    });
+  }
+
+  String _weekRangeLabel() {
+    final end = addDaysToDateKey(_weekStart, 6);
+    final startYear = _weekStart.substring(0, 4);
+    final endYear = end.substring(0, 4);
+    if (startYear == endYear) {
+      return '$startYear ${_md(_weekStart)} – ${_md(end)}';
+    }
+    return '${_weekStart.substring(0, 4)}-${_md(_weekStart)} – '
+        '${end.substring(0, 4)}-${_md(end)}';
+  }
+
+  static String _md(String key) =>
+      '${int.parse(key.substring(5, 7))}月${int.parse(key.substring(8))}日';
+
+  Widget _drawContent() {
+    // 不设固定宽高：标题、模式开关、工具栏、日期表头与底部状态/按钮由外壳固定，
+    // 只有网格占据剩余空间并独立滚动。
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        _drawToolbar(),
+        const SizedBox(height: 6),
+        Expanded(
+          child: Container(
+            decoration: BoxDecoration(
+              border: Border.all(color: TsColors.border),
+              borderRadius: const BorderRadius.all(Radius.circular(9)),
+            ),
+            clipBehavior: Clip.antiAlias,
+            child: TimetableGrid(
+              key: const Key('timetable-grid'),
+              controller: _grid,
+              weekStart: _weekStart,
+              weekStartsOn: widget.weekStartsOn,
+              weeklyMode: _weeklyMode,
+              taskNames: widget.taskNames,
+              verticalController: _gridScroll,
+              onChanged: () {},
+            ),
+          ),
         ),
       ],
     );
+  }
+
+  Widget _drawToolbar() {
+    return Wrap(
+      spacing: 8,
+      runSpacing: 6,
+      crossAxisAlignment: WrapCrossAlignment.center,
+      children: [
+        BezierSegments(
+          key: const Key('timetable-brush'),
+          height: 30,
+          itemWidth: 74,
+          items: const [
+            BezierSegmentItem('占用'),
+            BezierSegmentItem('任务'),
+          ],
+          selected: _grid.brush == TimetableState.occupied ? 0 : 1,
+          onChanged: (index) => _grid.setBrush(index == 0
+              ? TimetableState.occupied
+              : TimetableState.task),
+        ),
+        _smallToolButton('撤销', Icons.undo, () {
+          _grid.undo();
+          setState(() {});
+        }),
+        _smallToolButton('清空本周', Icons.layers_clear, _clearWeek),
+        _smallToolButton('绑定蓝块', Icons.link, _bindUnbound),
+        Padding(
+          padding: const EdgeInsets.only(left: 4),
+          child: Text(
+            _weeklyMode ? '正在编辑每周模板' : '只修改本周具体日期',
+            style: TextStyle(fontSize: 10.5, color: TsColors.textFaint),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _smallToolButton(String label, IconData icon, VoidCallback onTap) {
+    return SizedBox(
+      height: 30,
+      child: TextButton.icon(
+        onPressed: onTap,
+        icon: Icon(icon, size: 15),
+        label: Text(label),
+        style: TsButtons.filled(
+          radius: 7,
+          minimumSize: const Size(0, 30),
+          padding: const EdgeInsets.symmetric(horizontal: 10),
+          fontSize: 11,
+        ),
+      ),
+    );
+  }
+
+  void _clearWeek() {
+    final base = _baseSettings();
+    if (base == null) return;
+    setState(() {
+      _draft.reset(Timetable.withDefaults(
+        weekStart: _weekStart,
+        timezoneId: base.timezoneId,
+        timezoneOffsetMinutes: base.timezoneOffsetMinutes,
+        unavailable: <WallClockRange>[
+          for (final r in widget.defaultUnavailableRanges)
+            WallClockRange(r.start, r.end),
+        ],
+      ));
+    });
+  }
+
+  Future<void> _bindUnbound() async {
+    final base = _baseSettings();
+    if (base == null) return;
+    final unbound = _draft.timetable.dates
+        .where((e) =>
+            e.state == TimetableState.task &&
+            (e.taskId == null || e.taskId!.isEmpty))
+        .toList(growable: false);
+    if (unbound.isEmpty) {
+      setState(() => _error = '本周没有未绑定的蓝色块');
+      return;
+    }
+    if (widget.taskNames.isEmpty) {
+      setState(() => _error = '还没有可绑定的任务');
+      return;
+    }
+    final taskId = await showDialog<String>(
+      context: context,
+      builder: (ctx) => SimpleDialog(
+        title: const Text('把本周未绑定蓝块绑定到任务',
+            style: TextStyle(fontSize: 14)),
+        children: [
+          for (final entry in widget.taskNames.entries)
+            SimpleDialogOption(
+              onPressed: () => Navigator.of(ctx).pop(entry.key),
+              child: Text(entry.value, style: const TextStyle(fontSize: 12)),
+            ),
+        ],
+      ),
+    );
+    if (taskId == null || !mounted) return;
+    var next = _draft.timetable;
+    for (final entry in unbound) {
+      next = next.paint(
+        date: entry.date,
+        start: entry.start,
+        end: entry.end,
+        state: TimetableState.task,
+        origin: TimetableOrigin.manual,
+        title: widget.taskNames[taskId] ?? entry.title,
+        taskId: taskId,
+        reservationId: entry.reservationId ?? entry.id,
+      );
+    }
+    setState(() {
+      _draft.reset(next);
+      _error = null;
+    });
   }
 
   // ------------------------------------------------------------- sections
@@ -1048,6 +1651,7 @@ class _CalendarSettingsDialogState extends State<_CalendarSettingsDialog> {
       CalendarProposalKind.availability => TsColors.ready,
       CalendarProposalKind.occupancy => TsColors.waiting,
       CalendarProposalKind.exception => TsColors.blocked,
+      CalendarProposalKind.task => TsColors.accent,
       CalendarProposalKind.unclear => TsColors.pending,
     };
     return Container(
@@ -1148,13 +1752,15 @@ class _CalendarSettingsDialogState extends State<_CalendarSettingsDialog> {
       return p.question ?? p.title;
     }
     final when = p.isRepeating ? p.weekdayLabel : p.date!;
-    final kindText = p.kind == CalendarProposalKind.occupancy
-        ? switch (p.occupancyKind) {
-            'course' => '课程',
-            'rest' => '休息',
-            _ => '活动',
-          }
-        : '可用时间';
+    final kindText = switch (p.kind) {
+      CalendarProposalKind.occupancy => switch (p.occupancyKind) {
+          'course' => '课程',
+          'rest' => '休息',
+          _ => '活动',
+        },
+      CalendarProposalKind.task => p.isUnboundTask ? '任务预留（待绑定）' : '任务安排',
+      _ => '可用时间',
+    };
     return '$kindText · ${p.title} · $when ${p.rangeLabel}';
   }
 
@@ -1349,4 +1955,3 @@ class CalendarDialogFrame extends StatelessWidget {
         child: child,
       );
 }
-

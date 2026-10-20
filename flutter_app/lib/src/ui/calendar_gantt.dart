@@ -14,6 +14,8 @@ import 'package:flutter/services.dart';
 import '../model/calendar.dart';
 import '../model/display.dart';
 import '../model/session.dart';
+import '../model/settings.dart';
+import '../model/timetable.dart';
 import '../state/calendar_planner.dart';
 import '../state/task_interaction.dart';
 import './widgets/bezier_ui.dart';
@@ -34,6 +36,17 @@ class CalendarActions {
   final Future<String?> Function() ensureReady;
   final Map<String, String> taskNotes;
 
+  /// 0.1.1：当前版本的结构化时间表与三项通用设置。
+  final Timetable? timetable;
+  final int weekStartsOn;
+  final CalendarEditorMode defaultEditor;
+  final List<UnavailableRange> defaultUnavailableRanges;
+  final Map<String, String> taskNames;
+
+  /// 同时提交 CalendarSettings 与 Timetable；为空时退回 [applySettings]。
+  final Future<bool> Function(CalendarSettings settings, Timetable timetable,
+      {required bool reschedule})? applyTimetable;
+
   const CalendarActions({
     required this.commit,
     required this.autoSchedule,
@@ -41,6 +54,12 @@ class CalendarActions {
     required this.ensureReady,
     this.canEdit = true,
     this.taskNotes = const <String, String>{},
+    this.timetable,
+    this.weekStartsOn = 1,
+    this.defaultEditor = CalendarEditorMode.drawing,
+    this.defaultUnavailableRanges = const <UnavailableRange>[],
+    this.taskNames = const <String, String>{},
+    this.applyTimetable,
   });
 
   static CalendarActions readOnly() => CalendarActions(
@@ -134,6 +153,9 @@ class _CalendarGanttViewState extends State<CalendarGanttView> {
   _DragSession? _drag;
   Timer? _autoScroll;
   Offset? _lastGlobal;
+
+  /// 本次水平拖动是否从空白时间轴开始。按下/超过拖动阈值时决定，移动中不切换。
+  bool _blankPan = false;
 
   /// Which plan version has already been offered the one-time "generate the initial
   /// schedule" step. Keyed by version id (not by callback identity) so a rebuild can
@@ -659,17 +681,47 @@ class _CalendarGanttViewState extends State<CalendarGanttView> {
               ),
             ),
             Expanded(
-              child: SingleChildScrollView(
-                scrollDirection: Axis.horizontal,
-                controller: _horizontal,
-                child: SizedBox(
-                  key: _contentKey,
-                  width: _timelineWidth,
-                  child: Column(
-                    children: [
-                      for (final row in rows)
-                        _timelineCell(row, conflicts),
-                    ],
+              // Blank-timeline pan: only a gesture that starts on empty canvas reaches
+              // this recognizer. A gesture that starts on a bar (or its resize edge)
+              // is claimed by the bar's own horizontal recognizer, which is deeper in
+              // the tree and wins the arena at pointer-down; ownership never switches
+              // mid-drag. Wheel / touchpad / vertical scrolling are untouched.
+              child: GestureDetector(
+                behavior: HitTestBehavior.opaque,
+                onHorizontalDragStart: (_) => _blankPan = true,
+                onHorizontalDragUpdate: (details) {
+                  if (!_blankPan || !_horizontal.hasClients) return;
+                  final c = _horizontal;
+                  // Drag content right → offset decreases; clamp at both ends so the
+                  // timeline does not jitter past its bounds.
+                  c.jumpTo((c.offset - details.delta.dx)
+                      .clamp(c.position.minScrollExtent, c.position.maxScrollExtent)
+                      .toDouble());
+                },
+                onHorizontalDragEnd: (_) => _blankPan = false,
+                onHorizontalDragCancel: () => _blankPan = false,
+                child: Scrollbar(
+                  controller: _horizontal,
+                  thumbVisibility: true,
+                  thickness: 9,
+                  radius: const Radius.circular(4),
+                  scrollbarOrientation: ScrollbarOrientation.bottom,
+                  child: SingleChildScrollView(
+                    scrollDirection: Axis.horizontal,
+                    controller: _horizontal,
+                    // Reserve the strip the horizontal bar paints over, so it never
+                    // covers the last row of bars.
+                    padding: const EdgeInsets.only(bottom: 10),
+                    child: SizedBox(
+                      key: _contentKey,
+                      width: _timelineWidth,
+                      child: Column(
+                        children: [
+                          for (final row in rows)
+                            _timelineCell(row, conflicts),
+                        ],
+                      ),
+                    ),
                   ),
                 ),
               ),
@@ -1127,14 +1179,34 @@ class _CalendarGanttViewState extends State<CalendarGanttView> {
   // --------------------------------------------------------------- actions
 
   Future<void> _openSettings() async {
+    final applyTimetable = widget.actions.applyTimetable;
     final result = await showCalendarSettingsDialog(
       context,
       settings: _settings,
       now: _now ?? DateTime.now(),
       proposals: widget.proposalSource,
+      timetable: widget.actions.timetable,
+      weekStartsOn: widget.actions.weekStartsOn,
+      initialMode: widget.actions.defaultEditor,
+      defaultUnavailableRanges: widget.actions.defaultUnavailableRanges,
+      taskNames: widget.actions.taskNames,
+      onApply: applyTimetable == null
+          ? null
+          : (r) => applyTimetable(
+                r.settings,
+                r.timetable ??
+                    Timetable.fromSchedule(widget.schedule,
+                        weekStart: r.settings.planningStartDate),
+                reschedule: true,
+              ),
     );
     if (result == null) return;
-    await widget.actions.applySettings(result.settings, reschedule: true);
+    if (applyTimetable != null && result.timetable != null) {
+      await applyTimetable(result.settings, result.timetable!,
+          reschedule: true);
+    } else {
+      await widget.actions.applySettings(result.settings, reschedule: true);
+    }
   }
 
   Future<void> _autoSchedule({required bool keepManual}) async {
@@ -1723,4 +1795,3 @@ class _ToolButton extends StatelessWidget {
     );
   }
 }
-

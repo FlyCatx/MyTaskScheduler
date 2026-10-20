@@ -138,11 +138,6 @@ class _ModelSelectionDialogState extends State<_ModelSelectionDialog> {
           mainAxisSize: MainAxisSize.min,
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            Text(
-              '切换只影响之后的请求，不会重新生成计划；已有版本与完成状态保持不变。',
-              style: TextStyle(fontSize: 11.5, color: TsColors.textFaint, height: 1.5),
-            ),
-            const SizedBox(height: 14),
             if (widget.profiles.isEmpty)
               Text('还没有模型连接。请到 设置 → 模型 添加连接并选择模型。',
                   style: TextStyle(fontSize: 12, color: TsColors.pending))
@@ -189,8 +184,6 @@ class _ModelSelectionDialogState extends State<_ModelSelectionDialog> {
                   contentPadding: EdgeInsets.zero,
                   dense: true,
                   title: const Text('思考模式', style: TextStyle(fontSize: 12.5)),
-                  subtitle: Text('关闭时请求显式发送 thinking.type=disabled',
-                      style: TextStyle(fontSize: 10.5, color: TsColors.textFaint)),
                   value: _thinking == ThinkingMode.enabled,
                   onChanged: (on) {
                     setState(() {
@@ -202,6 +195,9 @@ class _ModelSelectionDialogState extends State<_ModelSelectionDialog> {
                 ),
                 if (_thinking == ThinkingMode.enabled)
                   BezierSegments(
+                    // Fill the available input width; each of the three modes gets an
+                    // equal share instead of a fixed intrinsic width.
+                    expand: true,
                     height: 28,
                     items: const [
                       BezierSegmentItem('low'),
@@ -264,4 +260,3 @@ class _ModelSelectionDialogState extends State<_ModelSelectionDialog> {
     );
   }
 }
-
