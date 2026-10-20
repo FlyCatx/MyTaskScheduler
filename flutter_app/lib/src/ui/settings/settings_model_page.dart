@@ -55,6 +55,15 @@ class _SettingsModelPageState extends State<SettingsModelPage> {
   final TextEditingController _modelId = TextEditingController();
   final TextEditingController _apiKey = TextEditingController();
 
+  /// 表单滚动区自己的 controller 与沟槽：右侧滚动条不再压在思考开关、输入框
+  /// 边框和底部「设为默认连接」按钮上。沟槽由外层 padding 预留，控件内容缩到
+  /// 沟槽左侧；连接列表仍使用自己的滚动容器。
+  final ScrollController _pageScroll = ScrollController();
+  final ScrollController _connectionScroll = ScrollController();
+
+  /// 右侧滚动条沟槽宽度（16–20 逻辑像素）。
+  static const double _scrollbarGutter = 18;
+
   String _formId = '';
   int _revision = 0;
 
@@ -120,6 +129,8 @@ class _SettingsModelPageState extends State<SettingsModelPage> {
     _modelsUrl.dispose();
     _modelId.dispose();
     _apiKey.dispose();
+    _pageScroll.dispose();
+    _connectionScroll.dispose();
     super.dispose();
   }
 
@@ -652,31 +663,52 @@ class _SettingsModelPageState extends State<SettingsModelPage> {
       builder: (context, constraints) {
         final narrow =
             constraints.maxWidth.isFinite && constraints.maxWidth < 620;
-        if (narrow) {
-          return SingleChildScrollView(
-            padding: const EdgeInsets.only(bottom: 8),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: [
-                _connectionPanel(listMaxHeight: 170),
-                const SizedBox(height: 10),
-                _formPanel(),
-              ],
-            ),
-          );
-        }
-        return SingleChildScrollView(
-          padding: const EdgeInsets.only(bottom: 8),
-          child: Row(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              SizedBox(width: 238, child: _connectionPanel()),
-              const SizedBox(width: 12),
-              Expanded(child: _formPanel()),
-            ],
-          ),
+        final content = narrow
+            ? Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  _connectionPanel(listMaxHeight: 170),
+                  const SizedBox(height: 10),
+                  _formPanel(),
+                ],
+              )
+            : Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  SizedBox(width: 238, child: _connectionPanel()),
+                  const SizedBox(width: 12),
+                  Expanded(child: _formPanel()),
+                ],
+              );
+        return _gutterScroll(
+          child: content,
         );
       },
+    );
+  }
+
+  /// 表单滚动外壳：显式 controller + 固定沟槽 + 单一显式 Scrollbar。
+  ///
+  /// `scrollbars: false` 只作用于本滚动区，避免桌面 ScrollBehavior 再叠一条
+  /// 自动滚动条压住右侧控件；连接列表自己的 Scrollbar 单独提供，所以不是
+  /// “把滚动条藏起来”。
+  Widget _gutterScroll({required Widget child}) {
+    return ScrollConfiguration(
+      behavior: ScrollConfiguration.of(context).copyWith(scrollbars: false),
+      child: Scrollbar(
+        controller: _pageScroll,
+        thumbVisibility: true,
+        thickness: 8,
+        radius: const Radius.circular(4),
+        child: SingleChildScrollView(
+          controller: _pageScroll,
+          padding: const EdgeInsets.only(
+            right: _scrollbarGutter + 2,
+            bottom: 12,
+          ),
+          child: child,
+        ),
+      ),
     );
   }
 
@@ -724,17 +756,22 @@ class _SettingsModelPageState extends State<SettingsModelPage> {
           else
             ConstrainedBox(
               constraints: BoxConstraints(maxHeight: listMaxHeight),
-              child: ListView(
-                shrinkWrap: true,
-                padding: EdgeInsets.zero,
-                children: [
-                  for (final p in profiles)
-                    _connectionTile(
-                      p,
-                      selected: p.id == _formId,
-                      isDefault: p.id == defaultId,
-                    ),
-                ],
+              // 连接列表有自己的滚动条（随滚动显示），与表单沟槽互不遮挡。
+              child: Scrollbar(
+                controller: _connectionScroll,
+                child: ListView(
+                  controller: _connectionScroll,
+                  shrinkWrap: true,
+                  padding: EdgeInsets.zero,
+                  children: [
+                    for (final p in profiles)
+                      _connectionTile(
+                        p,
+                        selected: p.id == _formId,
+                        isDefault: p.id == defaultId,
+                      ),
+                  ],
+                ),
               ),
             ),
         ],
@@ -1759,4 +1796,3 @@ class _SettingsModelPageState extends State<SettingsModelPage> {
     return result ?? false;
   }
 }
-
