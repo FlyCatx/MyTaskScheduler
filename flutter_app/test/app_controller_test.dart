@@ -6,9 +6,11 @@
 // in-memory settings bridge (also no DLL).
 
 import 'package:flutter_test/flutter_test.dart';
+import 'package:taskscheduler_flutter/src/model/calendar.dart';
 import 'package:taskscheduler_flutter/src/model/plan.dart';
 import 'package:taskscheduler_flutter/src/model/session.dart';
 import 'package:taskscheduler_flutter/src/model/settings.dart';
+import 'package:taskscheduler_flutter/src/model/timetable.dart';
 import 'package:taskscheduler_flutter/src/state/app_controller.dart';
 import 'package:taskscheduler_flutter/src/state/schedule_engine.dart';
 import 'package:taskscheduler_flutter/src/state/session_repository.dart';
@@ -403,5 +405,109 @@ void main() {
         'deepseek-official',
         reason: '失效的绑定保留原值，由用户重新选择');
   });
-}
 
+  group('结构化时间表请求', () {
+    test('同一快照同时发送 timetable 与 effectiveTimetable', () async {
+      final store = InMemorySessionRepository();
+      final controller = await buildController(store);
+      await controller.createConversation();
+      final base = Timetable.withDefaults(
+        weekStart: '2026-10-20',
+        unavailable: const <WallClockRange>[],
+      );
+      final timetable = base
+          .paint(
+            date: '2026-10-20',
+            start: 540,
+            end: 600,
+            state: TimetableState.occupied,
+          )
+          .paint(
+            date: '2026-10-20',
+            start: 555,
+            end: 570,
+            state: TimetableState.free,
+          )
+          .copyWith(revision: 9);
+      await controller.applyTimetableSettings(
+        controller.calendar.settings,
+        timetable,
+        reschedule: false,
+      );
+      final conversation = controller.conversation!;
+      expect(conversation.includeTimetable, isTrue);
+      final savedRevision = conversation.calendarDraft!.revision;
+
+      final request = controller.buildAnalysisRequest(
+        conversation: conversation,
+        version: null,
+        requestId: 'req-1',
+        draft: '请安排',
+      );
+      expect(request['calendarRevision'], savedRevision);
+      final sent = request['timetable'] as Map<String, dynamic>;
+      expect(sent['revision'], savedRevision);
+      final effective =
+          request['effectiveTimetable'] as Map<String, dynamic>;
+      expect(effective['sourceRevision'], savedRevision);
+      final day = (effective['days'] as List<dynamic>)
+          .cast<Map<String, dynamic>>()
+          .firstWhere((d) => d['date'] == '2026-10-20');
+      final intervals = (day['intervals'] as List<dynamic>)
+          .cast<Map<String, dynamic>>()
+          .map((i) => <Object?>[i['start'], i['end'], i['state']])
+          .toList();
+      expect(intervals, <List<Object?>>[
+        <Object?>[0, 540, 1],
+        <Object?>[540, 555, 0],
+        <Object?>[555, 570, 1],
+        <Object?>[570, 600, 0],
+        <Object?>[600, 1440, 1],
+      ]);
+    });
+
+    test('关闭附件时两份视图都不发；非法时间表明确失败', () async {
+      final store = InMemorySessionRepository();
+      final controller = await buildController(store);
+      await controller.createConversation();
+      await controller.applyTimetableSettings(
+        controller.calendar.settings,
+        Timetable.withDefaults(weekStart: '2026-10-19'),
+        reschedule: false,
+      );
+      await controller.removeTimetableFromRequest();
+      final request = controller.buildAnalysisRequest(
+        conversation: controller.conversation!,
+        version: null,
+        requestId: 'req-2',
+        draft: '请安排',
+      );
+      expect(request.containsKey('timetable'), isFalse);
+      expect(request.containsKey('effectiveTimetable'), isFalse);
+
+      const overlapping = Timetable(
+        dateFrom: '2026-10-19',
+        dateTo: '2026-10-19',
+        weekly: <TimetableEntry>[
+          TimetableEntry(
+            id: 'a',
+            state: TimetableState.occupied,
+            start: 0,
+            end: 600,
+            weekdays: <int>[1],
+          ),
+          TimetableEntry(
+            id: 'b',
+            state: TimetableState.free,
+            start: 500,
+            end: 700,
+            weekdays: <int>[1],
+          ),
+        ],
+      );
+      final error = controller.validateTimetableForRequest(overlapping);
+      expect(error, isNotNull);
+      expect(error, contains('时间表数据不合法'));
+    });
+  });
+}
