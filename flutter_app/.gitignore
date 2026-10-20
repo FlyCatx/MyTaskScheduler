@@ -56,4 +56,3 @@ app.*.map.json
 # Staged by the real-DLL tests (test/bridge_live_test.dart, test/settings_bridge_integration_test.dart)
 /ts_bridge.dll
 /libcurl-x64.dll
-

@@ -1,7 +1,7 @@
 name: taskscheduler_flutter
 description: "TaskScheduler 桌面界面（Flutter），复用现有 C 内核的校验、依赖与排序。"
 publish_to: 'none'
-version: 0.1.0+10
+version: 0.1.2+12
 
 environment:
   sdk: ">=3.6.0 <4.0.0"
@@ -25,4 +25,3 @@ dev_dependencies:
 
 flutter:
   uses-material-design: true
-
