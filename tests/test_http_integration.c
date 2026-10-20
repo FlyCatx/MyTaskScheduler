@@ -25,6 +25,7 @@
 #include <stdarg.h>
 
 #include "../src/domain/analysis/analyze.h"
+#include "../src/domain/analysis/constraints.h"
 #include "../src/state/config.h"
 #include "../src/app/controller.h"
 #include "../src/domain/export/export.h"
@@ -1561,6 +1562,95 @@ static int sc_local_edits_offline(Ctx *ctx)
     return 0;
 }
 
+/* --- 24. 结构化时间表真正进入最终 HTTP messages（含派生视图与语义） --- */
+static int sc_timetable_in_messages(Ctx *ctx)
+{
+    TsConfig cfg;
+    TsInputs in;
+    TsAnalyzeResult res;
+    TsCancel cancel;
+    char *content = load_fixture(ctx, "minimal_tasks.json");
+    char *env = make_envelope(content, "stop");
+    char *block;
+    char path[800];
+    char *trace;
+    int generation;
+
+    /*
+     * 2026-10-20 周二：09:00–10:00 占用，其中 09:15–09:30 通过日期例外恢复可用。
+     * 期望有效区间：[540,555) 占用、[555,570) 空闲、[570,600) 占用。
+     */
+    const char *payload =
+        "{\"timetable\":{\"schemaVersion\":2,\"revision\":7,"
+        "\"timezoneId\":\"Asia/Shanghai\",\"timezoneOffsetMinutes\":480,"
+        "\"coverage\":{\"dateFrom\":\"2026-10-20\",\"dateTo\":\"2026-10-20\","
+        "\"defaultState\":1},\"weekly\":[],"
+        "\"dates\":[{\"state\":0,\"start\":540,\"end\":600,"
+        "\"date\":\"2026-10-20\",\"title\":\"占用\"}]},"
+        "\"effectiveTimetable\":{\"sourceRevision\":7,"
+        "\"timezoneId\":\"Asia/Shanghai\",\"timezoneOffsetMinutes\":480,"
+        "\"dateFrom\":\"2026-10-20\",\"dateTo\":\"2026-10-20\","
+        "\"intervalSemantics\":\"[start,end), minutes since local midnight\","
+        "\"days\":[{\"date\":\"2026-10-20\",\"intervals\":["
+        "{\"start\":0,\"end\":540,\"state\":1,\"meaning\":\"free\"},"
+        "{\"start\":540,\"end\":555,\"state\":0,\"meaning\":\"occupied\"},"
+        "{\"start\":555,\"end\":570,\"state\":1,\"meaning\":\"free\"},"
+        "{\"start\":570,\"end\":600,\"state\":0,\"meaning\":\"occupied\"},"
+        "{\"start\":600,\"end\":1440,\"state\":1,\"meaning\":\"free\"}]}]}}";
+
+    cfg_init(ctx, &cfg, 120000, 2 * 1024 * 1024, 1);
+    inputs_init(&in);
+    reset_request_count(ctx);
+    control_write(ctx, env, 200, NULL);
+
+    block = ts_constraints_timetable_block(payload);
+    CHECK(ctx, block != NULL,
+          "同源 timetable + effectiveTimetable 生成提示词区块");
+    if (block == NULL) {
+        ts_config_free(&cfg);
+        ts_inputs_free(&in);
+        free(env);
+        free(content);
+        return 0;
+    }
+
+    ts_analyze_result_init(&res);
+    ts_cancel_init(&cancel);
+    generation = ts_cancel_begin(&cancel);
+    (void)ts_analyze_run_ex(&cfg, "请按本地时间表安排", block, &in, &cancel,
+                            generation, NULL, NULL, &res);
+    CHECK(ctx, res.ok == 1, "带结构化时间表的分析请求成功");
+    CHECK(ctx, requests_since_reset(ctx) == 1, "只调用一次（实际 %d）",
+          requests_since_reset(ctx));
+
+    snprintf(path, sizeof(path), "%s\\mock_last_request.json", ctx->workdir);
+    trace = read_file_utf8(path);
+    CHECK(ctx, trace != NULL, "可读取模拟服务记录的最终请求摘要");
+    if (trace != NULL) {
+        CHECK(ctx, strstr(trace, "\"has_timetable_block\": true") != NULL,
+              "最终 HTTP messages 含结构化时间表区块");
+        CHECK(ctx, strstr(trace, "\"has_effective_timetable\": true") != NULL,
+              "最终 HTTP messages 含派生 effectiveTimetable");
+        CHECK(ctx, strstr(trace, "\"has_timetable_semantics\": true") != NULL,
+              "最终 HTTP messages 的系统提示含时间表语义");
+        CHECK(ctx, strstr(trace, "\"has_occupied_state\": true") != NULL,
+              "state=0（占用）没有被当作空值过滤");
+        CHECK(ctx, strstr(trace, "\"has_exact_minutes\": true") != NULL,
+              "09:15 的精确分钟（555）保留，没有被 15 分钟格子取整");
+        CHECK(ctx, strstr(trace, "\"has_override_free\": true") != NULL,
+              "日期例外恢复的 free 进入最终 messages");
+        free(trace);
+    }
+
+    ts_analyze_result_free(&res);
+    ts_free(block);
+    ts_config_free(&cfg);
+    ts_inputs_free(&in);
+    free(env);
+    free(content);
+    return 0;
+}
+
 /* ================================================================== */
 
 static const Scenario kScenarios[] = {
@@ -1592,7 +1682,8 @@ static const Scenario kScenarios[] = {
     { "chunked_response",        "响应分块到达",                       sc_chunked_response },
     { "rate_limit_default",      "429 无 Retry-After 的默认退避",      sc_rate_limit_default_backoff },
     { "malformed_retry_after",   "畸形 Retry-After 不被采信",          sc_malformed_retry_after },
-    { "local_edits_offline",     "本地编辑/导出不再调用模型",          sc_local_edits_offline }
+    { "local_edits_offline",     "本地编辑/导出不再调用模型",          sc_local_edits_offline },
+    { "timetable_in_messages",   "结构化时间表进入最终 messages",      sc_timetable_in_messages }
 };
 
 static const size_t kScenarioCount = sizeof(kScenarios) / sizeof(kScenarios[0]);
@@ -1660,4 +1751,3 @@ int main(int argc, char **argv)
 
     return (ctx.fails == 0) ? 0 : 1;
 }
-

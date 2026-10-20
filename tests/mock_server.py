@@ -307,6 +307,7 @@ class MockHandler(BaseHTTPRequestHandler):
                         and v[:7].lower() == "bearer "
                         and "\r" not in v and "\n" not in v
                     )
+                body_text = body_in.decode("utf-8", "replace")
                 atomic_write_json(treq, {
                     "seq": seq,
                     "request_bytes": len(body_in),
@@ -316,6 +317,16 @@ class MockHandler(BaseHTTPRequestHandler):
                     "auth_present": bool(self.headers.get("Authorization")),
                     "auth_header_count": len(auth_vals),
                     "auth_bearer_shape_ok": bearer_ok,
+                    # 结构化时间表是否真的进入最终 messages（只记布尔标记，
+                    # 不落盘任何用户材料/时间表原文）。
+                    "has_timetable_block": ("结构化时间表" in body_text),
+                    "has_effective_timetable": ("effectiveTimetable" in body_text),
+                    "has_timetable_semantics": ("state=0 表示占用" in body_text),
+                    # messages 里的 JSON 字符串是转义的：匹配 \"state\":0 形式。
+                    "has_occupied_state": ('state\\":0' in body_text),
+                    "has_exact_minutes": ('start\\":555' in body_text),
+                    "has_override_free": ('start\\":555' in body_text
+                                          and 'state\\":1' in body_text),
                 })
         except (OSError, ValueError):
             pass
@@ -415,4 +426,3 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
-
