@@ -4,6 +4,7 @@
 // body drag that keeps the duration, an edge drag that changes it, Esc cancelling a drag,
 // conflict marking for an allowed-but-visible overlap, and the "no availability" guidance.
 
+import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -193,6 +194,73 @@ void main() {
     expect(outcome.tasks!.firstWhere((t) => t.id == 'task-b').estimatedHours, 2);
   });
 
+  testWidgets('dragging blank timeline pans; dragging a bar still edits it',
+      (tester) async {
+    final record = Recorded();
+    await pumpCalendar(
+      tester,
+      schedule: version.calendar,
+      calendarActions: actions(record),
+    );
+    final horizontal = find.byWidgetPredicate(
+        (w) => w is Scrollable && w.axisDirection == AxisDirection.right);
+    expect(horizontal, findsOneWidget);
+    final scroll = tester.state<ScrollableState>(horizontal);
+    scroll.position.jumpTo(400);
+    await tester.pump();
+    final before = scroll.position.pixels;
+
+    // 时间轴右半段没有任务条：按住空白向左拖 → 内容左移、offset 增大。
+    final body = tester.getRect(horizontal);
+    final blank = Offset(body.right - 60, body.top + 90);
+    final gesture =
+        await tester.startGesture(blank, kind: PointerDeviceKind.mouse);
+    for (var i = 0; i < 5; i++) {
+      await gesture.moveBy(const Offset(-16, 0));
+      await tester.pump();
+    }
+    await gesture.up();
+    await tester.pumpAndSettle();
+    expect(scroll.position.pixels, closeTo(before + 80, 3),
+        reason: '空白拖动应平移时间轴（向右拖时 offset 减小）');
+
+    // 任务条上的手势仍归任务编辑，不触发背景平移。
+    final afterPan = scroll.position.pixels;
+    await dragInSteps(tester, tester.getCenter(find.byKey(const Key('calendar-segment-s2'))),
+        const Offset(40, 0));
+    expect(record.commits, hasLength(1));
+    expect(scroll.position.pixels, closeTo(afterPan, 0.5),
+        reason: '从任务条开始的手势不能同时平移画布');
+  });
+
+  testWidgets('周模式下的空白时间轴同样可以平移', (tester) async {
+    await pumpCalendar(
+      tester,
+      schedule: version.calendar,
+      calendarActions: actions(Recorded()),
+    );
+    await tester.tap(find.text('周'));
+    await tester.pumpAndSettle();
+
+    final horizontal = find.byWidgetPredicate(
+        (w) => w is Scrollable && w.axisDirection == AxisDirection.right);
+    final scroll = tester.state<ScrollableState>(horizontal);
+    scroll.position.jumpTo(300);
+    await tester.pump();
+    final before = scroll.position.pixels;
+    final body = tester.getRect(horizontal);
+    final gesture = await tester.startGesture(
+        Offset(body.right - 80, body.top + 90),
+        kind: PointerDeviceKind.mouse);
+    for (var i = 0; i < 5; i++) {
+      await gesture.moveBy(const Offset(-20, 0));
+      await tester.pump();
+    }
+    await gesture.up();
+    await tester.pumpAndSettle();
+    expect(scroll.position.pixels, closeTo(before + 100, 3));
+  });
+
   testWidgets('dragging the right edge changes the duration and the estimate',
       (tester) async {
     final record = Recorded();
@@ -366,4 +434,3 @@ void main() {
     expect(tester.takeException(), isNull);
   });
 }
-

@@ -5,6 +5,8 @@
 //   4. the global font is Microsoft YaHei;
 //   5. multi-file selection is wired through one dialog call.
 
+import 'dart:io';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:taskscheduler_flutter/src/app_info.dart';
@@ -16,13 +18,20 @@ import 'package:taskscheduler_flutter/src/ui/user_menu.dart';
 
 import '../support/test_support.dart';
 
-Future<AppController> pumpShell(WidgetTester tester) async {
+Future<AppController> pumpShell(WidgetTester tester,
+    {TextScaler? textScaler}) async {
   final store = InMemorySessionRepository();
   await seedConversation(store);
   final controller = AppController(engine: FakeScheduleEngine(), store: store);
   await controller.initialize();
   await tester.pumpWidget(MaterialApp(
     theme: buildAppTheme(),
+    builder: textScaler == null
+        ? null
+        : (context, child) => MediaQuery(
+              data: MediaQuery.of(context).copyWith(textScaler: textScaler),
+              child: child!,
+            ),
     home: AppShell(
       controller: controller,
       settings: makeTestSettingsController(),
@@ -134,8 +143,45 @@ void main() {
   });
 
   test('5. version constant matches the release', () {
-    expect(kAppVersion, '0.1.0');
-    expect(kAppVersionSemver, '0.1.0');
+    // 版本号只在 pubspec 里维护一份；发布包与界面常量必须同步，避免两处漂移。
+    final pubspec = File('pubspec.yaml').readAsStringSync();
+    final version = RegExp(r'^version:\s*(\d+\.\d+\.\d+)', multiLine: true)
+        .firstMatch(pubspec)
+        ?.group(1);
+    expect(version, isNotNull);
+    expect(kAppVersion, version);
+    expect(kAppVersionSemver, version);
+  });
+
+  testWidgets('6. 标题栏「关于 TaskScheduler」直接打开设置关于页', (tester) async {
+    await tester.binding.setSurfaceSize(const Size(1440, 900));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    await pumpShell(tester);
+
+    await tester.tap(find.text('应用'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('关于 TaskScheduler'));
+    await tester.pumpAndSettle();
+
+    // 设置窗口打开在“关于”页，并显示当前产品版本。
+    expect(find.text('版本信息'), findsOneWidget);
+    expect(find.textContaining('$kAppName $kAppVersion'), findsWidgets);
+    // 属于设置窗口的一部分（左侧导航仍在）。
+    expect(find.text('账户安全'), findsOneWidget);
+  });
+
+  testWidgets('7. 1280×720、文字 1.5 倍时主界面与标题栏不溢出', (tester) async {
+    tester.view.devicePixelRatio = 1.0;
+    tester.view.physicalSize = const Size(1280, 720);
+    addTearDown(tester.view.reset);
+    await tester.binding.setSurfaceSize(const Size(1280, 720));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    await pumpShell(tester, textScaler: const TextScaler.linear(1.5));
+
+    // 标题栏、侧边栏入口、底部输入区仍可达。
+    expect(find.text('应用'), findsOneWidget);
+    expect(find.text('编辑'), findsOneWidget);
+    expect(find.byTooltip('关闭'), findsOneWidget);
+    expect(find.text('任务清单'), findsWidgets);
   });
 }
-

@@ -747,5 +747,32 @@ void main() {
     );
     expect(tile.hoverColor, Colors.transparent);
   });
-}
 
+  testWidgets('表单滚动区有独立 controller、固定沟槽和显式滚动条', (tester) async {
+    final controller = await _loaded(tester, profiles: [sampleProfile()]);
+    await _pump(tester, controller);
+
+    final page = find.byType(SettingsModelPage);
+    final outerScroll = find
+        .descendant(of: page, matching: find.byType(SingleChildScrollView))
+        .first;
+    final view = tester.widget<SingleChildScrollView>(outerScroll);
+    final padding = view.padding! as EdgeInsets;
+    expect(padding.right, greaterThanOrEqualTo(16),
+        reason: '右侧必须为滚动条留出 16–20 逻辑像素沟槽');
+
+    final barFinder = find
+        .descendant(of: page, matching: find.byType(Scrollbar))
+        .first;
+    final bar = tester.widget<Scrollbar>(barFinder);
+    expect(bar.controller, isNotNull, reason: '滚动区要使用自己的 controller');
+    expect(bar.thumbVisibility, isTrue);
+    expect(bar.thickness, 8);
+
+    // 右侧控件缩在沟槽左边：思考开关的右边缘与滚动视口右边缘至少差一个沟槽。
+    final scrollRect = tester.getRect(outerScroll);
+    final switchRect = tester.getRect(find.byType(Switch).first);
+    expect(switchRect.right, lessThanOrEqualTo(scrollRect.right - 16),
+        reason: '滚动条不能盖住思考开关/输入框边框');
+  });
+}

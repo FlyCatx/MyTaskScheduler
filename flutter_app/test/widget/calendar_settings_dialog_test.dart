@@ -86,6 +86,9 @@ Future<void> _open(
   CalendarProposalSource? source,
   CalendarSettings? settings,
 }) async {
+  tester.view.devicePixelRatio = 1.0;
+  tester.view.physicalSize = const Size(1100, 900);
+  addTearDown(tester.view.reset);
   await tester.binding.setSurfaceSize(const Size(1100, 900));
   addTearDown(() => tester.binding.setSurfaceSize(null));
   TsColors.apply(Brightness.light);
@@ -393,4 +396,3 @@ void main() {
 /// A request that cannot be awaited in a fake-async test (never used: blocked).
 Future<CalendarProposalOutcome> _neverRequest({bool force = false}) async =>
     throw StateError('不应发起请求');
-
