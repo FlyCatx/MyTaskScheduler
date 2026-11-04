@@ -23,7 +23,6 @@ import 'package:flutter/material.dart';
 
 import 'desktop_window.dart';
 import 'theme/values.dart';
-import 'window_probe/alpha_probe.dart';
 
 /// 标准圆角的三次贝塞尔近似系数（四分之一圆，k = 4/3 * (sqrt(2) - 1)）。
 ///
@@ -178,17 +177,6 @@ class _WindowSurfaceState extends State<WindowSurface> {
 
   @override
   Widget build(BuildContext context) {
-    /*
-     * R3-V V3 验收实验入口：只有 TASKSCHEDULER_ALPHA_PROBE 被设置时才走透明探针
-     * 外壳（透明根 + alpha 探针条 + 关闭原生 Region）。正常用户运行不会设置该
-     * 环境变量，因此生产路径与之前完全一致。见 window_probe/alpha_probe.dart。
-     */
-    if (WindowAlphaProbe.enabled) {
-      return WindowAlphaProbeShell(
-        radius: widget.radius,
-        child: widget.child,
-      );
-    }
     final listenable = widget.shape;
     if (listenable == null) {
       return _surface(context, widget.radius);
