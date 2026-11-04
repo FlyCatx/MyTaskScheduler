@@ -429,8 +429,9 @@ void main() {
       expect(result.error, contains('已回滚 1 个文件'));
       expect(result.rolledBackPaths, hasLength(1));
       expect(result.rolledBackPaths.single, contains('conv-new-1'));
-      expect(result.dataUnchanged, isFalse,
-          reason: '发生过替换就不能声称“原有数据未被修改”');
+      expect(result.rollbackFailedPaths, isEmpty);
+      expect(result.dataUnchanged, isTrue,
+          reason: '所有被替换的文件都成功回滚后，才能声称原数据已恢复');
       expect(
           File(_p([dir.path, 'conversations', 'conv-new-1.json'])).existsSync(),
           isFalse,
@@ -845,4 +846,3 @@ List<String> _findSensitiveKeys(Object? value, [String prefix = '']) {
   }
   return out;
 }
-

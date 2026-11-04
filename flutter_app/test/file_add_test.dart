@@ -155,7 +155,7 @@ void main() {
     test('the exact file from the bug report can be added', () async {
       // Regression guard for the reported reproduction. Not skipped silently: if the
       // file is missing we simply do not assert anything about its content.
-      const reported = r'<user-file>';
+      const reported = r'C:\Users\33743\Desktop\exp1.txt';
       if (!File(reported).existsSync()) return;
 
       final root = newDir('reported');
@@ -166,7 +166,7 @@ void main() {
       final controller = await emptyApp(root);
       final ok = await controller.addTextFile(reported);
 
-      expect(ok, isTrue, reason: 'C:\\Users\\TestUser\\Desktop\\exp1.txt 必须能添加成功');
+      expect(ok, isTrue, reason: 'C:\\Users\\33743\\Desktop\\exp1.txt 必须能添加成功');
       expect(controller.errorMessage, isNull);
       final att = controller.conversation!.attachments.single;
       expect(att.label, 'exp1.txt');
@@ -221,4 +221,3 @@ void main() {
     });
   });
 }
-
