@@ -3,7 +3,8 @@
 // 保证窗口（最大 980 x 660，窄屏切换为侧栏）与各页一致。
 //
 // 主要类型：SettingsGroupLabel、SettingsCard、SettingsTile、SettingsKeyValue、
-// SettingsNote、SettingsIntro、SettingsKeyChip、SettingsOutlinedButton。
+// SettingsNote、SettingsIntro、SettingsKeyChip、SettingsOutlinedButton、
+// SettingsPageViewport。
 
 import 'package:flutter/material.dart';
 
@@ -95,6 +96,13 @@ class SettingsTile extends StatelessWidget {
   final IconData? leading;
   final bool dense;
 
+  /// 横向并排所需的最小宽度（未乘文字缩放）。
+  ///
+  /// 默认 [kMinSideBySideWidth]：一个可读标题 + 常见开关/分段控件。控件本身明显更宽
+  /// 时（例如 1.5 倍字号下的「Ctrl+Enter 发送 / Enter 发送」分段），调用方传更大的
+  /// 值，让控件改走下方整行（可横向滚动）布局，而不是把标题挤成零宽后溢出。
+  final double minSideBySideWidth;
+
   const SettingsTile({
     super.key,
     required this.title,
@@ -102,6 +110,7 @@ class SettingsTile extends StatelessWidget {
     this.trailing,
     this.leading,
     this.dense = false,
+    this.minSideBySideWidth = kMinSideBySideWidth,
   });
 
   /// Below this the control cannot sit next to a readable title any more.
@@ -167,7 +176,7 @@ class SettingsTile extends StatelessWidget {
           // the framework, so a 1.5x font in a narrow pane really does switch to the
           // stacked layout instead of squeezing the title to a single glyph.
           final scale = MediaQuery.textScalerOf(context).scale(1);
-          final needsStack = constraints.maxWidth < kMinSideBySideWidth * scale;
+          final needsStack = constraints.maxWidth < minSideBySideWidth * scale;
           if (needsStack) {
             return Column(
               crossAxisAlignment: CrossAxisAlignment.start,
@@ -394,6 +403,130 @@ class SettingsOutlinedButton extends StatelessWidget {
   }
 }
 
+// ---------------------------------------------------------------------------
+// SettingsPageViewport — 所有设置页共用的纵向滚动视口（R2-ST）
+// ---------------------------------------------------------------------------
+//
+// 版式契约（见 docs / out/round2/R2_CONTRACT.md §6.2）：
+//   * 固定页标题与固定 footer 由 `SettingsDialog` 提供，本组件只负责中间那段；
+//   * 一个视口只持有一个 ScrollController，显式滚动条与 SingleChildScrollView
+//     绑定的是**同一个** controller（不存在第二条隐式滚动条）；
+//   * 右侧沟槽是**实际布局空间**：内容是 padding 出来的，右边缘一定在
+//     「视口右边缘 - kSettingsScrollbarGutter」左边，所以滚动条永远压不到输入框、
+//     开关或按钮的边框上（不是把半透明滚动条涂在内容上面）；
+//   * 内容不足时不画滑块（thumbVisibility=false），但沟槽照样占位，横向不会跳动。
+
+/// 右侧滚动条沟槽宽度（逻辑像素）：内容右边缘 ≤ 视口右边缘 - 该值。
+const double kSettingsScrollbarGutter = 18;
+
+/// 滚动条本体宽度。
+const double kSettingsScrollbarThickness = 8;
+
+/// 滚动条轨道距视口右边缘的距离。
+const double kSettingsScrollbarInset = 4;
+
+/// 一个设置页的纵向滚动视口。
+///
+/// [controller] 由设置窗口按页提供（每页一个，切页时保留各自的滚动位置），
+/// 单独使用本组件时可以不传，视口会创建并释放自己的 controller。
+class SettingsPageViewport extends StatefulWidget {
+  const SettingsPageViewport({
+    super.key,
+    required this.child,
+    this.controller,
+    this.padding = const EdgeInsets.fromLTRB(
+      0,
+      2,
+      kSettingsScrollbarGutter,
+      18,
+    ),
+  });
+
+  final Widget child;
+
+  /// 外部注入的控制器（设置窗口每页一个，切页恢复滚动位置）。为空时内部自建。
+  final ScrollController? controller;
+
+  /// 视口内边距。默认右侧已包含 [kSettingsScrollbarGutter] 的沟槽。
+  final EdgeInsetsGeometry padding;
+
+  @override
+  State<SettingsPageViewport> createState() => _SettingsPageViewportState();
+}
+
+class _SettingsPageViewportState extends State<SettingsPageViewport> {
+  ScrollController? _owned;
+  late ScrollController _controller;
+
+  /// 是否有可滚动范围。内容不足时为 false：不画滑块，但沟槽仍占位。
+  bool _hasExtent = false;
+
+  @override
+  void initState() {
+    super.initState();
+    final injected = widget.controller;
+    if (injected != null) {
+      _controller = injected;
+    } else {
+      _owned = ScrollController();
+      _controller = _owned!;
+    }
+  }
+
+  @override
+  void didUpdateWidget(covariant SettingsPageViewport oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    // 注入的 controller 变化时切换监听目标（设置窗口内每个页面的 controller 稳定）。
+    final injected = widget.controller;
+    if (injected != null && !identical(injected, _controller)) {
+      _owned?.dispose();
+      _owned = null;
+      _controller = injected;
+    }
+  }
+
+  @override
+  void dispose() {
+    _owned?.dispose();
+    super.dispose();
+  }
+
+  /// 布局完成后才知道真实内容高度；据此决定是否显示滑块。
+  void _syncExtent() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || !_controller.hasClients) return;
+      final hasExtent = _controller.position.maxScrollExtent > 0.5;
+      if (hasExtent != _hasExtent) setState(() => _hasExtent = hasExtent);
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    _syncExtent();
+    return ScrollConfiguration(
+      // 只关掉本滚动区由 ScrollBehavior 自动叠加的滚动条；组件自己显式画一条。
+      behavior: ScrollConfiguration.of(context).copyWith(scrollbars: false),
+      child: RawScrollbar(
+        key: const Key('settings-viewport-scrollbar'),
+        controller: _controller,
+        // 内容不足时不画滑块（也不横向跳动：沟槽是 padding，不是浮层）。
+        thumbVisibility: _hasExtent,
+        thickness: kSettingsScrollbarThickness,
+        radius: const Radius.circular(4),
+        // 轨道距视口右边缘 4 DIP：thumb 右边缘 = 视口右 - 4，与内容右边缘之间还有
+        // 18 - 4 - 8 = 6 DIP 的空隙。
+        crossAxisMargin: kSettingsScrollbarInset,
+        child: SingleChildScrollView(
+          key: const Key('settings-viewport-scroll'),
+          controller: _controller,
+          padding: widget.padding,
+          child: widget.child,
+        ),
+      ),
+    );
+  }
+}
+
 /// Floating snack bar; used for "copied" / "not available in this build" messages.
 void showSettingsMessage(BuildContext context, String message) {
   final messenger = ScaffoldMessenger.maybeOf(context);
@@ -406,4 +539,3 @@ void showSettingsMessage(BuildContext context, String message) {
     ),
   );
 }
-

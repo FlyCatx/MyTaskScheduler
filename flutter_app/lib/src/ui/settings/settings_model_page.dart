@@ -55,14 +55,13 @@ class _SettingsModelPageState extends State<SettingsModelPage> {
   final TextEditingController _modelId = TextEditingController();
   final TextEditingController _apiKey = TextEditingController();
 
-  /// 表单滚动区自己的 controller 与沟槽：右侧滚动条不再压在思考开关、输入框
-  /// 边框和底部「设为默认连接」按钮上。沟槽由外层 padding 预留，控件内容缩到
-  /// 沟槽左侧；连接列表仍使用自己的滚动容器。
-  final ScrollController _pageScroll = ScrollController();
+  /// 连接列表的独立滚动 controller（列表在自己的受限列里滚动，与页面主视口
+  /// 的 controller 不是同一个：两个 ScrollController 各自 attach 一个 position，
+  /// 不存在嵌套竞争或“同一 controller 绑两个滚动位置”的问题）。
+  ///
+  /// R2-ST：本页不再自己包整页 SingleChildScrollView/Scrollbar——外层纵向滚动由
+  /// `SettingsDialog` 的 `SettingsPageViewport` 统一负责，主滚动轨道因此与其它页对齐。
   final ScrollController _connectionScroll = ScrollController();
-
-  /// 右侧滚动条沟槽宽度（16–20 逻辑像素）。
-  static const double _scrollbarGutter = 18;
 
   String _formId = '';
   int _revision = 0;
@@ -129,7 +128,6 @@ class _SettingsModelPageState extends State<SettingsModelPage> {
     _modelsUrl.dispose();
     _modelId.dispose();
     _apiKey.dispose();
-    _pageScroll.dispose();
     _connectionScroll.dispose();
     super.dispose();
   }
@@ -663,52 +661,25 @@ class _SettingsModelPageState extends State<SettingsModelPage> {
       builder: (context, constraints) {
         final narrow =
             constraints.maxWidth.isFinite && constraints.maxWidth < 620;
-        final content = narrow
-            ? Column(
-                crossAxisAlignment: CrossAxisAlignment.stretch,
-                children: [
-                  _connectionPanel(listMaxHeight: 170),
-                  const SizedBox(height: 10),
-                  _formPanel(),
-                ],
-              )
-            : Row(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  SizedBox(width: 238, child: _connectionPanel()),
-                  const SizedBox(width: 12),
-                  Expanded(child: _formPanel()),
-                ],
-              );
-        return _gutterScroll(
-          child: content,
+        if (narrow) {
+          return Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              _connectionPanel(listMaxHeight: 170),
+              const SizedBox(height: 10),
+              _formPanel(),
+            ],
+          );
+        }
+        return Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            SizedBox(width: 238, child: _connectionPanel()),
+            const SizedBox(width: 12),
+            Expanded(child: _formPanel()),
+          ],
         );
       },
-    );
-  }
-
-  /// 表单滚动外壳：显式 controller + 固定沟槽 + 单一显式 Scrollbar。
-  ///
-  /// `scrollbars: false` 只作用于本滚动区，避免桌面 ScrollBehavior 再叠一条
-  /// 自动滚动条压住右侧控件；连接列表自己的 Scrollbar 单独提供，所以不是
-  /// “把滚动条藏起来”。
-  Widget _gutterScroll({required Widget child}) {
-    return ScrollConfiguration(
-      behavior: ScrollConfiguration.of(context).copyWith(scrollbars: false),
-      child: Scrollbar(
-        controller: _pageScroll,
-        thumbVisibility: true,
-        thickness: 8,
-        radius: const Radius.circular(4),
-        child: SingleChildScrollView(
-          controller: _pageScroll,
-          padding: const EdgeInsets.only(
-            right: _scrollbarGutter + 2,
-            bottom: 12,
-          ),
-          child: child,
-        ),
-      ),
     );
   }
 

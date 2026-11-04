@@ -135,6 +135,10 @@ class SettingsGeneralPage extends StatelessWidget {
               child: SettingsTile(
                 leading: Icons.send_outlined,
                 title: '发送方式',
+                // 两个标签（Ctrl+Enter 发送 / Enter 发送）比普通开关宽得多：
+                // 文字放大后并排会把标题挤到零宽并溢出，所以提高并排阈值，
+                // 放不下时走下方整行 + 横向滚动。
+                minSideBySideWidth: 460,
                 trailing: BezierSegments(
                   height: 28,
                   items: const [

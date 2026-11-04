@@ -14,14 +14,17 @@
 //     conversations/attachments/settings，也不按扩展名推断用户文件；预览与清理
 //     共用 [BackupService.scanCache]，不会出现“看得见却删不到”。
 //
-// 与 settings_dialog 的契约：构造签名 `({super.key, required controller})`，
-// 页面自己负责纵向滚动（小窗口 / 1.3 倍字号下不溢出）。
+// 与 settings_dialog 的契约：构造签名 `({super.key, required controller})`。
+// R2-ST：本页**不再**自己包整页纵向滚动/滚动条——外层由设置窗口的
+// `SettingsPageViewport` 统一提供唯一滚动控制器、显式滚动条与 18 DIP 沟槽，
+// 迁移 / 备份 / 恢复 / 清理卡片不再重复嵌套滚动区。
 
 import 'dart:io';
 
 import 'package:flutter/material.dart';
 
 import '../../state/backup_service.dart';
+import '../../state/execution/execution_store.dart';
 import '../../state/session_store.dart';
 import '../../state/storage_migration.dart';
 import '../../state/settings_controller.dart';
@@ -155,11 +158,20 @@ class SettingsStoragePage extends StatefulWidget {
   final BackupService? backupService;
   final Future<String?> Function(String path)? openDirectory;
 
+  /// 0.2.3（R3-E）：运行中的执行记录存储（备份/恢复要用同一个实例；null = 本运行
+  /// 未启用计时）。缺省时备份不含执行记录，恢复时如实提示。
+  final ExecutionStore? executionStore;
+
   /// 恢复成功后的刷新回调（主代理在 app_shell 接线到 AppController）。
   final Future<void> Function()? onDataRestored;
 
   /// 分析是否进行中（`AppController.isRunning`）；为 true 时不允许恢复。
   final bool Function()? isAnalysisRunning;
+
+  /// 恢复备份后重新加载外部日历（`AppController.externalCalendar?.load()`）。
+  ///
+  /// 为 null 时 [BackupService] 会如实提示“重启后生效”，不会假装已经刷新。
+  final Future<void> Function()? reloadExternalCalendar;
 
   const SettingsStoragePage({
     super.key,
@@ -168,8 +180,10 @@ class SettingsStoragePage extends StatefulWidget {
     this.memoryOnly,
     this.backupService,
     this.openDirectory,
+    this.executionStore,
     this.onDataRestored,
     this.isAnalysisRunning,
+    this.reloadExternalCalendar,
   });
 
   @override
@@ -215,11 +229,17 @@ class _SettingsStoragePageState extends State<SettingsStoragePage> {
           store: SessionStore(widget.controller.dataRoot),
           root: widget.controller.dataRoot,
           settings: widget.controller,
+          // 0.2.3（R3-E）：执行记录与计划分开存储；备份/恢复必须复用运行中的
+          // 存储实例（它持有实例写锁，另建实例会变只读）。
+          execution: widget.executionStore,
           // The page owns both hooks, so the service can report the truth about the
           // session list and about an analysis in flight.
           isBusy: _analysisRunning,
           reloadSessions:
               widget.onDataRestored == null ? null : _notifyDataRestored,
+          // 备份里含 <root>/external_calendar/；恢复后让内存里的外部日历服务重新
+          // 加载，否则界面上仍是恢复前的来源（重启才生效）。
+          reloadExternalCalendar: widget.reloadExternalCalendar,
         );
     _backupPath.text = _defaultBackupPath();
     _loadUsage();
@@ -567,22 +587,20 @@ class _SettingsStoragePageState extends State<SettingsStoragePage> {
 
   @override
   Widget build(BuildContext context) {
-    return SingleChildScrollView(
-      padding: const EdgeInsets.only(bottom: 8),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
-          _directoryCard(),
-          const SizedBox(height: 10),
-          _migrationCard(),
-          const SizedBox(height: 10),
-          _backupCard(),
-          const SizedBox(height: 10),
-          _restoreCard(),
-          const SizedBox(height: 10),
-          _cleanupCard(),
-        ],
-      ),
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        _directoryCard(),
+        const SizedBox(height: 10),
+        _migrationCard(),
+        const SizedBox(height: 10),
+        _backupCard(),
+        const SizedBox(height: 10),
+        _restoreCard(),
+        const SizedBox(height: 10),
+        _cleanupCard(),
+      ],
     );
   }
 
@@ -1026,4 +1044,3 @@ class _SettingsStoragePageState extends State<SettingsStoragePage> {
     return text.length > 180 ? '${text.substring(0, 180)}…' : text;
   }
 }
-

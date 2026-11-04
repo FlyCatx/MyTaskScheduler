@@ -15,20 +15,31 @@
 //
 // Page ownership:
 //   * account / general / shortcuts / notifications / about are implemented here;
-//   * model / storage are implemented by the settings data layer and consumed through the
-//     agreed constructors `SettingsModelPage(controller: …)` /
-//     `SettingsStoragePage(controller: …)`. Both pages scroll their own content.
+//   * model / storage / externalCalendar are implemented by their own pages and consumed
+//     through the agreed constructors. Every page is rendered inside ONE
+//     [SettingsPageViewport] (fixed title + fixed footer, single scroll controller +
+//     explicit scrollbar) so all pages share the same scroll track.
+//
+// R2-ST: the viewport is also why 模型 / 存储 no longer wrap their whole content in their
+// own SingleChildScrollView — a page-level scroll area that has no extent but still
+// consumes wheel events used to fight the dialog's scroll area. Pages are kept alive in a
+// lazily-built `IndexedStack`, so switching categories restores unsaved form state,
+// shortcut recording state, connection edits and the scroll offset of each page.
 
 import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 
 import '../../app_info.dart';
+import '../../model/calendar.dart' show kDefaultTimezoneId;
+import '../../state/execution/execution_store.dart';
+import '../../state/external_calendar_service.dart';
 import '../../state/settings_controller.dart';
 import '../widgets/bezier_ui.dart';
 import '../theme.dart';
 import 'settings_about_page.dart';
 import 'settings_account_page.dart';
+import 'settings_external_calendar_page.dart';
 import 'settings_general_page.dart';
 import 'settings_model_page.dart';
 import 'settings_notifications_page.dart';
@@ -36,8 +47,10 @@ import 'settings_shortcuts_page.dart';
 import 'settings_storage_page.dart';
 import 'settings_widgets.dart';
 
-/// The seven categories of the settings rail. Labels and order are part of the product
+/// The settings categories. Labels and order are part of the product
 /// (「账户安全」 keeps its name), so they are not configurable.
+///
+/// 「外部日历」 is the local ICS import / source-management category added in 0.2.2.
 enum SettingsSection {
   account('账户安全', Icons.person_outline),
   general('通用', Icons.settings_outlined),
@@ -45,6 +58,7 @@ enum SettingsSection {
   shortcuts('快捷键', Icons.keyboard_outlined),
   notifications('通知', Icons.notifications_none),
   storage('存储', Icons.folder_outlined),
+  externalCalendar('外部日历', Icons.event_outlined),
   about('关于', Icons.info_outline);
 
   final String label;
@@ -56,12 +70,23 @@ enum SettingsSection {
 ///
 /// The default section is 账户安全 for every generic entry point (user menu, Ctrl+,).
 /// Entry points that genuinely mean a specific page still pass an explicit [initial].
+///
+/// [externalCalendar] is optional so tests and older call sites keep working: when it is
+/// null the 「外部日历」 page shows an explicit "service unavailable" notice instead of
+/// crashing. [timezoneId] / [currentConversationTitle] are display context for that page,
+/// and [onExternalCalendarChanged] lets the caller refresh read-only calendar views after
+/// an import/enable/delete.
 Future<void> showSettingsDialog(
   BuildContext context, {
   required SettingsController controller,
   SettingsSection initial = SettingsSection.account,
   String? storageSource,
   bool? storageMemoryOnly,
+  ExternalCalendarService? externalCalendar,
+  String timezoneId = kDefaultTimezoneId,
+  String? currentConversationTitle,
+  VoidCallback? onExternalCalendarChanged,
+  ExecutionStore? executionStore,
 }) {
   return showDialog<void>(
     context: context,
@@ -74,6 +99,11 @@ Future<void> showSettingsDialog(
       initial: initial,
       storageSource: storageSource,
       storageMemoryOnly: storageMemoryOnly,
+      externalCalendar: externalCalendar,
+      timezoneId: timezoneId,
+      currentConversationTitle: currentConversationTitle,
+      onExternalCalendarChanged: onExternalCalendarChanged,
+      executionStore: executionStore,
     ),
   );
 }
@@ -88,12 +118,32 @@ class SettingsDialog extends StatefulWidget {
   final String? storageSource;
   final bool? storageMemoryOnly;
 
+  /// 外部日历服务（T-C）。可空：空时「外部日历」页显示服务不可用的明确说明。
+  final ExternalCalendarService? externalCalendar;
+
+  /// 规划时区（「外部日历」页展示/导入使用），默认 `Asia/Shanghai`。
+  final String timezoneId;
+
+  /// 当前会话标题（来源管理页用于说明影响范围），可为空。
+  final String? currentConversationTitle;
+
+  /// 外部日历数据变化后的回调（应用层据此刷新只读占用/排程）。
+  final VoidCallback? onExternalCalendarChanged;
+
+  /// 0.2.3（R3-E）：运行中的执行记录存储；备份/恢复要用同一实例（null = 未启用）。
+  final ExecutionStore? executionStore;
+
   const SettingsDialog({
     super.key,
     required this.controller,
     this.initial = SettingsSection.account,
     this.storageSource,
     this.storageMemoryOnly,
+    this.externalCalendar,
+    this.timezoneId = kDefaultTimezoneId,
+    this.currentConversationTitle,
+    this.onExternalCalendarChanged,
+    this.executionStore,
   });
 
   @override
@@ -102,6 +152,20 @@ class SettingsDialog extends StatefulWidget {
 
 class _SettingsDialogState extends State<SettingsDialog> {
   late SettingsSection _section = widget.initial;
+
+  /// 访问过的分类（R2-ST）。
+  ///
+  /// 只有访问过的页面才会被构建——打开设置窗口不会顺带跑模型/存储页的副作用；
+  /// 访问过的页面会一直留在 `IndexedStack` 里，所以切页再切回来时表单文本、
+  /// 快捷键录制状态、连接编辑与滚动位置都还在。
+  late final Set<SettingsSection> _visited = <SettingsSection>{widget.initial};
+
+  /// 每个页面一个 ScrollController：切页后各自的滚动位置保留，并交给
+  /// [SettingsPageViewport] 绑定到唯一一条显式滚动条。窗口关闭时统一释放。
+  final Map<SettingsSection, ScrollController> _pageControllers = {};
+
+  ScrollController _controllerFor(SettingsSection section) =>
+      _pageControllers.putIfAbsent(section, () => ScrollController());
 
   /// True while `controller.save()` is in flight (the controller also exposes `saving`,
   /// but the local flag covers the gap before the first notification).
@@ -117,6 +181,14 @@ class _SettingsDialogState extends State<SettingsDialog> {
   SettingsController get c => widget.controller;
 
   bool get _busy => _saving || c.saving;
+
+  @override
+  void dispose() {
+    for (final controller in _pageControllers.values) {
+      controller.dispose();
+    }
+    super.dispose();
+  }
 
   // --------------------------------------------------------------- geometry
 
@@ -232,6 +304,7 @@ class _SettingsDialogState extends State<SettingsDialog> {
           customBorder: const BezierRoundedRectangleBorder(radius: 8),
           onTap: () => setState(() {
             _section = section;
+            _visited.add(section);
             _error = null;
           }),
           child: Padding(
@@ -310,24 +383,45 @@ class _SettingsDialogState extends State<SettingsDialog> {
     );
   }
 
-  /// Content area.
+  /// 统一的页面区域（R2-ST）。
   ///
-  /// The 模型 / 存储 pages come from the settings data layer and bring their own vertical
-  /// scroll view (they contain fixed-height inner lists). Wrapping them in a second
-  /// scrollable would swallow the mouse wheel — the inner one has no extent but still
-  /// consumes the pointer signal — so those two get the dialog's padding only.
+  /// 所有分类都走同一个 [SettingsPageViewport]：固定标题与 footer 由本对话框提供，
+  /// 中间只有一个滚动控制器 + 一条显式滚动条，右侧 18 DIP 沟槽是实际布局空间。
+  /// 模型 / 存储不再有“只加 Padding”的特殊分支。
+  ///
+  /// 页面放在惰性 `IndexedStack` 里：只有访问过的分类才构建（打开窗口不会顺带
+  /// 跑模型/存储页的副作用），访问过的页面一直保留 State，所以切页再回来时
+  /// 未保存表单、快捷键录制状态、连接编辑与各自的滚动位置都还在。
+  /// 非当前页同时排除语义与焦点，避免 Tab/读屏跑到看不见的页面上。
   Widget _pageArea(bool compact) {
     final pad = compact ? 14.0 : 24.0;
-    final padding = EdgeInsets.fromLTRB(pad, 2, pad, 18);
-    if (_section == SettingsSection.model ||
-        _section == SettingsSection.storage) {
-      return Padding(padding: padding, child: _page());
-    }
-    return SingleChildScrollView(padding: padding, child: _page());
+    final padding = EdgeInsets.fromLTRB(pad, 2, kSettingsScrollbarGutter, 18);
+    return IndexedStack(
+      key: const Key('settings-page-stack'),
+      index: _section.index,
+      sizing: StackFit.expand,
+      children: [
+        for (final section in SettingsSection.values)
+          ExcludeFocus(
+            excluding: section != _section,
+            child: ExcludeSemantics(
+              excluding: section != _section,
+              child: !_visited.contains(section)
+                  ? const SizedBox.shrink()
+                  : SettingsPageViewport(
+                      key: ValueKey('settings-viewport-${section.name}'),
+                      controller: _controllerFor(section),
+                      padding: padding,
+                      child: _pageFor(section),
+                    ),
+            ),
+          ),
+      ],
+    );
   }
 
-  Widget _page() {
-    return switch (_section) {
+  Widget _pageFor(SettingsSection section) {
+    return switch (section) {
       SettingsSection.account => const SettingsAccountPage(),
       SettingsSection.general => SettingsGeneralPage(controller: c),
       SettingsSection.model => SettingsModelPage(controller: c),
@@ -337,9 +431,29 @@ class _SettingsDialogState extends State<SettingsDialog> {
           controller: c,
           storageSource: widget.storageSource,
           memoryOnly: widget.storageMemoryOnly,
+          executionStore: widget.executionStore,
+          // 备份恢复包含外部日历快照：恢复后立即重新加载，避免“重启后才生效”。
+          reloadExternalCalendar: widget.externalCalendar == null
+              ? null
+              : () => widget.externalCalendar!.load(),
         ),
+      SettingsSection.externalCalendar => _externalCalendarPage(),
       SettingsSection.about => SettingsAboutPage(controller: c),
     };
+  }
+
+  /// 「外部日历」页（T-E 实现）。service 为空时显示明确说明，而不是崩溃。
+  Widget _externalCalendarPage() {
+    final service = widget.externalCalendar;
+    if (service == null) {
+      return const _ExternalCalendarUnavailablePage();
+    }
+    return SettingsExternalCalendarPage(
+      service: service,
+      timezoneId: widget.timezoneId,
+      currentConversationTitle: widget.currentConversationTitle,
+      onChanged: widget.onExternalCalendarChanged,
+    );
   }
 
   // ----------------------------------------------------------------- footer
@@ -556,3 +670,39 @@ class _UnsavedChangesDialog extends StatelessWidget {
   }
 }
 
+/// 「外部日历」页在 service 为空时的降级内容（0.2.2 / R2）。
+///
+/// 真实页面由 T-E 的 `settings_external_calendar_page.dart` 提供；这里只负责“服务不可
+/// 用”的明确说明：不假装功能可用，也不会崩溃。正常运行时 `showSettingsDialog` 总会
+/// 传入 `AppController.externalCalendar`，所以只有独立构造 SettingsDialog 的测试/宿主
+/// 才会看到这一页。
+class _ExternalCalendarUnavailablePage extends StatelessWidget {
+  const _ExternalCalendarUnavailablePage();
+
+  @override
+  Widget build(BuildContext context) {
+    return const Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        SettingsGroupLabel('外部日历'),
+        SettingsCard(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              SettingsIntro(
+                text: '从本地 ICS 文件导入只读的外部日历，排程时会避开已有的安排。',
+              ),
+              SizedBox(height: 10),
+              SettingsNote(
+                key: Key('settings-external-calendar-unavailable'),
+                icon: Icons.info_outline,
+                text: '外部日历服务不可用：本版本尚未接入外部日历服务。',
+              ),
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+}
