@@ -3254,7 +3254,7 @@ int ts_bridge_pick_file(TsBridge *bridge,
      * 过滤器：只列文本；同时保留“所有文件”，这样用户仍能看到 .log 等文件，
      * 真正的类型校验在 App 侧完成（会给出明确提示）。
      */
-    ofn.lpstrFilter = L"文档 (*.txt;*.md;*.pdf;*.docx;*.pptx)\0*.txt;*.md;*.pdf;*.docx;*.pptx\0所有文件 (*.*)\0*.*\0\0";
+        ofn.lpstrFilter = L"文档 (*.txt;*.md;*.pdf;*.docx;*.pptx)\0*.txt;*.md;*.pdf;*.docx;*.pptx\0日历文件 (*.ics;*.ical)\0*.ics;*.ical\0所有文件 (*.*)\0*.*\0\0";
     ofn.lpstrFile = file_buf;
     ofn.nMaxFile = (DWORD)(sizeof(file_buf) / sizeof(file_buf[0]));
     ofn.lpstrTitle = title;
