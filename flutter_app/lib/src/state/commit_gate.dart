@@ -17,6 +17,9 @@ class RequestTicket {
   final String requestId;
   final String? baseVersionId;
   final int baseRevision;
+
+  /// 请求发出时的已提交时间表 revision；期间用户改了时间表则结果不能直接应用。
+  final int calendarRevision;
   bool cancelled = false;
 
   RequestTicket({
@@ -24,6 +27,7 @@ class RequestTicket {
     required this.requestId,
     required this.baseVersionId,
     required this.baseRevision,
+    this.calendarRevision = 0,
   });
 }
 
@@ -84,6 +88,7 @@ class ConversationCommitGate {
     required String requestId,
     required String? baseVersionId,
     required int baseRevision,
+    int calendarRevision = 0,
   }) {
     if (_active.containsKey(conversationId)) {
       throw StateError('该会话已有进行中的分析，请先等待或取消');
@@ -93,6 +98,7 @@ class ConversationCommitGate {
       requestId: requestId,
       baseVersionId: baseVersionId,
       baseRevision: baseRevision,
+      calendarRevision: calendarRevision,
     );
     _active[conversationId] = ticket;
     return ticket;
@@ -115,4 +121,3 @@ class ConversationCommitGate {
     }
   }
 }
-

@@ -55,6 +55,36 @@ ParsedDeadline parseDeadlineText(
   final clock = WallClock(offsetMinutes);
   final wallNow = clock.toWall(now);
 
+  // A complete ISO timestamp that carries its own zone (Z / +08:00) must keep that
+  // zone. Re-applying the user's fixed offset here would move the instant.
+  final zoned = RegExp(
+    r'(\d{4})-(\d{1,2})-(\d{1,2})[T ](\d{1,2}):(\d{2})(?::(\d{2}))?\s*(Z|[+-]\d{2}:?\d{2})',
+    caseSensitive: false,
+  ).firstMatch(raw);
+  if (zoned != null) {
+    final y = int.parse(zoned.group(1)!);
+    final m = int.parse(zoned.group(2)!);
+    final d = int.parse(zoned.group(3)!);
+    final h = int.parse(zoned.group(4)!);
+    final min = int.parse(zoned.group(5)!);
+    final sec = zoned.group(6) == null ? 0 : int.parse(zoned.group(6)!);
+    final zone = zoned.group(7)!;
+    if (!_validDate(y, m, d) || h > 23 || min > 59 || sec > 59) {
+      return ParsedDeadline(problem: '截止时间不存在：$raw');
+    }
+    var zoneMinutes = 0;
+    if (zone.toUpperCase() != 'Z') {
+      final sign = zone.startsWith('-') ? -1 : 1;
+      final digits = zone.substring(1).replaceAll(':', '');
+      zoneMinutes = sign *
+          (int.parse(digits.substring(0, 2)) * 60 +
+              int.parse(digits.substring(2)));
+    }
+    final utc = DateTime.utc(y, m, d, h, min, sec)
+        .subtract(Duration(minutes: zoneMinutes));
+    return ParsedDeadline(at: utc, inferred: false);
+  }
+
   final hhmm = RegExp(r'(\d{1,2})\s*[:：]\s*(\d{2})(?!\d)');
   final timeMatch = hhmm.firstMatch(raw);
   int? hour = timeMatch == null ? null : int.parse(timeMatch.group(1)!);
@@ -71,10 +101,10 @@ ParsedDeadline parseDeadlineText(
     final y = int.parse(iso.group(1)!);
     final m = int.parse(iso.group(2)!);
     final d = int.parse(iso.group(3)!);
-    if (m >= 1 && m <= 12 && d >= 1 && d <= 31) {
-      return _build(clock, y, m, d, hour, minute,
-          inferred: false);
+    if (!_validDate(y, m, d)) {
+      return ParsedDeadline(problem: '截止日期不存在：$raw');
     }
+    return _build(clock, y, m, d, hour, minute, inferred: false);
   }
 
   // M月D日 / M-D / M/D (no year)
@@ -100,7 +130,10 @@ ParsedDeadline parseDeadlineText(
   if (day != null) {
     var m = month ?? wallNow.month;
     var y = wallNow.year;
-    if (m < 1 || m > 12 || day < 1 || day > 31) return ParsedDeadline.none;
+    if (m < 1 || m > 12 || day < 1 || !_validDate(y, m, day)) {
+      // 2月30日 / 4月31日 等不能被静默归一化成下个月。
+      return ParsedDeadline(problem: '截止日期不存在：$raw');
+    }
     // A month/day that already looks like it passed refers to the next occurrence —
     // still flagged as inferred, because the text itself did not say which year.
     var candidate = DateTime.utc(y, m, day);
@@ -115,23 +148,34 @@ ParsedDeadline parseDeadlineText(
       } else {
         y += 1;
       }
+      if (!_validDate(y, m, day)) {
+        return ParsedDeadline(problem: '截止日期不存在：$raw');
+      }
       candidate = DateTime.utc(y, m, day);
     }
     return _build(clock, y, m, day, hour, minute, inferred: true);
   }
 
-  // Time only: today, or tomorrow when that time already passed.
+  // Time only: today at that time, or tomorrow when that time already passed.
   if (hour != null) {
-    var d = DateTime.utc(wallNow.year, wallNow.month, wallNow.day);
-    if (clock.fromWall(d).isBefore(now)) {
-      d = d.add(const Duration(days: 1));
+    var day =
+        DateTime.utc(wallNow.year, wallNow.month, wallNow.day, hour, minute!);
+    if (clock.fromWall(day).isBefore(now)) {
+      day = day.add(const Duration(days: 1));
     }
-    return _build(clock, d.year, d.month, d.day, hour, minute, inferred: true);
+    return ParsedDeadline(at: clock.fromWall(day), inferred: true);
   }
 
   return ParsedDeadline(
     problem: '无法解析截止时间「$raw」，不计入日历约束',
   );
+}
+
+bool _validDate(int year, int month, int day) {
+  if (month < 1 || month > 12 || day < 1) return false;
+  final date = DateTime.utc(year, month, day);
+  // DateTime normalizes impossible dates (2/30 -> 3/2); compare back.
+  return date.year == year && date.month == month && date.day == day;
 }
 
 ParsedDeadline _build(
@@ -1062,4 +1106,3 @@ CalendarEditOutcome replaceSchedule({
       label: label,
       message: message,
     );
-

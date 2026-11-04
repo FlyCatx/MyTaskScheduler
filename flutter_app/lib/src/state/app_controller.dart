@@ -418,32 +418,57 @@ class AppController extends ChangeNotifier {
 
   final Set<String> _draftDirty = <String>{};
   Timer? _draftTimer;
-  bool _flushingDrafts = false;
 
-  /// Flushes debounced writes (draft text). Called before switching/closing and by tests.
-  Future<void> flushPendingWrites() async {
-    if (_draftDirty.isEmpty || _flushingDrafts) return;
-    _flushingDrafts = true;
+  /// 正在进行的排空任务。并发调用必须等待同一个 Future，不能“看到别人在写就
+  /// 直接返回成功”——关闭流程会因此提前销毁进程。
+  Future<bool>? _flushInFlight;
+
+  /// Flushes debounced writes (draft text) and drains edits that arrive while a
+  /// write is in flight. Returns false when a write failed and the dirty set could
+  /// not be drained; callers must not treat that as “saved”.
+  Future<bool> flushPendingWrites() {
+    final existing = _flushInFlight;
+    if (existing != null) {
+      return existing.then((ok) {
+        if (!ok) return false;
+        // 上一次排空结束前可能又产生了新草稿：继续排空，直到真正没有 dirty。
+        if (_draftDirty.isEmpty) return true;
+        return flushPendingWrites();
+      });
+    }
+    if (_draftDirty.isEmpty) return Future.value(true);
+    final future = _drainDraftWrites();
+    _flushInFlight = future;
+    future.whenComplete(() {
+      if (identical(_flushInFlight, future)) _flushInFlight = null;
+    });
+    return future;
+  }
+
+  Future<bool> _drainDraftWrites() async {
     _draftTimer?.cancel();
     _draftTimer = null;
-    try {
-      while (_draftDirty.isNotEmpty) {
-        final id = _draftDirty.first;
+    while (_draftDirty.isNotEmpty) {
+      final id = _draftDirty.first;
+      final snapshot = _cache[id];
+      if (snapshot == null) {
         _draftDirty.remove(id);
-        final c = _cache[id];
-        if (c == null) continue;
-        try {
-          await store.saveConversation(c);
-        } catch (e) {
-          _draftDirty.add(id);
-          _errorMessage = '草稿未能写入本地存储：$e';
-          _notify();
-          break;
-        }
+        continue;
       }
-    } finally {
-      _flushingDrafts = false;
+      try {
+        await store.saveConversation(snapshot);
+      } catch (e) {
+        // 保留 dirty，允许调用方重试；错误可见，不能假装已保存。
+        _errorMessage = '草稿未能写入本地存储：$e';
+        _notify();
+        return false;
+      }
+      // 保存期间用户继续输入会替换缓存对象：这一条仍需再写一次。
+      if (identical(_cache[id], snapshot)) {
+        _draftDirty.remove(id);
+      }
     }
+    return true;
   }
 
   // ----------------------------------------------------------- attachments
@@ -709,6 +734,9 @@ class AppController extends ChangeNotifier {
       requestId: requestId,
       baseVersionId: version?.id,
       baseRevision: version?.revision ?? 0,
+      // -1 = 本次请求没有带时间表，之后改时间表不影响结果可用性。
+      calendarRevision:
+          requestTimetable == null ? -1 : requestTimetable.revision,
     );
 
     // Persist the pending request before starting, so a crash cannot leave a
@@ -935,6 +963,16 @@ class AppController extends ChangeNotifier {
     if (latest == null || latest.isDeleted || latest.isArchived) {
       _statusMessage = '会话已归档或删除，迟到结果已丢弃';
       return;
+    }
+    if (ticket.calendarRevision >= 0) {
+      final currentTimetable =
+          latest.currentVersion?.timetable ?? latest.calendarDraft;
+      final currentRevision = currentTimetable?.revision ?? 0;
+      final stale = calendarStaleMessage(ticket.calendarRevision, currentRevision);
+      if (stale != null) {
+        _statusMessage = stale;
+        return;
+      }
     }
     if (c == null || c.id != ticket.conversationId || plan == null) {
       _statusMessage = '结果不属于当前会话，已丢弃';
@@ -1482,17 +1520,29 @@ class AppController extends ChangeNotifier {
     return Timetable.fromSchedule(v.calendar, weekStart: weekStart);
   }
 
+  /// 迟到结果的时间表一致性判断：请求未带时间表（-1）或 revision 未变时可用。
+  static String? calendarStaleMessage(int requestedRevision, int currentRevision) {
+    if (requestedRevision < 0 || requestedRevision == currentRevision) {
+      return null;
+    }
+    return '时间表在分析期间已修改（revision $requestedRevision → '
+        '$currentRevision），本次结果未应用；请用新时间表重新分析';
+  }
+
   /// 输入框里的时间表摘要；没有可发送的时间表时为 null。
+  ///
+  /// 这里给出的是 coverage 内按天展开的可用总量（含日期覆盖与本周占用），
+  /// 不是“每周模板容量”，避免把模板值显示成本周实际可用。
   String? get timetableSummary {
     final c = _conversation;
     if (c == null || !c.includeTimetable) return null;
     final tt = c.currentVersion?.timetable ?? c.calendarDraft;
     if (tt == null) return null;
-    final free = tt.freeMinutesPerWeek;
+    final free = tt.freeMinutesInCoverage;
     final tasks = tt.taskEntries.length;
     final bound = tt.boundMinutesByTask().values.fold<int>(0, (a, b) => a + b);
-    return '时间表：本周可用 ${free ~/ 60} 小时 ${free % 60} 分 · '
-        '蓝色 $tasks 段（已绑定 $bound 分钟）';
+    return '时间表：覆盖 ${tt.coverageDays} 天 · 可用 ${free ~/ 60} 小时 '
+        '${free % 60} 分 · 蓝色 $tasks 段（已绑定 $bound 分钟）';
   }
 
   /// 移除随请求发送的时间表；不会删除已保存的日程数据。
@@ -1506,63 +1556,90 @@ class AppController extends ChangeNotifier {
     _notify();
   }
 
+  /// 时间表提交进行中标记：防止重复点击/并发展开导致重复排程或乱序写入。
+  bool _applyingTimetable = false;
+
   /// 应用编辑器的结果：时间表与 CalendarSettings 一起提交，并按需重新安排。
+  ///
+  /// [timetable] 是唯一权威草稿；settings 里的周可用/例外/占用必须已经反映在
+  /// 时间表中（编辑器负责同源重建）。revision 从当前已提交状态推进，不能拿
+  /// 编辑器打开时的旧 revision 反复 +1。
   Future<bool> applyTimetableSettings(
     CalendarSettings settings,
     Timetable timetable, {
     bool reschedule = true,
   }) async {
-    final v = _viewVersion;
-    if (v == null) {
-      // 空会话：只保存草稿时间表，不创建空计划版本。
-      final c = _conversation;
-      if (c == null) return false;
-      final updated = c.copyWith(
-        calendarDraft: timetable.copyWith(revision: timetable.revision + 1),
-        includeTimetable: true,
-        updatedAt: DateTime.now(),
-        activityAt: DateTime.now(),
-      );
-      _conversation = updated;
-      _cache[updated.id] = updated;
-      await store.saveConversation(updated);
-      _statusMessage = '时间表已保存；发送时会随请求一起提交';
+    if (_applyingTimetable) {
+      _errorMessage = '时间表正在保存，请稍候';
       _notify();
-      return true;
+      return false;
     }
-    final clock = settings.clock;
-    final nextTimetable = timetable.copyWith(revision: timetable.revision + 1);
-    final derived = nextTimetable.toCalendarSettings(settings);
-    final auto =
-        v.calendar.segments.where((s) => s.source == SegmentSource.auto);
-    final manual = nextTimetable.taskSegments(clock);
-    var schedule = v.calendar.copyWith(
-      settings: derived,
-      segments: List<ScheduleSegment>.unmodifiable(<ScheduleSegment>[
-        ...auto,
-        ...manual,
-      ]..sort((a, b) => a.start.compareTo(b.start))),
-    );
-    if (reschedule) {
-      final plan = autoSchedule(
-        current: schedule,
-        tasks: schedulingTasks(),
-        suggestedOrder: _display?.order ?? const <String>[],
-        now: DateTime.now(),
-        keepManual: true,
+    final invalid = validateTimetableForRequest(timetable);
+    if (invalid != null) {
+      _errorMessage = invalid;
+      _notify();
+      return false;
+    }
+    _applyingTimetable = true;
+    try {
+      final v = _viewVersion;
+      if (v == null) {
+        // 空会话：只保存草稿时间表，不创建空计划版本。
+        final c = _conversation;
+        if (c == null) return false;
+        final committedRevision = c.calendarDraft?.revision ?? 0;
+        final updated = c.copyWith(
+          calendarDraft:
+              timetable.copyWith(revision: committedRevision + 1),
+          includeTimetable: true,
+          updatedAt: DateTime.now(),
+          activityAt: DateTime.now(),
+        );
+        _conversation = updated;
+        _cache[updated.id] = updated;
+        await store.saveConversation(updated);
+        _statusMessage = '时间表已保存；发送时会随请求一起提交';
+        _notify();
+        return true;
+      }
+      final clock = settings.clock;
+      final committedRevision = v.timetable?.revision ?? 0;
+      final nextTimetable =
+          timetable.copyWith(revision: committedRevision + 1);
+      final derived = nextTimetable.toCalendarSettings(settings);
+      final auto =
+          v.calendar.segments.where((s) => s.source == SegmentSource.auto);
+      final manual = nextTimetable.taskSegments(clock);
+      var schedule = v.calendar.copyWith(
+        settings: derived,
+        segments: List<ScheduleSegment>.unmodifiable(<ScheduleSegment>[
+          ...auto,
+          ...manual,
+        ]..sort((a, b) => a.start.compareTo(b.start))),
       );
-      _calendarTaskNotes = plan.taskNotes;
-      schedule = plan.schedule;
+      if (reschedule) {
+        final plan = autoSchedule(
+          current: schedule,
+          tasks: schedulingTasks(),
+          suggestedOrder: _display?.order ?? const <String>[],
+          now: DateTime.now(),
+          keepManual: true,
+        );
+        _calendarTaskNotes = plan.taskNotes;
+        schedule = plan.schedule;
+      }
+      return await applyCalendarEdit(
+        CalendarEditOutcome(
+          schedule: schedule,
+          tasks: v.tasks,
+          label: '更新时间表',
+          message: reschedule ? '已保存时间表并重新安排' : '已保存时间表',
+        ),
+        timetable: nextTimetable,
+      );
+    } finally {
+      _applyingTimetable = false;
     }
-    return applyCalendarEdit(
-      CalendarEditOutcome(
-        schedule: schedule,
-        tasks: v.tasks,
-        label: '更新时间表',
-        message: reschedule ? '已保存时间表并重新安排' : '已保存时间表',
-      ),
-      timetable: nextTimetable,
-    );
   }
 
   // ---------------------------------------- AI calendar-constraint proposals
