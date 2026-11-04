@@ -1,14 +1,18 @@
 #include "flutter_window.h"
 
 #include <commctrl.h>
+#include <dwmapi.h>
 #include <flutter/standard_method_codec.h>
 #include <flutter_windows.h>
 #include <windowsx.h>
 
+#include <cstdio>
+#include <cstdlib>
 #include <optional>
 
 #include "flutter/generated_plugin_registrant.h"
 #include "window_geometry.h"
+#include "window_region.h"
 
 namespace {
 
@@ -31,10 +35,64 @@ int64_t ReadInt(const flutter::EncodableValue& value) {
   return 0;
 }
 
+/*
+ * Optional window-message diagnostics for acceptance evidence (R2-W2).
+ *
+ * Set TASKSCHEDULER_WINDOW_LOG=<file> before starting the executable and every
+ * state-transition related message is appended with the current window style and
+ * rectangle. The acceptance report uses it to prove that no transition brings
+ * WS_CAPTION / WS_BORDER back or triggers non-client painting. It is off in
+ * normal runs and never contains user data.
+ */
+void WindowLog(const char* message, HWND window, WPARAM wparam, LPARAM lparam) {
+  static FILE* log = nullptr;
+  static bool initialised = false;
+  if (!initialised) {
+    initialised = true;
+    char path[1024] = {0};
+    const DWORD length = GetEnvironmentVariableA(
+        "TASKSCHEDULER_WINDOW_LOG", path, static_cast<DWORD>(sizeof(path)));
+    if (length > 0 && length < sizeof(path) && path[0] != '\0') {
+      log = nullptr;
+      fopen_s(&log, path, "a");
+    }
+  }
+  if (log == nullptr || window == nullptr) return;
+  LONG style = GetWindowLong(window, GWL_STYLE);
+  LONG ex_style = GetWindowLong(window, GWL_EXSTYLE);
+  RECT rect = {0, 0, 0, 0};
+  GetWindowRect(window, &rect);
+  std::fprintf(log,
+               "%s style=0x%08lX ex=0x%08lX rect=(%ld,%ld,%ld,%ld) "
+               "zoomed=%d iconic=%d wp=%llX lp=%llX\n",
+               message, static_cast<unsigned long>(style),
+               static_cast<unsigned long>(ex_style), rect.left, rect.top,
+               rect.right, rect.bottom, IsZoomed(window) ? 1 : 0,
+               IsIconic(window) ? 1 : 0,
+               static_cast<unsigned long long>(wparam),
+               static_cast<unsigned long long>(lparam));
+  std::fflush(log);
+}
+
 }  // namespace
 
 FlutterWindow::FlutterWindow(const flutter::DartProject& project)
-    : project_(project) {}
+    : project_(project) {
+  /*
+   * Acceptance experiment only: TASKSCHEDULER_DISABLE_REGION=1 starts the app
+   * without the native window region. The probe then captures what the Flutter
+   * GPU surface itself presents at the corners, which is the evidence for
+   * "the embedder's HWND surface has no per-pixel alpha, so a ClipPath cannot
+   * make the native window edge transparent". Normal runs never set this.
+   */
+  char disable_region[8] = {0};
+  const DWORD disabled = GetEnvironmentVariableA(
+      "TASKSCHEDULER_DISABLE_REGION", disable_region,
+      static_cast<DWORD>(sizeof(disable_region)));
+  if (disabled > 0 && disable_region[0] == '1') {
+    region_diagnostics_enabled_ = false;
+  }
+}
 
 FlutterWindow::~FlutterWindow() {}
 
@@ -84,6 +142,38 @@ bool FlutterWindow::OnCreate() {
   SetWindowSubclass(flutter_controller_->view()->GetNativeWindow(),
                     &FlutterWindow::ChildHitTestProc, 1,
                     reinterpret_cast<DWORD_PTR>(this));
+
+  // Establish the rounded outline before the first frame is shown, so the
+  // window never flashes its square corners on startup. WM_NCCALCSIZE keeps the
+  // client rectangle equal to the window rectangle here, so the region
+  // coordinates and Flutter's rendering surface share one origin.
+  UpdateWindowRegion(/*force=*/true);
+
+  /*
+   * Once the window is non-rectangular, DWM falls back to painting its own
+   * window frame inside the window bounds: without this the rounded outline is
+   * surrounded by a thick gray system band instead of Flutter's 1 px hairline.
+   *
+   * The frame extension used by most borderless-window apps is NOT usable here:
+   * it makes DWM ignore the window region for compositing, so the cut corners
+   * fill with the frame brush and the outline stops being a true window cut.
+   * Disabling non-client rendering keeps the region authoritative and stops the
+   * system from painting a second frame.
+   */
+  const DWMNCRENDERINGPOLICY nc_policy = DWMNCRP_DISABLED;
+  DwmSetWindowAttribute(window, DWMWA_NCRENDERING_POLICY, &nc_policy,
+                        sizeof(nc_policy));
+#ifndef DWMWA_WINDOW_CORNER_PREFERENCE
+#define DWMWA_WINDOW_CORNER_PREFERENCE 33
+#endif
+#ifndef DWMWCP_DONOTROUND
+#define DWMWCP_DONOTROUND 1
+#endif
+  // The outline is an explicit cubic Bezier path; the system corner style must
+  // not add a second, slightly different rounding on top of it.
+  const DWORD corner_preference = DWMWCP_DONOTROUND;
+  DwmSetWindowAttribute(window, DWMWA_WINDOW_CORNER_PREFERENCE,
+                        &corner_preference, sizeof(corner_preference));
 
   flutter_controller_->engine()->SetNextFrameCallback([&]() {
     this->Show();
@@ -159,6 +249,39 @@ void FlutterWindow::HandleWindowMethod(
       }
     }
     result->Success();
+  } else if (method == "windowShape") {
+    // Current window state for Dart: shape (state/radius), real size and DPI.
+    // Dart uses it once on startup; events carry the same map afterwards.
+    result->Success(WindowShapeInfo(shape_sequence_));
+  } else if (method == "setRegionEnabled") {
+    /*
+     * Diagnostics only (acceptance evidence for the anti-aliasing section):
+     * turning the native region off lets a probe capture what the GPU surface
+     * actually presents at the corners, proving whether the top-level surface
+     * carries per-pixel alpha or is opaque (in which case a ClipPath cannot
+     * produce a transparent native edge).
+     */
+    const auto* arguments = std::get_if<flutter::EncodableMap>(call.arguments());
+    bool enabled = true;
+    if (arguments != nullptr) {
+      auto it = arguments->find(flutter::EncodableValue("enabled"));
+      if (it != arguments->end()) {
+        if (const bool* value = std::get_if<bool>(&it->second)) {
+          enabled = *value;
+        }
+      }
+    }
+    region_diagnostics_enabled_ = enabled;
+    if (!enabled) {
+      region_updating_ = true;
+      SetWindowRgn(window, nullptr, TRUE);
+      region_applied_ = false;
+      region_updating_ = false;
+    } else {
+      UpdateWindowRegion(/*force=*/true);
+      NotifyWindowShape(window);
+    }
+    result->Success(WindowShapeInfo(shape_sequence_));
   } else {
     result->NotImplemented();
   }
@@ -173,6 +296,208 @@ void FlutterWindow::NotifyMaximizedState(HWND window) {
 
 bool FlutterWindow::IsWindowMaximized(HWND window) const {
   return window != nullptr && IsZoomed(window) != 0;
+}
+
+void FlutterWindow::UpdateWindowRegion(bool force) {
+  HWND window = GetHandle();
+  if (window == nullptr) return;
+
+  // A minimized window has no meaningful client rectangle; skipping keeps the
+  // last real region instead of replacing it with a degenerate one.
+  if (IsIconic(window) != 0) return;
+
+  // Diagnostics mode: the region was deliberately cleared by the probe.
+  if (!region_diagnostics_enabled_) return;
+
+  /*
+   * Re-entrancy: SetWindowRgn sends WM_WINDOWPOSCHANGING/WM_WINDOWPOSCHANGED and
+   * can synchronously re-enter the message handler. The flag (not the cache)
+   * is what prevents recursion; the cache keeps resize drags from rebuilding an
+   * identical HRGN for every intermediate size it already handled.
+   */
+  if (region_updating_) return;
+
+  RECT rect = {0, 0, 0, 0};
+  if (GetWindowRect(window, &rect) == FALSE) {
+    ++region_failures_;
+    region_last_error_ = GetLastError();
+    return;
+  }
+  const int width = static_cast<int>(rect.right - rect.left);
+  const int height = static_cast<int>(rect.bottom - rect.top);
+  if (width <= 0 || height <= 0) return;
+
+  /*
+   * Always the window's own DPI, resolved after the new rectangle was applied:
+   * a WM_DPICHANGED / cross-monitor move must not reuse the previous value.
+   */
+  const UINT dpi = FlutterDesktopGetDpiForHWND(window);
+  if (dpi == 0) {
+    ++region_failures_;
+    region_last_error_ = ERROR_INVALID_PARAMETER;
+    return;
+  }
+  const double radius_dip = CurrentCornerRadiusDip(window);
+  const int radius_px =
+      ts_window_region_radius_px(width, height, dpi, radius_dip);
+  const bool maximized = IsWindowMaximized(window);
+  const bool snapped = IsWindowSnappedToWorkArea(window);
+
+  if (!force && region_applied_ == (radius_px > 0) &&
+      width == region_width_ && height == region_height_ &&
+      dpi == region_dpi_ && radius_px == region_radius_px_ &&
+      radius_dip == region_radius_dip_ && maximized == region_maximized_ &&
+      snapped == region_snapped_) {
+    return;
+  }
+
+  TsWindowRegionPoint points[TS_WINDOW_REGION_MAX_POINTS];
+  const int count = ts_window_region_build(width, height,
+                                           static_cast<double>(radius_px),
+                                           points, TS_WINDOW_REGION_MAX_POINTS);
+  if (count < 0) {
+    ++region_failures_;
+    region_last_error_ = ERROR_INVALID_PARAMETER;
+    return;
+  }
+
+  region_updating_ = true;
+  HRGN region = nullptr;
+  if (count == 0) {
+    // Radius 0 (maximized / snapped): clear the region so the window is a plain
+    // rectangle that fills the work area without cut corners. SetWindowRgn with
+    // NULL removes any previous region; the system releases the old HRGN.
+    if (SetWindowRgn(window, nullptr, TRUE) == 0) {
+      ++region_failures_;
+      region_last_error_ = GetLastError();
+      region_updating_ = false;
+      return;
+    }
+    region_applied_ = false;
+  } else {
+    POINT polygon[TS_WINDOW_REGION_MAX_POINTS];
+    for (int i = 0; i < count; ++i) {
+      polygon[i].x = points[i].x;
+      polygon[i].y = points[i].y;
+    }
+    region = CreatePolygonRgn(polygon, count, WINDING);
+    if (region == nullptr) {
+      ++region_failures_;
+      region_last_error_ = GetLastError();
+      region_updating_ = false;
+      return;
+    }
+    if (SetWindowRgn(window, region, TRUE) == 0) {
+      // On failure the HRGN is still ours; on success the system owns it and it
+      // must never be deleted or used again.
+      DeleteObject(region);
+      ++region_failures_;
+      region_last_error_ = GetLastError();
+      region_updating_ = false;
+      return;
+    }
+    region_applied_ = true;
+  }
+
+  region_width_ = width;
+  region_height_ = height;
+  region_dpi_ = dpi;
+  region_radius_px_ = radius_px;
+  region_radius_dip_ = radius_dip;
+  region_maximized_ = maximized;
+  region_snapped_ = snapped;
+  ++region_updates_;
+  region_updating_ = false;
+}
+
+bool FlutterWindow::IsWindowSnappedToWorkArea(HWND window) const {
+  /*
+   * Windows has no public "is this window snapped" API. A window that covers
+   * the full work-area height and touches the left or right work-area edge is
+   * the shape the OS produces for half/quarter Snap layouts; a maximized window
+   * is handled separately by IsZoomed and never reaches this test with a
+   * matching rectangle.
+   *
+   * A normal window moved/resized by hand to exactly those coordinates is
+   * indistinguishable from a snapped one; treating it as snapped only changes
+   * the corner style (square), never the geometry, and the radius is frozen
+   * during a sizing loop so the shape cannot flicker while dragging.
+   */
+  if (IsIconic(window) != 0) return false;
+  if (IsWindowMaximized(window)) return false;
+  MONITORINFO info = {};
+  info.cbSize = sizeof(info);
+  HMONITOR monitor = MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST);
+  if (GetMonitorInfo(monitor, &info) == FALSE) return false;
+  RECT rect = {0, 0, 0, 0};
+  if (GetWindowRect(window, &rect) == FALSE) return false;
+  const RECT& work = info.rcWork;
+  const bool within_work = rect.left >= work.left && rect.top >= work.top &&
+                           rect.right <= work.right &&
+                           rect.bottom <= work.bottom;
+  if (!within_work) return false;
+  const bool full_height = rect.top == work.top && rect.bottom == work.bottom;
+  const bool touches_side = rect.left == work.left || rect.right == work.right;
+  return full_height && touches_side;
+}
+
+double FlutterWindow::CurrentCornerRadiusDip(HWND window) const {
+  if (window == nullptr) return kWindowCornerRadiusDip;
+  if (IsIconic(window) != 0) {
+    // Keep the last applied radius while minimized: there is nothing to clip.
+    return region_radius_dip_;
+  }
+  if (IsWindowMaximized(window)) return 0.0;
+  if (IsWindowSnappedToWorkArea(window)) return 0.0;
+  if (in_sizing_loop_) {
+    // Freeze during the interactive resize so dragging through a snap-sized
+    // rectangle does not flip the corners back and forth.
+    return region_radius_dip_ > 0.0 ? region_radius_dip_ : kWindowCornerRadiusDip;
+  }
+  return kWindowCornerRadiusDip;
+}
+
+void FlutterWindow::NotifyWindowShape(HWND window) {
+  if (!window_channel_ || window == nullptr) return;
+  const int sequence = ++shape_sequence_;
+  last_pushed_sequence_ = sequence;
+  window_channel_->InvokeMethod(
+      "windowShapeChanged",
+      std::make_unique<flutter::EncodableValue>(WindowShapeInfo(sequence)));
+}
+
+flutter::EncodableValue FlutterWindow::WindowShapeInfo(int sequence) const {
+  flutter::EncodableMap map;
+  const bool minimized = false;
+  map[flutter::EncodableValue("sequence")] = flutter::EncodableValue(sequence);
+  map[flutter::EncodableValue("radiusDip")] =
+      flutter::EncodableValue(region_radius_dip_);
+  map[flutter::EncodableValue("radiusPx")] =
+      flutter::EncodableValue(region_radius_px_);
+  map[flutter::EncodableValue("cornerRadiusConfigDip")] =
+      flutter::EncodableValue(kWindowCornerRadiusDip);
+  map[flutter::EncodableValue("maximized")] =
+      flutter::EncodableValue(region_maximized_);
+  map[flutter::EncodableValue("snapped")] =
+      flutter::EncodableValue(region_snapped_);
+  map[flutter::EncodableValue("width")] = flutter::EncodableValue(region_width_);
+  map[flutter::EncodableValue("height")] =
+      flutter::EncodableValue(region_height_);
+  map[flutter::EncodableValue("dpi")] =
+      flutter::EncodableValue(static_cast<int>(region_dpi_));
+  map[flutter::EncodableValue("applied")] =
+      flutter::EncodableValue(region_applied_);
+  map[flutter::EncodableValue("updates")] =
+      flutter::EncodableValue(region_updates_);
+  map[flutter::EncodableValue("failures")] =
+      flutter::EncodableValue(region_failures_);
+  map[flutter::EncodableValue("lastError")] =
+      flutter::EncodableValue(static_cast<int>(region_last_error_));
+  map[flutter::EncodableValue("minimized")] =
+      flutter::EncodableValue(minimized);
+  map[flutter::EncodableValue("regionDiagnosticsEnabled")] =
+      flutter::EncodableValue(region_diagnostics_enabled_);
+  return flutter::EncodableValue(map);
 }
 
 int FlutterWindow::ComputeHitTest(int x, int y) {
@@ -247,6 +572,21 @@ FlutterWindow::MessageHandler(HWND hwnd, UINT const message,
   }
 
   switch (message) {
+    case WM_STYLECHANGED:
+      WindowLog("WM_STYLECHANGED", hwnd, wparam, lparam);
+      break;
+
+
+
+
+    case WM_SYSCOMMAND:
+      WindowLog("WM_SYSCOMMAND", hwnd, wparam, lparam);
+      break;
+
+    case WM_SHOWWINDOW:
+      WindowLog("WM_SHOWWINDOW", hwnd, wparam, lparam);
+      break;
+
     case WM_FONTCHANGE:
       flutter_controller_->engine()->ReloadSystemFonts();
       break;
@@ -288,6 +628,7 @@ FlutterWindow::MessageHandler(HWND hwnd, UINT const message,
     }
 
     case WM_NCCALCSIZE:
+      WindowLog("WM_NCCALCSIZE", hwnd, wparam, lparam);
       if (wparam == TRUE) {
         /*
          * Borderless frame: for a normal window the client covers the whole
@@ -346,7 +687,69 @@ FlutterWindow::MessageHandler(HWND hwnd, UINT const message,
         return 0;
       }
       break;
+
+    case WM_ENTERSIZEMOVE:
+      WindowLog("WM_ENTERSIZEMOVE", hwnd, wparam, lparam);
+      // Interactive move/resize loop: freeze the corner radius so dragging the
+      // frame through a snap-sized rectangle cannot flip the shape back and
+      // forth. The shape is re-evaluated in WM_EXITSIZEMOVE.
+      in_sizing_loop_ = true;
+      break;
+
+    case WM_EXITSIZEMOVE:
+      WindowLog("WM_EXITSIZEMOVE", hwnd, wparam, lparam);
+      in_sizing_loop_ = false;
+      // The window may now be snapped (or no longer snapped); re-evaluate.
+      UpdateWindowRegion(/*force=*/true);
+      NotifyWindowShape(hwnd);
+      break;
+
+    case WM_NCPAINT:
+      WindowLog("WM_NCPAINT", hwnd, wparam, lparam);
+      /*
+       * The window has no native non-client area (WM_NCCALCSIZE claims the whole
+       * rectangle), so any system non-client painting would draw a stray border
+       * or caption strip over Flutter's surface during state transitions. The
+       * chrome is fully owned by Flutter; treat it as handled.
+       */
+      return 0;
+
+    case WM_NCACTIVATE:
+      WindowLog("WM_NCACTIVATE", hwnd, wparam, lparam);
+      /*
+       * Returning TRUE tells the system the activation change was handled, so
+       * DefWindowProc does not repaint a (non-existent) NC caption on
+       * activate/deactivate. Activation behaviour itself is unchanged.
+       */
+      return TRUE;
   }
 
-  return Win32Window::MessageHandler(hwnd, message, wparam, lparam);
+  const LRESULT handled =
+      Win32Window::MessageHandler(hwnd, message, wparam, lparam);
+
+  /*
+   * Outline refresh happens after the base handler so the new window rectangle
+   * is already applied: WM_DPICHANGED applies the suggested rect, and the WM_SIZE
+   * it causes arrives with the new DPI active. Both messages may fire for one
+   * change; UpdateWindowRegion's cache makes the second call a no-op.
+   *
+   * The shape is pushed to Dart only after the native region was refreshed, so
+   * Flutter's clip/stroke and the real window shape always describe the same
+   * state (maximized -> square corners in both layers at the same frame).
+   */
+  switch (message) {
+    case WM_SIZE:
+    case WM_DPICHANGED:
+    case WM_SHOWWINDOW:
+      UpdateWindowRegion();
+      NotifyWindowShape(hwnd);
+      break;
+    case WM_ACTIVATE:
+      // Activation only changes the hairline colour on the Flutter side; the
+      // geometry does not change, so no region rebuild is needed.
+      break;
+    default:
+      break;
+  }
+  return handled;
 }

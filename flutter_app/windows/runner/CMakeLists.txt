@@ -36,6 +36,8 @@ target_link_libraries(${BINARY_NAME} PRIVATE flutter flutter_wrapper_app)
 target_link_libraries(${BINARY_NAME} PRIVATE "dwmapi.lib")
 # SetWindowSubclass / DefSubclassProc (Flutter view hit-test handoff).
 target_link_libraries(${BINARY_NAME} PRIVATE "comctl32.lib")
+# CreatePolygonRgn / SetWindowRgn (rounded window outline, window_region.h).
+target_link_libraries(${BINARY_NAME} PRIVATE "gdi32.lib")
 target_include_directories(${BINARY_NAME} PRIVATE "${CMAKE_SOURCE_DIR}")
 
 # Run the Flutter tool portions of the build. This must not be removed.

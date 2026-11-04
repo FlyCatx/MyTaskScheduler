@@ -41,6 +41,46 @@ class FlutterWindow : public Win32Window {
 
   bool IsWindowMaximized(HWND window) const;
 
+  /*
+   * Shape state (second round): normal restored windows are rounded, maximized
+   * and system-snapped windows are plain rectangles.
+   *
+   * The window state is the *real* platform state (IsZoomed / applied window
+   * rectangle vs. monitor work area), never a locally flipped flag.
+   */
+  bool IsWindowSnappedToWorkArea(HWND window) const;
+
+  // Corner radius in DIPs that currently applies: 18 for a normal window, 0 for
+  // maximized / snapped / while a manual sizing loop is in progress (so a drag
+  // through snap-like sizes does not flicker the shape).
+  double CurrentCornerRadiusDip(HWND window) const;
+
+  // Pushes the shape state (state, radius, dpi, size, sequence) to Dart. Called
+  // after the region was applied so Dart never sees a state the native window
+  // has not adopted yet.
+  void NotifyWindowShape(HWND window);
+
+  /*
+   * Rebuilds the top-level window's rounded outline (cubic Bezier corners) from
+   * the *applied* window rectangle and the window's current DPI, then hands the
+   * region to the system with SetWindowRgn.
+   *
+   * The region is the native half of the window shape: Flutter clips and
+   * strokes the same path, but a ClipPath alone cannot change the shape of an
+   * opaque Win32 window, so the four cut-away corners have to be removed here.
+   *
+   * Cached on (width, height, dpi, radius, maximized): repeated WM_SIZE /
+   * WM_DPICHANGED messages, and the position messages SetWindowRgn itself
+   * triggers, do not rebuild the HRGN. Re-entrancy is guarded with
+   * |region_updating_|. On success the system owns the HRGN (never deleted
+   * here); on failure we keep the previous region and record the error.
+   */
+  void UpdateWindowRegion(bool force = false);
+
+  // Snapshot of the outline state for the `windowShape` channel call and for
+  // the acceptance probe (proves the region was applied and how often).
+  flutter::EncodableValue WindowShapeInfo(int sequence) const;
+
   // One hit-test result for the whole borderless frame. Used by the parent's
   // WM_NCHITTEST and by the Flutter view's subclass so both agree on which
   // client points belong to the native caption/resize borders.
@@ -73,6 +113,42 @@ class FlutterWindow : public Win32Window {
   // reported by Dart after layout. Excludes menus and caption buttons.
   RECT drag_region_ = {0, 0, 0, 0};
   bool has_drag_region_ = false;
+
+  // ---- window outline (rounded corners + Flutter-drawn gray border) --------
+  // Must stay in sync with TsWindowShape.radius in
+  // flutter_app/lib/src/ui/theme/values.dart; the geometry itself is shared with
+  // the C tests through window_region.h.
+  static constexpr double kWindowCornerRadiusDip = 18.0;
+
+  // True only after SetWindowRgn accepted the region; a failure must never be
+  // cached as success.
+  bool region_applied_ = false;
+  bool region_updating_ = false;
+  int region_width_ = 0;
+  int region_height_ = 0;
+  unsigned int region_dpi_ = 0;
+  int region_radius_px_ = 0;
+  double region_radius_dip_ = 0.0;
+  bool region_maximized_ = false;
+  bool region_snapped_ = false;
+  int region_updates_ = 0;
+  int region_failures_ = 0;
+  long region_last_error_ = 0;
+
+  // True while the user is dragging/resizing the frame (WM_ENTERSIZEMOVE ..=
+  // WM_EXITSIZEMOVE). The radius is frozen during the loop so passing through a
+  // snap-sized rectangle does not toggle the shape mid-drag.
+  bool in_sizing_loop_ = false;
+
+  // Monotonic counter for shape notifications so Dart can drop a late reply to
+  // the initial `windowShape` query that is older than an event it already saw.
+  int shape_sequence_ = 0;
+  int last_pushed_sequence_ = 0;
+
+  // Diagnostics switch (`setRegionEnabled`): when false the native region is
+  // cleared and not rebuilt, so the acceptance probe can capture what the GPU
+  // surface itself presents at the corners. Never used in normal operation.
+  bool region_diagnostics_enabled_ = true;
 };
 
 #endif  // RUNNER_FLUTTER_WINDOW_H_
