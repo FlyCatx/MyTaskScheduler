@@ -1,16 +1,25 @@
-# Flutter 桌面界面
+# Flutter Windows 界面
 
-`flutter_app` 提供 TaskScheduler 的 Flutter Windows 界面。应用通过 FFI 调用 `ts_bridge.dll`，由共享 C 内核完成模型请求、时间表校验、任务依赖分析和结果处理。
+`flutter_app/` 包含 TaskScheduler 的 Flutter 桌面界面。界面通过 `ts_bridge.dll` 调用 C 内核处理分析、数据校验和计划操作；Dart 代码负责窗口、视图、交互、时间表编辑和本地状态协调。
 
-界面包含会话与任务视图、模型连接设置、甘特图和时间表编辑器。桌面窗口由 Windows runner 承载，标题栏和窗口控制与 Flutter 界面保持一致。
+## 主要组成
 
-## 目录说明
+- `lib/src/model/`：界面和业务间使用的数据模型。
+- `lib/src/state/`：应用状态、时间表规划、持久化和分析流程协调。
+- `lib/src/ui/`：主窗口、甘特图、时间表编辑器和设置页面。
+- `windows/runner/`：Windows 窗口集成与原生消息处理。
+- `test/`：Dart 单元测试、组件测试和集成回归测试。
 
-- `lib/src/model/`：任务、会话、设置和时间表的数据模型。
-- `lib/src/state/`：应用状态、持久化、迁移与备份逻辑。
-- `lib/src/ui/`：主界面、设置、甘特图、时间表编辑器和菜单组件。
-- `lib/src/ffi/`：Flutter 与 C 桥接库之间的接口。
-- `windows/runner/`：Windows 窗口创建、标题栏和原生窗口消息处理。
-- `test/`：模型、状态和界面交互的自动化测试。
+## 构建
 
-接口密钥由本机配置或环境变量提供。不要将个人配置文件或密钥提交到版本库。
+在项目根目录准备 C 内核依赖和 Flutter SDK 后，运行：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/build_flutter_app.ps1
+```
+
+发布包由 `scripts/make_flutter_release.ps1` 生成。Flutter 程序需要与对应版本的 `ts_bridge.dll` 及运行依赖一起分发。
+
+## 配置与数据
+
+模型连接和凭据在应用设置中管理。密钥由 Windows 凭据管理器保护；本地配置、用户数据和构建产物不属于源代码提交内容。
