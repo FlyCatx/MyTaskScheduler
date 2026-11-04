@@ -81,10 +81,28 @@ if (Test-Path $cacert) { Copy-Item $cacert $runnerDir -Force }
 $cfgExample = Join-Path $root 'config.example.json'
 if (Test-Path $cfgExample) { Copy-Item $cfgExample (Join-Path $runnerDir 'config.example.json') -Force }
 
+# --- 4. local OCR host (0.2.3, R3-O) ---------------------------------------
+# The offline OCR helper is an app-owned executable, not a Flutter asset: it is
+# staged next to the runtime so the packaged folder is self-contained. It is only
+# copied when it was built (scripts/build_ocr_host.ps1); a missing helper must not
+# break the rest of the build, the app then reports "OCR unavailable" explicitly.
+$ocrSrc = Join-Path $root 'tools\ocr_host\bin\ocr_host.exe'
+if (Test-Path $ocrSrc) {
+    $ocrDir = Join-Path $runnerDir 'data\ocr'
+    New-Item -ItemType Directory -Force -Path $ocrDir | Out-Null
+    Copy-Item $ocrSrc (Join-Path $ocrDir 'ocr_host.exe') -Force
+    $ocrInfo = Join-Path $root 'tools\ocr_host\bin\build-info.json'
+    if (Test-Path $ocrInfo) { Copy-Item $ocrInfo (Join-Path $ocrDir 'build-info.json') -Force }
+    $ocrReadme = Join-Path $root 'docs\r3\ocr\README.md'
+    if (Test-Path $ocrReadme) { Copy-Item $ocrReadme (Join-Path $ocrDir 'OCR-README.md') -Force }
+    Write-Host ("staged OCR host: {0}" -f $ocrSrc)
+} else {
+    Write-Host 'OCR host not built (optional): run scripts/build_ocr_host.ps1'
+}
+
 Write-Host ""
 Write-Host "staged into: $runnerDir"
 Get-ChildItem $runnerDir | Where-Object { $_.Name -match '\.(exe|dll|pem|json)$' } |
     ForEach-Object { Write-Host ("  " + $_.Name) }
 Write-Host ""
 Write-Host "run: " (Join-Path $runnerDir 'taskscheduler.exe')
-
