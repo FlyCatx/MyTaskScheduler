@@ -261,6 +261,61 @@ void main() {
     expect(scroll.position.pixels, closeTo(before + 100, 3));
   });
 
+  testWidgets('edge auto-scroll follows the real pointer without double delta',
+      (tester) async {
+    final record = Recorded();
+    await pumpCalendar(
+      tester,
+      schedule: version.calendar,
+      calendarActions: actions(record),
+    );
+    final horizontal = find.byWidgetPredicate(
+        (w) => w is Scrollable && w.axisDirection == AxisDirection.right);
+    final scroll = tester.state<ScrollableState>(horizontal);
+    await tester.pump();
+
+    final bar = find.byKey(const Key('calendar-segment-s2'));
+    final start = tester.getCenter(bar);
+    final gesture = await tester.startGesture(start);
+    await tester.pump();
+    for (var i = 0; i < 18; i++) {
+      await gesture.moveBy(const Offset(50, 0));
+      await tester.pump();
+    }
+    final beforeOffset = scroll.position.pixels;
+
+    String preview() =>
+        tester.widget<Text>(find.textContaining('→').first).data!;
+    int startMinutes(String text) {
+      final m = RegExp(r'(\d{2}):(\d{2}) →').firstMatch(text)!;
+      return int.parse(m.group(1)!) * 60 + int.parse(m.group(2)!);
+    }
+
+    final beforeMinutes = startMinutes(preview());
+    // Five 40 ms auto-scroll ticks: 60 px of scroll = 60 / 0.8 = 75 minutes.
+    await tester.pump(const Duration(milliseconds: 200));
+    final afterOffset = scroll.position.pixels;
+    final afterMinutes = startMinutes(preview());
+    expect(afterOffset, greaterThan(beforeOffset), reason: '边缘应持续滚动');
+    final expected = (afterOffset - beforeOffset) / 0.8;
+    expect(afterMinutes - beforeMinutes, closeTo(expected, 6),
+        reason: '只按真实滚动量移动，不能把鼠标位置再伪造一次（双倍位移）');
+
+    // Move the same pointer to the left edge: direction must reverse immediately.
+    final leftEdge = Offset(220, tester.getCenter(bar).dy);
+    await gesture.moveTo(leftEdge);
+    await tester.pump(const Duration(milliseconds: 200));
+    expect(scroll.position.pixels, lessThan(afterOffset),
+        reason: '移到左侧后应反向滚动，不能沿用旧方向');
+
+    await gesture.up();
+    await tester.pumpAndSettle();
+    final stopped = scroll.position.pixels;
+    await tester.pump(const Duration(milliseconds: 300));
+    expect(scroll.position.pixels, closeTo(stopped, 0.5),
+        reason: '释放后不能残留自动滚动计时器');
+  });
+
   testWidgets('dragging the right edge changes the duration and the estimate',
       (tester) async {
     final record = Recorded();
