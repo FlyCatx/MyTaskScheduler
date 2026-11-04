@@ -238,6 +238,48 @@ const double kPaneHeaderHeight = 44;
 /// 顶部标题栏高度：左侧栏、摘要栏与输入区共用，保证两条标题行基线对齐。
 const double kTopBarHeight = 56;
 
+/// 整窗外形令牌：圆角半径、描边宽度与灰色描边的唯一来源。
+///
+/// 三个数值必须分别与原生侧一致：
+/// - [radius] 与 `flutter_app/windows/runner/flutter_window.h` 的
+///   `kWindowCornerRadiusDip` 相同（原生侧按窗口自身 DPI 换算成物理像素）；
+/// - [borderWidthPhysical] 是 1 个物理像素，Flutter 端用 `1 / devicePixelRatio`
+///   变成逻辑像素绘制；
+/// - 描边颜色始终是中性灰，随明暗主题给两组值，深色下也不改成蓝色。
+///
+/// 原生窗口区域由 `window_region.h` 的同一份三次贝塞尔路径生成，二者不能各用一套半径。
+class TsWindowShape {
+  TsWindowShape._();
+
+  /// 外轮廓圆角半径（逻辑像素）。
+  ///
+  /// 第二轮（0.2.2）从 12 提升到 18：更大的弧线让原生二值 Region 的台阶在视觉上更细。
+  /// 最大化 / 系统 Snap 时实际半径由真实窗口状态决定为 0（直角），见 `DesktopWindow.shape`。
+  static const double radius = 18;
+
+  /// 描边宽度（物理像素）；绘制时除以 devicePixelRatio 转成逻辑像素。
+  static const double borderWidthPhysical = 1;
+
+  /// 浅色主题描边灰。
+  static const Color borderLight = Color(0xFFB8BDC5);
+
+  /// 深色主题描边灰。
+  static const Color borderDark = Color(0xFF626873);
+
+  /// 失焦时描边向背景混合的比例；只降低对比度，绝不取消描边。
+  static const double inactiveBlend = 0.35;
+
+  static Color borderFor(Brightness brightness) =>
+      brightness == Brightness.dark ? borderDark : borderLight;
+
+  /// 描边宽度（逻辑像素）。
+  static double strokeWidth(double devicePixelRatio) =>
+      borderWidthPhysical /
+      (devicePixelRatio.isFinite && devicePixelRatio > 0
+          ? devicePixelRatio
+          : 1.0);
+}
+
 /// Colour + soft background for a status key coming from the C display snapshot.
 class StatusPalette {
   final Color foreground;
