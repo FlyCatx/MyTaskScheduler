@@ -907,6 +907,10 @@ class Timetable {
     return out;
   }
 
+  /// 周模板容量：只统计 weekly/default 的可用区间，不含具体日期覆盖。
+  ///
+  /// 这是“模板”口径，不能直接当作某一周的实际可用时间展示；界面必须标成
+  /// “每周模板”。按实际周日期展开请用 [freeMinutesInWeek]。
   int get freeMinutesPerWeek {
     var total = 0;
     for (var day = 1; day <= 7; day++) {
@@ -915,6 +919,51 @@ class Timetable {
       }
     }
     return total;
+  }
+
+  /// 按 [weekStart] 起的真实 7 个日期展开的本周可用分钟数。
+  ///
+  /// 逐日使用 [dayIntervals]（defaultState → weekly → dates），因此会扣除本周
+  /// 单独画出的占用、日期例外和任务预留；只统计 state=free。显示“本周可用”
+  /// 必须用这个口径，不能拿模板容量冒充。
+  int freeMinutesInWeek(String weekStart) {
+    final days = weekDays(weekStart: weekStart);
+    if (days.isEmpty) return 0;
+    var total = 0;
+    for (final day in days) {
+      for (final interval in day.intervals) {
+        if (interval.state == TimetableState.free) total += interval.minutes;
+      }
+    }
+    return total;
+  }
+
+  /// 整个 coverage 范围内按天展开的可用分钟数（用于输入框摘要）。
+  int get freeMinutesInCoverage {
+    final from = parseDateKey(dateFrom);
+    if (from == null) return 0;
+    final base = _dateOf(from);
+    var total = 0;
+    final days = coverageDays.clamp(0, 400);
+    for (var i = 0; i < days; i++) {
+      final date = base.add(Duration(days: i));
+      final key = WallClock.formatDateKey(date.year, date.month, date.day);
+      for (final interval in dayIntervals(key, date.weekday)) {
+        if (interval.state == TimetableState.free) total += interval.minutes;
+      }
+    }
+    return total;
+  }
+
+  /// coverage 包含的自然日数；日期非法时为 0。
+  int get coverageDays {
+    final from = parseDateKey(dateFrom);
+    final to = parseDateKey(dateTo);
+    if (from == null || to == null) return 0;
+    final first = _dateOf(from);
+    final last = _dateOf(to);
+    final days = last.difference(first).inDays + 1;
+    return days < 0 ? 0 : days;
   }
 
   /// 某个星期的默认可用分钟数（不含具体日期覆盖）。
@@ -1105,13 +1154,21 @@ class Timetable {
   }
 
   static List<TimetableEntry> _normalizeLayer(List<TimetableEntry> input) {
-    final sorted = <TimetableEntry>[...input]
+    // 稳定排序：同一开始时间的条目保持输入顺序，后出现的覆盖先出现的。
+    // 普通 sort 在相同 start 时可能把“周可用”排到“占用”之后，导致占用被整段
+    // 可用覆盖（fromSchedule 中 08:00 开始的第一节课会因此消失）。
+    final sorted = input
+        .asMap()
+        .entries
+        .toList()
       ..sort((a, b) {
-        final byStart = a.start.compareTo(b.start);
-        return byStart != 0 ? byStart : a.end.compareTo(b.end);
+        final byStart = a.value.start.compareTo(b.value.start);
+        if (byStart != 0) return byStart;
+        return a.key.compareTo(b.key);
       });
     final out = <TimetableEntry>[];
-    for (final e in sorted) {
+    for (final entry in sorted) {
+      final e = entry.value;
       // 后出现的一条覆盖先出现的：保留它左右两侧的旧区间。
       final kept = <TimetableEntry>[];
       for (final current in out) {
