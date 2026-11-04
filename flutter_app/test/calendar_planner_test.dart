@@ -530,5 +530,202 @@ void main() {
       expect(conflicts, isEmpty);
     });
   });
-}
 
+  group('conflict sources（R1-C 结构化来源旁路）', () {
+    CalendarSchedule scheduleWith(
+      List<ScheduleSegment> segments, {
+      List<CalendarOccupancy> occupancies = const [],
+      List<CalendarDateException> exceptions = const [],
+      int days = 3,
+    }) =>
+        CalendarSchedule(
+          settings: settingsWith(
+            const [WallClockRange(8 * 60, 12 * 60)],
+            days: days,
+            occupancies: occupancies,
+            exceptions: exceptions,
+          ),
+          segments: segments,
+        );
+
+    test('detectConflicts 给重叠/自身重叠填充来源，既有字段不变', () {
+      final conflicts = detectConflicts(
+        schedule: scheduleWith([
+          ScheduleSegment(
+            id: 's1',
+            taskId: 'a',
+            start: at('2026-11-18 08:00'),
+            end: at('2026-11-18 10:00'),
+          ),
+          ScheduleSegment(
+            id: 's2',
+            taskId: 'b',
+            start: at('2026-11-18 09:00'),
+            end: at('2026-11-18 11:00'),
+          ),
+          ScheduleSegment(
+            id: 's3',
+            taskId: 'a',
+            start: at('2026-11-18 09:30'),
+            end: at('2026-11-18 10:30'),
+          ),
+        ]),
+        tasks: [task('a', 3), task('b', 2)],
+        now: now,
+      );
+      final overlap =
+          conflicts.firstWhere((c) => c.kind == ConflictKind.taskOverlap);
+      expect(overlap.source, ConflictSource.taskReservation);
+      expect(overlap.message, contains('重叠'));
+      final self =
+          conflicts.firstWhere((c) => c.kind == ConflictKind.selfOverlap);
+      expect(self.source, ConflictSource.selfOverlap);
+    });
+
+    test('不可用来源区分用户占用/未绑定预留/日期关闭/默认不可用', () {
+      ConflictSource sourceFor(CalendarSchedule schedule) {
+        final conflict = detectConflicts(
+          schedule: schedule,
+          tasks: [task('a', 2)],
+          now: now,
+        ).firstWhere((c) => c.kind == ConflictKind.unavailable);
+        return conflict.source!;
+      }
+
+      final segment = ScheduleSegment(
+        id: 's1',
+        taskId: 'a',
+        start: at('2026-11-18 08:00'),
+        end: at('2026-11-18 10:00'),
+      );
+      expect(
+        sourceFor(scheduleWith(
+          [segment],
+          occupancies: const [
+            CalendarOccupancy(
+              id: 'occ',
+              title: '线性代数',
+              kind: 'course',
+              weekday: 3,
+              ranges: [WallClockRange(9 * 60, 10 * 60)],
+            ),
+          ],
+        )),
+        ConflictSource.userOccupancy,
+      );
+      expect(
+        sourceFor(scheduleWith(
+          [segment],
+          occupancies: const [
+            CalendarOccupancy(
+              id: 'res-1',
+              title: '任务预留',
+              kind: 'activity',
+              weekday: 3,
+              ranges: [WallClockRange(9 * 60, 10 * 60)],
+            ),
+          ],
+        )),
+        ConflictSource.taskReservationUnbound,
+      );
+      expect(
+        sourceFor(scheduleWith(
+          [segment],
+          exceptions: const [
+            CalendarDateException(date: '2026-11-18', closed: true),
+          ],
+        )),
+        ConflictSource.defaultUnavailable,
+      );
+      // 落在两个可用窗口之间的缝隙。
+      expect(
+        sourceFor(CalendarSchedule(
+          settings: settingsWith(
+            const [
+              WallClockRange(8 * 60, 9 * 60),
+              WallClockRange(10 * 60, 12 * 60),
+            ],
+            days: 1,
+          ),
+          segments: [segment],
+        )),
+        ConflictSource.defaultUnavailable,
+      );
+    });
+
+    test('依赖/截止/超出规划范围映射到 dependency/deadline/capacity', () {
+      final conflicts = detectConflicts(
+        schedule: scheduleWith(
+          [
+            ScheduleSegment(
+              id: 's1',
+              taskId: 'a',
+              start: at('2026-11-18 08:00'),
+              end: at('2026-11-18 10:00'),
+            ),
+            ScheduleSegment(
+              id: 's2',
+              taskId: 'b',
+              start: at('2026-11-18 08:00'),
+              end: at('2026-11-18 09:00'),
+            ),
+            ScheduleSegment(
+              id: 's3',
+              taskId: 'c',
+              start: at('2026-11-21 08:00'),
+              end: at('2026-11-21 09:00'),
+            ),
+          ],
+          days: 2,
+        ),
+        tasks: [
+          task('a', 2),
+          task('b', 1, dependsOn: ['a'], deadline: '2026-11-18 08:30'),
+          task('c', 1),
+        ],
+        now: now,
+      );
+      ConflictSource? sourceOf(ConflictKind kind) {
+        for (final conflict in conflicts) {
+          if (conflict.kind == kind) return conflict.source;
+        }
+        return null;
+      }
+
+      expect(sourceOf(ConflictKind.dependencyOrder), ConflictSource.dependency);
+      expect(sourceOf(ConflictKind.pastDeadline), ConflictSource.deadline);
+      expect(sourceOf(ConflictKind.outsideRange), ConflictSource.capacity);
+    });
+
+    test('conflictSourceOf 可用同一设置快照重新判定旧冲突', () {
+      final settings = settingsWith(
+        const [WallClockRange(8 * 60, 12 * 60)],
+        days: 1,
+        occupancies: const [
+          CalendarOccupancy(
+            id: 'occ',
+            title: '班会',
+            kind: 'activity',
+            weekday: 3,
+            ranges: [WallClockRange(9 * 60, 10 * 60)],
+          ),
+        ],
+      );
+      final conflict = CalendarConflict(
+        kind: ConflictKind.unavailable,
+        taskId: 'a',
+        start: at('2026-11-18 09:00'),
+        end: at('2026-11-18 10:00'),
+        message: '旧冲突没有 source',
+      );
+      expect(conflict.source, isNull);
+      expect(
+        conflictSourceOf(
+          conflict,
+          schedule: CalendarSchedule(settings: settings),
+        ),
+        ConflictSource.userOccupancy,
+      );
+    });
+  });
+}

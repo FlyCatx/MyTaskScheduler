@@ -3,6 +3,8 @@
 // 这些测试不联网、不依赖真实 DLL：它们只验证“同一份草稿”在模型、网格控件和
 // 排程器之间的语义，包括精确分钟、未绑定蓝块、日期覆盖和撤销事务。
 
+import 'dart:convert';
+
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -12,6 +14,7 @@ import 'package:taskscheduler_flutter/src/model/settings.dart';
 import 'package:taskscheduler_flutter/src/model/timetable.dart';
 import 'package:taskscheduler_flutter/src/state/calendar_planner.dart';
 import 'package:taskscheduler_flutter/src/ui/calendar_grid.dart';
+import 'package:taskscheduler_flutter/src/ui/edit_commands.dart';
 import 'package:taskscheduler_flutter/src/ui/theme.dart';
 
 Timetable _defaults() => Timetable.withDefaults(weekStart: '2026-10-19');
@@ -176,8 +179,39 @@ void main() {
           TimetableState.occupied);
     });
 
-    test('09:05–09:35 的精确边界保留，不被取整', () {
+    test('同一分钟区间画到 3 个不同日期都保留（日期层按天规范化，不跨日期相切）',
+        () {
       var t = _defaults();
+      const dates = <String>['2026-10-19', '2026-10-20', '2026-10-21'];
+      for (final date in dates) {
+        t = t.paint(
+          date: date,
+          start: 540,
+          end: 600,
+          state: TimetableState.task,
+          title: '任务预留',
+          taskId: 'T1',
+        );
+      }
+      expect(t.dates, hasLength(3), reason: '三个日期的同分钟规则不能互相切掉');
+      for (final date in dates) {
+        final entries =
+            t.dates.where((e) => e.date == date).toList(growable: false);
+        expect(entries, hasLength(1));
+        expect(entries.single.start, 540);
+        expect(entries.single.end, 600);
+        expect(t.stateAt(date, weekdayOfDateKey(date), 570),
+            TimetableState.task);
+      }
+
+      // 擦除也只影响目标日期，其他日期规则仍在。
+      t = t.erase(date: '2026-10-20', start: 540, end: 600);
+      expect(t.dates.where((e) => e.date == '2026-10-20'), isEmpty);
+      expect(t.dates.where((e) => e.date == '2026-10-19'), hasLength(1));
+      expect(t.dates.where((e) => e.date == '2026-10-21'), hasLength(1));
+    });
+
+    test('09:05–09:35 的精确边界保留，不被取整', () {      var t = _defaults();
       t = t.paint(
         date: '2026-10-19',
         start: 545,
@@ -411,12 +445,16 @@ void main() {
   });
 
   group('网格控件', () {
-    Future<(TimetableGridController, String)> pumpGrid(WidgetTester tester) async {
+    Future<(TimetableGridController, String)> pumpGrid(
+      WidgetTester tester, {
+      Timetable? timetable,
+      ValueChanged<Set<String>>? onSelectionChanged,
+    }) async {
       await tester.binding.setSurfaceSize(const Size(1000, 760));
       addTearDown(() => tester.binding.setSurfaceSize(null));
       TsColors.apply(Brightness.light);
       addTearDown(() => TsColors.apply(Brightness.light));
-      final draft = _draft();
+      final draft = TimetableDraft(timetable ?? _defaults());
       final controller = TimetableGridController(draft: draft);
       await tester.pumpWidget(MaterialApp(
         theme: buildAppTheme(),
@@ -429,6 +467,7 @@ void main() {
               weekStart: '2026-10-19',
               weekStartsOn: 1,
               weeklyMode: false,
+              onSelectionChanged: onSelectionChanged,
             ),
           ),
         ),
@@ -624,6 +663,149 @@ void main() {
       await tester.pump();
       expect(controller.draft.timetable.dates, isEmpty,
           reason: '时间轴/表头/状态条不是网格，不能画格');
+    });
+
+    testWidgets('Ctrl+Y 重做最后一笔；Ctrl+Shift+Z 同样重做', (tester) async {
+      final (controller, _) = await pumpGrid(tester);
+      final from = cellCenter(tester, 0, 34);
+      final to = cellCenter(tester, 0, 37);
+      final gesture = await tester.startGesture(from);
+      await gesture.moveTo(to);
+      await gesture.up();
+      await tester.pump();
+      expect(controller.canUndo, isTrue);
+      expect(controller.canRedo, isFalse);
+
+      Future<void> undo() async {
+        await tester.sendKeyDownEvent(LogicalKeyboardKey.controlLeft);
+        await tester.sendKeyEvent(LogicalKeyboardKey.keyZ);
+        await tester.sendKeyUpEvent(LogicalKeyboardKey.controlLeft);
+        await tester.pump();
+      }
+
+      Future<void> redoByY() async {
+        await tester.sendKeyDownEvent(LogicalKeyboardKey.controlLeft);
+        await tester.sendKeyEvent(LogicalKeyboardKey.keyY);
+        await tester.sendKeyUpEvent(LogicalKeyboardKey.controlLeft);
+        await tester.pump();
+      }
+
+      Future<void> redoByShiftZ() async {
+        await tester.sendKeyDownEvent(LogicalKeyboardKey.controlLeft);
+        await tester.sendKeyDownEvent(LogicalKeyboardKey.shiftLeft);
+        await tester.sendKeyEvent(LogicalKeyboardKey.keyZ);
+        await tester.sendKeyUpEvent(LogicalKeyboardKey.shiftLeft);
+        await tester.sendKeyUpEvent(LogicalKeyboardKey.controlLeft);
+        await tester.pump();
+      }
+
+      Future<void> expectPainted(bool painted) async {
+        for (var slot = 34; slot <= 37; slot++) {
+          expect(
+            controller.draft.timetable.day('2026-10-19', 1).stateOfSlot(slot),
+            painted ? TimetableState.occupied : TimetableState.free,
+          );
+        }
+      }
+
+      await undo();
+      await expectPainted(false);
+      expect(controller.canRedo, isTrue);
+      // 标题栏“重做”菜单也会真正可用。
+      final target = TimetableGridEditTarget(
+        controller: controller,
+        isAlive: () => true,
+      );
+      expect(target.canExecute(EditCommand.redo), isTrue);
+
+      await redoByY();
+      await expectPainted(true);
+      expect(controller.canRedo, isFalse);
+
+      await undo();
+      await redoByShiftZ();
+      await expectPainted(true);
+    });
+
+    testWidgets('选择模式点选蓝块：切换选中、不绘制、不产生撤销记录', (tester) async {
+      final timetable = _defaults()
+          .paint(
+            date: '2026-10-19',
+            start: 5 * 60,
+            end: 6 * 60,
+            state: TimetableState.task,
+            title: '任务预留',
+            taskId: 'T1',
+            reservationId: 'res-bound',
+          )
+          .paint(
+            date: '2026-10-20',
+            start: 5 * 60,
+            end: 6 * 60,
+            state: TimetableState.task,
+            title: '任务预留',
+          );
+      final changed = <Set<String>>[];
+      final (controller, _) = await pumpGrid(
+        tester,
+        timetable: timetable,
+        onSelectionChanged: (selected) => changed.add(selected),
+      );
+      final unbound = controller.draft.timetable.dates
+          .firstWhere((e) => e.date == '2026-10-20');
+      final unboundIdentity = unbound.reservationId ?? unbound.id;
+      final before = jsonEncode(controller.draft.timetable.toJson());
+
+      controller.setSelectionMode(true);
+      await tester.pump();
+      expect(controller.selectionMode, isTrue);
+
+      // 点选已绑定的蓝块。
+      var gesture = await tester.startGesture(cellCenter(tester, 0, 20));
+      await gesture.up();
+      await tester.pump();
+      expect(controller.selectedReservationIds, <String>{'res-bound'});
+      expect(controller.selectedBlockCount, 1);
+      expect(controller.selectedMinutes, 60);
+
+      // 再点一次取消。
+      gesture = await tester.startGesture(cellCenter(tester, 0, 20));
+      await gesture.up();
+      await tester.pump();
+      expect(controller.hasSelection, isFalse);
+
+      // 未绑定蓝块（没有 reservationId）也能选中，身份回退到条目 id。
+      gesture = await tester.startGesture(cellCenter(tester, 1, 20));
+      await gesture.up();
+      await tester.pump();
+      expect(controller.selectedReservationIds, <String>{unboundIdentity});
+      expect(changed.last, <String>{unboundIdentity});
+
+      // 选择模式不写数据、不产生撤销记录。
+      expect(jsonEncode(controller.draft.timetable.toJson()), before);
+      expect(controller.draft.undoDepth, 0);
+
+      // controller 上的选择 API 也会通知监听者。
+      var notified = 0;
+      controller.addListener(() => notified++);
+      controller.toggleSelection('res-bound');
+      await tester.pump();
+      expect(controller.selectedReservationIds, contains('res-bound'));
+      expect(notified, greaterThan(0));
+      controller.toggleSelection('res-bound');
+      await tester.pump();
+      expect(controller.selectedReservationIds, isNot(contains('res-bound')));
+
+      // 点非蓝块（默认占用）不改变选择。
+      gesture = await tester.startGesture(cellCenter(tester, 3, 30));
+      await gesture.up();
+      await tester.pump();
+      expect(controller.selectedReservationIds, <String>{unboundIdentity});
+
+      controller.setSelectionMode(false);
+      await tester.pump();
+      expect(controller.selectedReservationIds, isEmpty,
+          reason: '关闭选择模式应清空选择');
     });
   });
 
