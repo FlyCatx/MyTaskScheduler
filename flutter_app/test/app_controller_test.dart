@@ -509,5 +509,49 @@ void main() {
       expect(error, isNotNull);
       expect(error, contains('时间表数据不合法'));
     });
+
+    test('重复应用按已提交 revision 推进，并拒绝并发提交', () async {
+      final store = InMemorySessionRepository();
+      final controller = await buildController(store);
+      await controller.createConversation();
+      // 同一个 stale timetable 连续提交两次：revision 必须从已提交状态推进。
+      final stale = Timetable.withDefaults(weekStart: '2026-10-19');
+      expect(
+        await controller.applyTimetableSettings(
+            controller.calendar.settings, stale,
+            reschedule: false),
+        isTrue,
+      );
+      expect(controller.conversation!.calendarDraft!.revision, 1);
+      expect(
+        await controller.applyTimetableSettings(
+            controller.calendar.settings, stale,
+            reschedule: false),
+        isTrue,
+      );
+      expect(controller.conversation!.calendarDraft!.revision, 2,
+          reason: '不能拿打开编辑器时的旧 revision 反复 +1');
+
+      // 并发提交只允许一个成功，另一个明确失败而不是乱序写入。
+      final first = controller.applyTimetableSettings(
+          controller.calendar.settings, stale,
+          reschedule: false);
+      final second = controller.applyTimetableSettings(
+          controller.calendar.settings, stale,
+          reschedule: false);
+      final results = await Future.wait(<Future<bool>>[first, second]);
+      expect(results.where((ok) => ok).length, 1);
+      expect(controller.conversation!.calendarDraft!.revision, 3);
+    });
+
+    test('时间表 revision 在分析期间变化时结果作废', () {
+      expect(AppController.calendarStaleMessage(-1, 7), isNull,
+          reason: '请求没带时间表，之后改时间表不影响结果');
+      expect(AppController.calendarStaleMessage(4, 4), isNull);
+      final stale = AppController.calendarStaleMessage(4, 5);
+      expect(stale, isNotNull);
+      expect(stale, contains('4 → 5'));
+      expect(stale, contains('未应用'));
+    });
   });
 }

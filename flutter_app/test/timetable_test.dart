@@ -480,15 +480,73 @@ void main() {
       expect(controller.brush, TimetableState.task);
     });
 
+    testWidgets('第二指针不打断当前笔画，整笔只撤销一次', (tester) async {
+      final (controller, _) = await pumpGrid(tester);
+      final first =
+          await tester.startGesture(cellCenter(tester, 0, 34), pointer: 1);
+      await tester.pump();
+      final second =
+          await tester.startGesture(cellCenter(tester, 0, 40), pointer: 2);
+      await tester.pump();
+      await first.moveTo(cellCenter(tester, 0, 36));
+      await first.up();
+      await second.up();
+      await tester.pump();
+
+      expect(controller.draft.timetable.day('2026-10-19', 1).stateOfSlot(34),
+          TimetableState.occupied);
+      expect(controller.draft.timetable.day('2026-10-19', 1).stateOfSlot(40),
+          TimetableState.free,
+          reason: '第二指针不能写入当前笔画之外的格子');
+
+      await tester.sendKeyDownEvent(LogicalKeyboardKey.controlLeft);
+      await tester.sendKeyEvent(LogicalKeyboardKey.keyZ);
+      await tester.sendKeyUpEvent(LogicalKeyboardKey.controlLeft);
+      await tester.pump();
+      for (var slot = 34; slot <= 36; slot++) {
+        expect(
+          controller.draft.timetable.day('2026-10-19', 1).stateOfSlot(slot),
+          TimetableState.free,
+          reason: '一笔应一次撤销，第二指针不能产生额外事务',
+        );
+      }
+    });
+
+    testWidgets('拖到可见视口外不写隐藏时段', (tester) async {
+      final (controller, _) = await pumpGrid(tester);
+      final grid = tester.getRect(find.byType(TimetableGrid));
+      final statusTop =
+          tester.getRect(find.byKey(const Key('timetable-hover'))).top - 5;
+      final headerBottom = grid.top + TimetableGrid.headerHeight;
+      final visibleBottomSlot =
+          ((statusTop - headerBottom - TimetableGrid.topInset) /
+                  TimetableGrid.rowHeight)
+              .floor();
+      final from = cellCenter(tester, 0, 34);
+      final below = Offset(from.dx, grid.bottom - 2); // 状态条区域，已在视口之外
+      final gesture = await tester.startGesture(from);
+      await tester.pump();
+      await gesture.moveTo(below);
+      await tester.pump();
+      await gesture.up();
+      await tester.pump();
+
+      for (final entry in controller.draft.timetable.dates) {
+        final firstSlot = entry.start ~/ 15;
+        expect(firstSlot, lessThanOrEqualTo(visibleBottomSlot + 1),
+            reason: '视口下方隐藏的时段不能被写入');
+      }
+    });
+
     testWidgets('拖动连续绘制并可用 Ctrl+Z 整笔撤销', (tester) async {
       final (controller, _) = await pumpGrid(tester);
-      final from = cellCenter(tester, 0, 36);
-      final to = cellCenter(tester, 0, 39);
+      final from = cellCenter(tester, 0, 34);
+      final to = cellCenter(tester, 0, 37);
       final gesture = await tester.startGesture(from);
       await gesture.moveTo(to);
       await gesture.up();
       await tester.pump();
-      for (var slot = 36; slot <= 39; slot++) {
+      for (var slot = 34; slot <= 37; slot++) {
         expect(
           controller.draft.timetable.day('2026-10-19', 1).stateOfSlot(slot),
           TimetableState.occupied,
@@ -499,7 +557,7 @@ void main() {
       await tester.sendKeyEvent(LogicalKeyboardKey.keyZ);
       await tester.sendKeyUpEvent(LogicalKeyboardKey.controlLeft);
       await tester.pump();
-      for (var slot = 36; slot <= 39; slot++) {
+      for (var slot = 34; slot <= 37; slot++) {
         expect(
           controller.draft.timetable.day('2026-10-19', 1).stateOfSlot(slot),
           TimetableState.free,
