@@ -6,6 +6,7 @@
 //
 // 主要函数/类型：showCalendarSettingsDialog、CalendarSettingsResult、CalendarDialogFrame。
 
+import 'dart:convert';
 import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
@@ -220,6 +221,14 @@ class _CalendarSettingsDialogState extends State<_CalendarSettingsDialog> {
   late TimetableGridController _grid;
   late CalendarSettings _applied;
   String? _applyStatus;
+  bool _busy = false;
+
+  /// 打开时的规划输入，用于区分“用户主动改了范围”与“旧数据本来的范围”。
+  late final String _initialPlanningStart;
+  late final int _initialPlanningDays;
+
+  /// 打开时的完整数据快照，用于关闭/取消时的未保存保护。
+  late String _initialDataSignature;
 
   // Proposal section state.
   CalendarProposalSet? _proposalSet;
@@ -281,7 +290,11 @@ class _CalendarSettingsDialogState extends State<_CalendarSettingsDialog> {
           )
         : widget.settings.planningStartDate;
     _weekStart = weekStartFor(anchor, widget.weekStartsOn);
-    final Timetable initial;
+    // 覆盖范围（业务状态）与可见周（UI 状态）分开：
+    //   * 已提交时间表自带的 coverage 优先保留（可能跨多周）；
+    //   * 新建/默认时间表使用“排程起始日期 + 规划天数”，不再缩成可见的一周。
+    final coverage = _coverageRange(widget.settings);
+    Timetable initial;
     if (widget.timetable != null) {
       initial = widget.timetable!;
     } else if (widget.useDefaultTimetable) {
@@ -293,17 +306,26 @@ class _CalendarSettingsDialogState extends State<_CalendarSettingsDialog> {
           for (final r in widget.defaultUnavailableRanges)
             WallClockRange(r.start, r.end),
         ],
-      );
+      ).copyWith(dateFrom: coverage.from, dateTo: coverage.to);
     } else {
       initial = Timetable.fromSchedule(
         CalendarSchedule(settings: widget.settings),
         weekStart: _weekStart,
-      );
+      ).copyWith(dateFrom: coverage.from, dateTo: coverage.to);
     }
-    _draft = TimetableDraft(initial.copyWith(
-      dateFrom: _weekStart,
-      dateTo: addDaysToDateKey(_weekStart, 6),
-    ));
+    // 旧数据可能把日期规则留在 coverage 之外（0.1.2 按“保存时可见周”写 coverage）。
+    // 打开时先扩展到覆盖这些规则，避免第一次保存就静默丢掉它们；超过 400 天则
+    // 保留原样，保存时会明确报错而不是假装成功。
+    final initialUnion =
+        _unionCoverage(initial.dateFrom, initial.dateTo, initial.dates);
+    if (initialUnion != null) {
+      initial = initial.copyWith(
+          dateFrom: initialUnion.from, dateTo: initialUnion.to);
+    }
+    _draft = TimetableDraft(initial);
+    _initialPlanningStart = _startDate.text.trim();
+    _initialPlanningDays = int.tryParse(_planningDays.text.trim()) ?? 0;
+    _initialDataSignature = _dataSignature();
     _grid = TimetableGridController(draft: _draft);
     _grid.addListener(() {
       if (mounted) setState(() {});
@@ -598,6 +620,9 @@ class _CalendarSettingsDialogState extends State<_CalendarSettingsDialog> {
   }
 
   /// 生成待提交结果；失败时返回 null 且不关闭窗口。
+  ///
+  /// 唯一权威草稿是 timetable：填写和绘制都先落到同一个 `Timetable`，settings
+  /// 只是由它派生的展示/排程输入。这样“填写后直接保存”不会再返回旧时间表。
   CalendarSettingsResult? _buildResult() {
     final base = _baseSettings();
     if (base == null) return null;
@@ -608,12 +633,39 @@ class _CalendarSettingsDialogState extends State<_CalendarSettingsDialog> {
       return null;
     }
 
+    final formCoverage = _effectiveCoverage(base);
+    final planningChanged = _planningChanged();
+    final drawnOutside = _draft.timetable.dates
+        .where((e) =>
+            e.date!.compareTo(formCoverage.from) < 0 ||
+            e.date!.compareTo(formCoverage.to) > 0)
+        .length;
+    if (planningChanged && drawnOutside > 0) {
+      setState(() => _error =
+          '新的排程范围（${formCoverage.from} 至 ${formCoverage.to}）'
+          '不包含已有的 $drawnOutside 条日期规则；'
+          '请扩大范围或先删除这些日期后再保存');
+      return null;
+    }
+
     if (_mode == CalendarEditorMode.drawing) {
-      final derived = _draft.timetable.toCalendarSettings(base);
-      final settings = derived.copyWith(pendingNotes: _pendingNotes);
+      var merged = _draft.timetable;
+      final union =
+          _unionCoverage(merged.dateFrom, merged.dateTo, merged.dates);
+      if (union == null) {
+        setState(() => _error = '已有日期规则的跨度超过 400 天，无法作为一次排程范围提交；'
+            '请先清理范围外的日期规则');
+        return null;
+      }
+      merged = merged.copyWith(dateFrom: union.from, dateTo: union.to);
+      final derived = merged.toCalendarSettings(base).copyWith(
+        planningStartDate: merged.dateFrom,
+        planningDays: merged.coverageDays,
+        pendingNotes: _pendingNotes,
+      );
       return CalendarSettingsResult(
-        settings: settings,
-        timetable: _draft.timetable,
+        settings: derived,
+        timetable: merged,
       );
     }
 
@@ -627,48 +679,176 @@ class _CalendarSettingsDialogState extends State<_CalendarSettingsDialog> {
       pendingNotes: _pendingNotes,
       idPrefix: 'p${DateTime.now().millisecondsSinceEpoch}',
     );
+    final settingsWithProposals = base.copyWith(
+      weekly: WeeklyAvailability(applied.weekly),
+      exceptions: applied.exceptions,
+      occupancies: applied.occupancies,
+      planningStartDate: formCoverage.from,
+      planningDays: _inclusiveDays(formCoverage.from, formCoverage.to),
+      pendingNotes: _pendingNotes,
+    );
+    // 表单是权威来源：先按表单重建规则，再把已绘制日期逐条覆盖回去。
+    final fromForm = Timetable.fromSchedule(
+      CalendarSchedule(settings: settingsWithProposals),
+      weekStart: formCoverage.from,
+    ).copyWith(dateFrom: formCoverage.from, dateTo: formCoverage.to);
+    var merged = _mergeTimetables(fromForm, _draft.timetable);
+    if (planningChanged) {
+      final outside = merged.dates
+          .where((e) =>
+              e.date!.compareTo(formCoverage.from) < 0 ||
+              e.date!.compareTo(formCoverage.to) > 0)
+          .length;
+      if (outside > 0) {
+        setState(() => _error =
+            '新的排程范围（${formCoverage.from} 至 ${formCoverage.to}）'
+            '不包含已有的 $outside 条日期规则；'
+            '请扩大范围或先删除这些日期后再保存');
+        return null;
+      }
+    }
+    final union =
+        _unionCoverage(formCoverage.from, formCoverage.to, merged.dates);
+    if (union == null) {
+      setState(() => _error = '日期规则的跨度超过 400 天，无法作为一次排程范围提交；'
+          '请先清理范围外的日期规则');
+      return null;
+    }
+    merged = merged.copyWith(dateFrom: union.from, dateTo: union.to);
+    final derived = merged.toCalendarSettings(settingsWithProposals).copyWith(
+      planningStartDate: merged.dateFrom,
+      planningDays: merged.coverageDays,
+      pendingNotes: _pendingNotes,
+    );
     return CalendarSettingsResult(
-      settings: base.copyWith(
-        weekly: WeeklyAvailability(applied.weekly),
-        exceptions: applied.exceptions,
-        occupancies: applied.occupancies,
-        pendingNotes: applied.pendingNotes,
-      ),
+      settings: derived,
       appliedProposals: applied.applied,
       skippedProposals: applied.skipped,
-      timetable: _draft.timetable,
+      timetable: merged,
     );
   }
 
+  /// 直接读取控件/草稿的纯数据签名，不触发校验或 setState。
+  ///
+  /// 只包含用户可编辑的数据：规划字段、周规则文本、日期例外/占用、已绘制草稿和
+  /// 已勾选的候选。模式切换、候选列表加载、提示文字变化本身不算修改。
+  String _dataSignature() => jsonEncode(<String, Object?>{
+        'start': _startDate.text.trim(),
+        'days': _planningDays.text.trim(),
+        'snap': _snap.text.trim(),
+        'offset': _offset.text.trim(),
+        'weekly': <String, String>{
+          for (final d in _weekdays) '$d': _weekly[d]!.text.trim(),
+        },
+        'exceptions': <Object?>[
+          for (final row in _exceptions)
+            <String, Object?>{
+              'date': row.date.text.trim(),
+              'ranges': row.ranges.text.trim(),
+              'closed': row.closed,
+            },
+        ],
+        'occupancies': <Object?>[
+          for (final row in _occupancies)
+            <String, Object?>{
+              'date': row.date.text.trim(),
+              'title': row.title.text.trim(),
+              'ranges': row.ranges.text.trim(),
+              'kind': row.kind,
+              'weekday': row.weekday,
+            },
+        ],
+        'draft': _draft.timetable.toJson(),
+        'acceptedProposals': <Object?>[
+          for (final row in _proposalRows)
+            if (row.accepted)
+              <String, Object?>{
+                'id': row.proposal.id,
+                'ranges': row.ranges?.text.trim() ?? '',
+              },
+        ],
+      });
+
+  /// 关闭/取消前的未保存判断。
+  bool _hasUnsavedChanges() => _dataSignature() != _initialDataSignature;
+
+  Future<void> _handlePopRequest() async {
+    if (_busy) return;
+    if (!_hasUnsavedChanges()) {
+      if (mounted) Navigator.of(context).pop();
+      return;
+    }
+    final discard = await showDialog<bool>(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => AlertDialog(
+        title: const Text('放弃未保存的时间表修改？', style: TextStyle(fontSize: 15)),
+        content: const Text('关闭后本次修改不会写入，已保存的数据不受影响。',
+            style: TextStyle(fontSize: 12.5, height: 1.5)),
+        actions: [
+          TextButton(
+            key: const Key('calendar-discard-cancel'),
+            onPressed: () => Navigator.of(ctx).pop(false),
+            child: const Text('继续编辑'),
+          ),
+          TextButton(
+            key: const Key('calendar-discard-confirm'),
+            onPressed: () => Navigator.of(ctx).pop(true),
+            child: Text('放弃修改',
+                style: TextStyle(color: TsColors.blocked)),
+          ),
+        ],
+      ),
+    );
+    if (discard == true && mounted) Navigator.of(context).pop();
+  }
+
   Future<void> _apply() async {
+    if (_busy) return;
     final result = _buildResult();
     if (result == null) return;
     final callback = widget.onApply;
-    if (callback != null) {
-      final ok = await callback(result);
-      if (!mounted) return;
-      if (!ok) {
-        setState(() => _error ??= '提交失败，修改仍保留在编辑器中');
-        return;
-      }
-    }
     setState(() {
-      _error = null;
-      _applyStatus = '已应用';
-      _applied = result.settings;
-      _draft.markApplied();
+      _busy = true;
+      _applyStatus = '正在保存…';
     });
+    try {
+      if (callback != null) {
+        final ok = await callback(result);
+        if (!mounted) return;
+        if (!ok) {
+          setState(() {
+            _error ??= '提交失败，修改仍保留在编辑器中';
+            _applyStatus = null;
+          });
+          return;
+        }
+      }
+      if (!mounted) return;
+      setState(() {
+        _error = null;
+        _applyStatus = '已应用';
+        _applied = result.settings;
+        _draft.markApplied();
+        // 刚提交成功的数据就是新的“已保存基线”，随后关闭不应再提示丢弃。
+        _initialDataSignature = _dataSignature();
+      });
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
   }
 
   void _save() {
+    if (_busy) return;
     final result = _buildResult();
     if (result == null) return;
+    setState(() => _busy = true);
     Navigator.of(context).pop(result);
   }
 
   /// 手动填写 ↔ 手动绘制：先把当前表单内容并入草稿，避免切换丢修改。
   void _setMode(CalendarEditorMode mode) {
-    if (mode == _mode) return;
+    if (mode == _mode || _busy) return;
     final base = _baseSettings();
     if (base == null) return;
     if (mode == CalendarEditorMode.fill) {
@@ -689,17 +869,40 @@ class _CalendarSettingsDialogState extends State<_CalendarSettingsDialog> {
       _occupancies
         ..clear()
         ..addAll(derived.occupancies.map(_OccupancyRow.new));
+      // 规划范围以草稿 coverage 为准（绘制是业务状态，不受浏览周影响）。
+      _startDate.text = _draft.timetable.dateFrom;
+      _planningDays.text = '${_draft.timetable.coverageDays}';
     } else {
       // 填写 → 绘制：用当前表单重建时间表（保留已画的日期规则）。
+      final formCoverage = _effectiveCoverage(base);
+      final planningChanged = _planningChanged();
+      if (planningChanged) {
+        final outside = _draft.timetable.dates
+            .where((e) =>
+                e.date!.compareTo(formCoverage.from) < 0 ||
+                e.date!.compareTo(formCoverage.to) > 0)
+            .length;
+        if (outside > 0) {
+          setState(() => _error =
+              '新的排程范围（${formCoverage.from} 至 ${formCoverage.to}）'
+              '不包含已有的 $outside 条日期规则；请扩大范围或先删除这些日期');
+          return;
+        }
+      }
       final rebuilt = Timetable.fromSchedule(
         CalendarSchedule(settings: base),
-        weekStart: _weekStart,
-      );
-      final merged = _mergeTimetables(rebuilt, _draft.timetable);
-      _draft.reset(merged.copyWith(
-        dateFrom: _weekStart,
-        dateTo: addDaysToDateKey(_weekStart, 6),
-      ));
+        weekStart: formCoverage.from,
+      ).copyWith(dateFrom: formCoverage.from, dateTo: formCoverage.to);
+      var merged = _mergeTimetables(rebuilt, _draft.timetable);
+      final union = _unionCoverage(
+          formCoverage.from, formCoverage.to, merged.dates);
+      if (union == null) {
+        setState(() => _error = '日期规则跨度超过 400 天，无法作为一次排程范围；'
+            '请先清理范围外的日期规则');
+        return;
+      }
+      merged = merged.copyWith(dateFrom: union.from, dateTo: union.to);
+      _draft.reset(merged);
     }
     setState(() {
       _mode = mode;
@@ -707,26 +910,92 @@ class _CalendarSettingsDialogState extends State<_CalendarSettingsDialog> {
     });
   }
 
-  /// 表单重建的周规则 + 已绘制草稿的日期规则；同一周的同一天以草稿为准。
+  /// 表单/规划范围对应的业务 coverage（不是在浏览的周）。
+  ({String from, String to}) _coverageRange(CalendarSettings settings) {
+    final start = parseDateKey(settings.planningStartDate) ?? _weekStart;
+    final days = settings.planningDays.clamp(1, 400);
+    return (from: start, to: addDaysToDateKey(start, days - 1));
+  }
+
+  bool _planningChanged() =>
+      _startDate.text.trim() != _initialPlanningStart ||
+      (int.tryParse(_planningDays.text.trim()) ?? 0) != _initialPlanningDays;
+
+  /// 本次提交应使用的 coverage。
+  ///
+  /// 只有用户真的改了“排程起始日期/规划天数”才按表单重算；否则保留已提交
+  /// 时间表自己的 coverage（旧数据可能是不同的周/范围，不能因为打开填写页
+  /// 就被悄悄缩成表单默认范围）。
+  ({String from, String to}) _effectiveCoverage(CalendarSettings base) {
+    final form = _coverageRange(base);
+    if (!_planningChanged()) {
+      final timetable = _draft.timetable;
+      if (timetable.coverageDays > 0) {
+        return (from: timetable.dateFrom, to: timetable.dateTo);
+      }
+    }
+    return form;
+  }
+
+  /// 覆盖范围扩展到包含所有已有日期规则；跨度超过 400 天时返回 null。
+  ({String from, String to})? _unionCoverage(
+      String from, String to, Iterable<TimetableEntry> entries) {
+    var low = from;
+    var high = to;
+    for (final entry in entries) {
+      final date = entry.date;
+      if (date == null) continue;
+      if (date.compareTo(low) < 0) low = date;
+      if (date.compareTo(high) > 0) high = date;
+    }
+    if (_inclusiveDays(low, high) > 400) return null;
+    return (from: low, to: high);
+  }
+
+  int _inclusiveDays(String from, String to) {
+    final a = parseDateKey(from);
+    final b = parseDateKey(to);
+    if (a == null || b == null) return 1;
+    final first = DateTime.utc(
+        int.parse(a.substring(0, 4)),
+        int.parse(a.substring(5, 7)),
+        int.parse(a.substring(8)));
+    final last = DateTime.utc(
+        int.parse(b.substring(0, 4)),
+        int.parse(b.substring(5, 7)),
+        int.parse(b.substring(8)));
+    final days = last.difference(first).inDays + 1;
+    return days < 1 ? 1 : days;
+  }
+
+  /// 表单（周规则 + 日期例外/占用）作为底层，已绘制的日期规则逐条覆盖在上面。
+  ///
+  /// 不能再“按整天丢弃表单结果”：同一天既有日期例外又有绘制块时，两者都必须
+  /// 保留；绘制块（含任务绑定/预留给定）覆盖其自身区间，其余表单区间保留。
   Timetable _mergeTimetables(Timetable fromForm, Timetable drawn) {
-    final dateKeys = drawn.dates.map((e) => e.date!).toSet();
-    final dates = <TimetableEntry>[
-      for (final e in fromForm.dates)
-        if (!dateKeys.contains(e.date)) e,
-      ...drawn.dates,
-    ];
-    return drawn.copyWith(weekly: fromForm.weekly, dates: dates);
+    // 表单日期规则先保留；绘制块只覆盖它自身区间（paint 会切开重叠的旧规则），
+    // 不再像旧实现那样按整天丢掉表单结果。
+    var merged = fromForm;
+    for (final entry in drawn.dates) {
+      final date = entry.date;
+      if (date == null) continue;
+      merged = merged.paint(
+        date: date,
+        start: entry.start,
+        end: entry.end,
+        state: entry.state,
+        origin: entry.origin,
+        title: entry.title,
+        taskId: entry.taskId,
+        reservationId: entry.reservationId,
+      );
+    }
+    return merged.copyWith(dateFrom: drawn.dateFrom, dateTo: drawn.dateTo);
   }
 
   void _shiftWeek(int days) {
-    final next = addDaysToDateKey(_weekStart, days);
-    setState(() {
-      _weekStart = next;
-      _draft.reset(_draft.timetable.copyWith(
-        dateFrom: next,
-        dateTo: addDaysToDateKey(next, 6),
-      ));
-    });
+    // 只是浏览：不改 coverage，不动草稿，也不清空撤销历史。
+    setState(() => _weekStart = addDaysToDateKey(_weekStart, days));
   }
 
   Future<void> _pickMonth() async {
@@ -736,13 +1005,7 @@ class _CalendarSettingsDialogState extends State<_CalendarSettingsDialog> {
       weekStartsOn: widget.weekStartsOn,
     );
     if (picked == null || !mounted) return;
-    setState(() {
-      _weekStart = weekStartFor(picked, widget.weekStartsOn);
-      _draft.reset(_draft.timetable.copyWith(
-        dateFrom: _weekStart,
-        dateTo: addDaysToDateKey(_weekStart, 6),
-      ));
-    });
+    setState(() => _weekStart = weekStartFor(picked, widget.weekStartsOn));
   }
 
   Future<void> _pickYear() async {
@@ -757,13 +1020,7 @@ class _CalendarSettingsDialogState extends State<_CalendarSettingsDialog> {
       weekStartsOn: widget.weekStartsOn,
     );
     if (selected == null || !mounted) return;
-    setState(() {
-      _weekStart = weekStartFor(selected, widget.weekStartsOn);
-      _draft.reset(_draft.timetable.copyWith(
-        dateFrom: _weekStart,
-        dateTo: addDaysToDateKey(_weekStart, 6),
-      ));
-    });
+    setState(() => _weekStart = weekStartFor(selected, widget.weekStartsOn));
   }
 
   // ---------------------------------------------------------------- build
@@ -798,69 +1055,75 @@ class _CalendarSettingsDialogState extends State<_CalendarSettingsDialog> {
         reduceMotion ? Duration.zero : const Duration(milliseconds: 200);
     final drawing = _mode == CalendarEditorMode.drawing;
 
-    return Dialog(
-      // 尺寸完全由内容决定，不叠加 AlertDialog 的默认边距与 560 宽度上限。
-      insetPadding: EdgeInsets.zero,
-      child: AnimatedContainer(
-        duration: duration,
-        curve: Curves.easeOutCubic,
-        width: size.width,
-        height: size.height,
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            _titleRow(context),
-            Padding(
-              padding: const EdgeInsets.fromLTRB(20, 0, 20, 0),
-              child: _editorHeader(),
-            ),
-            const SizedBox(height: 6),
-            Expanded(
-              child: Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 20),
-                child: AnimatedSwitcher(
-                  duration: duration,
-                  switchInCurve: Curves.easeOutCubic,
-                  switchOutCurve: Curves.easeInCubic,
-                  transitionBuilder: (child, animation) {
-                    // 淡入 + 轻微位移；正在淡出的旧子树不接收指针，避免两份可交互表单。
-                    final outgoing =
-                        animation.status == AnimationStatus.reverse;
-                    final curved = CurvedAnimation(
-                      parent: animation,
-                      curve: Curves.easeOutCubic,
-                      reverseCurve: Curves.easeInCubic,
-                    );
-                    return IgnorePointer(
-                      ignoring: outgoing,
-                      child: FadeTransition(
-                        opacity: curved,
-                        child: SlideTransition(
-                          position: Tween<Offset>(
-                            begin: const Offset(0, 0.015),
-                            end: Offset.zero,
-                          ).animate(curved),
-                          child: child,
+    return PopScope(
+      canPop: false,
+      onPopInvokedWithResult: (didPop, result) {
+        if (!didPop) _handlePopRequest();
+      },
+      child: Dialog(
+        // 尺寸完全由内容决定，不叠加 AlertDialog 的默认边距与 560 宽度上限。
+        insetPadding: EdgeInsets.zero,
+        child: AnimatedContainer(
+          duration: duration,
+          curve: Curves.easeOutCubic,
+          width: size.width,
+          height: size.height,
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              _titleRow(context),
+              Padding(
+                padding: const EdgeInsets.fromLTRB(20, 0, 20, 0),
+                child: _editorHeader(),
+              ),
+              const SizedBox(height: 6),
+              Expanded(
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 20),
+                  child: AnimatedSwitcher(
+                    duration: duration,
+                    switchInCurve: Curves.easeOutCubic,
+                    switchOutCurve: Curves.easeInCubic,
+                    transitionBuilder: (child, animation) {
+                      // 淡入 + 轻微位移；正在淡出的旧子树不接收指针，避免两份可交互表单。
+                      final outgoing =
+                          animation.status == AnimationStatus.reverse;
+                      final curved = CurvedAnimation(
+                        parent: animation,
+                        curve: Curves.easeOutCubic,
+                        reverseCurve: Curves.easeInCubic,
+                      );
+                      return IgnorePointer(
+                        ignoring: outgoing,
+                        child: FadeTransition(
+                          opacity: curved,
+                          child: SlideTransition(
+                            position: Tween<Offset>(
+                              begin: const Offset(0, 0.015),
+                              end: Offset.zero,
+                            ).animate(curved),
+                            child: child,
+                          ),
                         ),
-                      ),
-                    );
-                  },
-                  child: KeyedSubtree(
-                    key: ValueKey<CalendarEditorMode>(_mode),
-                    child: drawing ? _drawContent() : _fillContent(),
+                      );
+                    },
+                    child: KeyedSubtree(
+                      key: ValueKey<CalendarEditorMode>(_mode),
+                      child: drawing ? _drawContent() : _fillContent(),
+                    ),
                   ),
                 ),
               ),
-            ),
-            if (_error != null)
-              Padding(
-                padding: const EdgeInsets.fromLTRB(20, 6, 20, 0),
-                child: Text(_error!,
-                    key: const Key('calendar-settings-error'),
-                    style: TextStyle(fontSize: 11.5, color: TsColors.blocked)),
-              ),
-            _footer(context),
-          ],
+              if (_error != null)
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(20, 6, 20, 0),
+                  child: Text(_error!,
+                      key: const Key('calendar-settings-error'),
+                      style: TextStyle(fontSize: 11.5, color: TsColors.blocked)),
+                ),
+              _footer(context),
+            ],
+          ),
         ),
       ),
     );
@@ -876,7 +1139,7 @@ class _CalendarSettingsDialogState extends State<_CalendarSettingsDialog> {
           ),
           IconButton(
             tooltip: '关闭',
-            onPressed: () => Navigator.of(context).pop(),
+            onPressed: _busy ? null : _handlePopRequest,
             style: TsButtons.closeIcon(size: 28),
             icon: const Icon(Icons.close, size: 16),
           ),
@@ -1034,21 +1297,21 @@ class _CalendarSettingsDialogState extends State<_CalendarSettingsDialog> {
             key: const Key('calendar-settings-cancel'),
             label: '取消',
             filled: false,
-            onPressed: () => Navigator.of(context).pop(),
+            onPressed: _busy ? null : _handlePopRequest,
           ),
           const SizedBox(width: 10),
           _action(
             key: const Key('calendar-settings-apply'),
             label: '应用',
             filled: false,
-            onPressed: _apply,
+            onPressed: _busy ? null : _apply,
           ),
           const SizedBox(width: 10),
           _action(
             key: const Key('calendar-settings-save'),
             label: '保存并重新安排',
             filled: true,
-            onPressed: _save,
+            onPressed: _busy ? null : _save,
           ),
         ],
       ),
@@ -1114,13 +1377,8 @@ class _CalendarSettingsDialogState extends State<_CalendarSettingsDialog> {
   void _goThisWeek() {
     final wall = _applied.clock.toWall(widget.now);
     final today = WallClock.formatDateKey(wall.year, wall.month, wall.day);
-    setState(() {
-      _weekStart = weekStartFor(today, widget.weekStartsOn);
-      _draft.reset(_draft.timetable.copyWith(
-        dateFrom: _weekStart,
-        dateTo: addDaysToDateKey(_weekStart, 6),
-      ));
-    });
+    // 只是导航：coverage 与撤销历史不动。
+    setState(() => _weekStart = weekStartFor(today, widget.weekStartsOn));
   }
 
   String _weekRangeLabel() {
@@ -1140,10 +1398,25 @@ class _CalendarSettingsDialogState extends State<_CalendarSettingsDialog> {
   Widget _drawContent() {
     // 不设固定宽高：标题、模式开关、工具栏、日期表头与底部状态/按钮由外壳固定，
     // 只有网格占据剩余空间并独立滚动。
+    final timetable = _draft.timetable;
+    final weekEnd = addDaysToDateKey(_weekStart, 6);
+    final outsideCoverage = _weekStart.compareTo(timetable.dateFrom) < 0 ||
+        weekEnd.compareTo(timetable.dateTo) > 0;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
         _drawToolbar(),
+        if (outsideCoverage)
+          Padding(
+            padding: const EdgeInsets.only(top: 4),
+            child: Text(
+              '当前浏览的周（$_weekStart 至 $weekEnd）不在排程覆盖范围'
+              '（${timetable.dateFrom} 至 ${timetable.dateTo}）内：绘制已禁用，'
+              '请在“手动填写”里调整排程范围。',
+              key: const Key('timetable-outside-coverage'),
+              style: TextStyle(fontSize: 10.5, color: TsColors.pending),
+            ),
+          ),
         const SizedBox(height: 6),
         Expanded(
           child: Container(
@@ -1160,6 +1433,9 @@ class _CalendarSettingsDialogState extends State<_CalendarSettingsDialog> {
               weeklyMode: _weeklyMode,
               taskNames: widget.taskNames,
               verticalController: _gridScroll,
+              canEditDate: (date) =>
+                  date.compareTo(timetable.dateFrom) >= 0 &&
+                  date.compareTo(timetable.dateTo) <= 0,
               onChanged: () {},
             ),
           ),
@@ -1225,14 +1501,18 @@ class _CalendarSettingsDialogState extends State<_CalendarSettingsDialog> {
     final base = _baseSettings();
     if (base == null) return;
     setState(() {
+      // 清空规则但保留用户设定的 coverage（业务范围不因一次清空而缩成一周）。
       _draft.reset(Timetable.withDefaults(
-        weekStart: _weekStart,
+        weekStart: _draft.timetable.dateFrom,
         timezoneId: base.timezoneId,
         timezoneOffsetMinutes: base.timezoneOffsetMinutes,
         unavailable: <WallClockRange>[
           for (final r in widget.defaultUnavailableRanges)
             WallClockRange(r.start, r.end),
         ],
+      ).copyWith(
+        dateFrom: _draft.timetable.dateFrom,
+        dateTo: _draft.timetable.dateTo,
       ));
     });
   }
@@ -1394,12 +1674,14 @@ class _CalendarSettingsDialogState extends State<_CalendarSettingsDialog> {
       final dateField = SizedBox(
         width: 118,
         child: TextField(
+          key: Key('calendar-exception-date-$i'),
           controller: row.date,
           style: const TextStyle(fontSize: 12),
           decoration: const InputDecoration(hintText: 'yyyy-MM-dd', isDense: true),
         ),
       );
       final rangesField = TextField(
+        key: Key('calendar-exception-ranges-$i'),
         controller: row.ranges,
         enabled: !row.closed,
         style: const TextStyle(fontSize: 12),
@@ -1770,7 +2052,7 @@ class _CalendarSettingsDialogState extends State<_CalendarSettingsDialog> {
     required Key key,
     required String label,
     required bool filled,
-    required VoidCallback onPressed,
+    required VoidCallback? onPressed,
   }) {
     // Same height / radius / font / vertical padding for both footer buttons; only the
     // emphasis differs. `minimumSize` alone is not enough — the visual box is forced by

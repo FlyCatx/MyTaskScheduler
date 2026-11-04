@@ -44,6 +44,8 @@ import 'user_menu.dart';
 
 enum ChartMode { tree, gantt }
 
+enum _CloseChoice { retry, cancel, discard }
+
 class AppShell extends StatefulWidget {
   final AppController controller;
 
@@ -134,16 +136,64 @@ class _AppShellState extends State<AppShell> {
   }
 
   /// 统一关闭流程：先落盘必要数据，再真正销毁窗口。
+  ///
+  /// * 仍有弹窗/路由时，先交给该路由自己的未保存保护（maybePop），不绕过它；
+  /// * 写入失败时不退出，提供“重试 / 取消退出 / 放弃并退出”；
+  /// * 只有写入真正排空或用户明确放弃后才 confirmClose。
   Future<void> _handleWindowClose() async {
-    if (_closing) return;
+    if (_closing || !mounted) return;
+    final navigator = Navigator.of(context);
+    if (navigator.canPop()) {
+      await navigator.maybePop();
+      return;
+    }
     _closing = true;
     try {
-      await c.flushPendingWrites();
-    } catch (_) {
-      // 即使落盘失败也要让用户能关闭窗口；失败信息已经由存储层记录。
+      while (true) {
+        final saved = await c.flushPendingWrites();
+        if (saved) break;
+        final choice = await _askCloseAfterFailure();
+        if (choice == null || choice == _CloseChoice.cancel) return;
+        if (choice == _CloseChoice.discard) break;
+        // retry: loop and flush again.
+      }
+      await _window.confirmClose();
+    } finally {
+      _closing = false;
     }
-    await _window.confirmClose();
-    _closing = false;
+  }
+
+  Future<_CloseChoice?> _askCloseAfterFailure() {
+    return showDialog<_CloseChoice>(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => AlertDialog(
+        title: const Text('保存失败，暂不能退出', style: TextStyle(fontSize: 15)),
+        content: Text(
+          '${c.errorMessage ?? '未保存的草稿写入失败。'}\n\n'
+          '可以重试写入、取消退出回到工作，或明确放弃这些未保存修改后退出。',
+          style: const TextStyle(fontSize: 12.5, height: 1.5),
+        ),
+        actions: [
+          TextButton(
+            key: const Key('close-cancel'),
+            onPressed: () => Navigator.of(ctx).pop(_CloseChoice.cancel),
+            child: const Text('取消退出'),
+          ),
+          FilledButton(
+            key: const Key('close-retry'),
+            onPressed: () => Navigator.of(ctx).pop(_CloseChoice.retry),
+            child: const Text('重试'),
+          ),
+          TextButton(
+            key: const Key('close-discard'),
+            onPressed: () => Navigator.of(ctx).pop(_CloseChoice.discard),
+            child: Text('放弃并退出',
+                style: TextStyle(color: TsColors.blocked)),
+          ),
+        ],
+      ),
+    );
   }
 
   @override

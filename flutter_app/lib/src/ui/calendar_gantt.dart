@@ -1342,41 +1342,59 @@ class _CalendarGanttViewState extends State<CalendarGanttView> {
   }
 
   void _maybeAutoScroll() {
-    if (!_horizontal.hasClients || _lastGlobal == null) return;
-    final box = context.findRenderObject() as RenderBox?;
-    if (box == null) return;
-    final local = box.globalToLocal(_lastGlobal!);
-    final width = box.size.width;
-    final nearRight = local.dx > width - 40;
-    final nearLeft = local.dx < labelWidth + 20;
-    if (!nearRight && !nearLeft) {
-      _autoScroll?.cancel();
-      _autoScroll = null;
+    if (!_horizontal.hasClients || _lastGlobal == null || _drag == null) {
+      _stopAutoScroll();
+      return;
+    }
+    if (_autoScrollDirection() == 0) {
+      _stopAutoScroll();
       return;
     }
     if (_autoScroll != null) return;
     _autoScroll = Timer.periodic(const Duration(milliseconds: 40), (_) {
       if (!mounted || _drag == null || !_horizontal.hasClients) {
-        _autoScroll?.cancel();
-        _autoScroll = null;
+        _stopAutoScroll();
         return;
       }
-      final step = nearRight ? 12.0 : -12.0;
+      // Direction is re-evaluated from the *current* real pointer position every
+      // tick, so moving from one edge to the other reverses immediately.
+      final direction = _autoScrollDirection();
+      if (direction == 0) {
+        _stopAutoScroll();
+        return;
+      }
+      final step = direction * 12.0;
       final next = (_horizontal.offset + step).clamp(
         0.0,
         _horizontal.position.maxScrollExtent,
       );
-      if (next == _horizontal.offset) {
-        _autoScroll?.cancel();
-        _autoScroll = null;
+      if ((next - _horizontal.offset).abs() < 0.01) {
+        _stopAutoScroll();
         return;
       }
+      // Only the scroll position changes. globalToLocal already includes the new
+      // offset, so the real pointer must not be shifted as well (that used to
+      // double-count the movement and made the preview jump).
       _horizontal.jumpTo(next);
-      if (_lastGlobal != null) {
-        _lastGlobal = _lastGlobal! + Offset(step, 0);
-      }
       _applyDragDelta();
     });
+  }
+
+  /// -1 = scroll left band, +1 = right band, 0 = neither (or outside the canvas).
+  int _autoScrollDirection() {
+    final box = context.findRenderObject() as RenderBox?;
+    final global = _lastGlobal;
+    if (box == null || global == null) return 0;
+    final local = box.globalToLocal(global);
+    final width = box.size.width;
+    if (local.dx > width - 40) return 1;
+    if (local.dx < labelWidth + 20) return -1;
+    return 0;
+  }
+
+  void _stopAutoScroll() {
+    _autoScroll?.cancel();
+    _autoScroll = null;
   }
 
   void _cancelDrag() {

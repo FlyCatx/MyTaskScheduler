@@ -94,9 +94,14 @@ class TimetableGridGeometry {
 
   double get dayWidth => days <= 0 ? 0 : gridWidth / days;
 
-  /// 视口坐标 → 连续格坐标；不在网格内时返回 null。
+  /// 视口坐标 → 连续格坐标；不在【可见网格视口】内时返回 null。
+  ///
+  /// 先校验指针确实落在可写视口内，再扣时间轴、加滚动偏移。否则把指针拖到
+  /// 表头、状态条或视口外时，滚动偏移会把它映射到隐藏时段并写入。
   Offset? toGrid(Offset viewportPoint) {
     if (dayWidth <= 0 || rowHeight <= 0) return null;
+    if (!viewportPoint.dx.isFinite || !viewportPoint.dy.isFinite) return null;
+    if (viewportPoint.dy < 0 || viewportPoint.dy >= viewportHeight) return null;
     final x = viewportPoint.dx - axisWidth;
     final y = viewportPoint.dy + scrollOffset - topInset;
     if (x < 0 || x >= dayWidth * days) return null;
@@ -206,6 +211,10 @@ class TimetableGrid extends StatefulWidget {
   /// 为 null 时由网格自己创建并在 dispose 时释放。
   final ScrollController? verticalController;
 
+  /// 具体日期是否允许绘制/擦除。用于把“可见周（UI）”限制在排程覆盖范围内，
+  /// 避免在 coverage 之外画出不会随请求发送的规则。为 null 时全部允许。
+  final bool Function(String date)? canEditDate;
+
   const TimetableGrid({
     super.key,
     required this.controller,
@@ -217,6 +226,7 @@ class TimetableGrid extends StatefulWidget {
     this.taskNames = const <String, String>{},
     this.onBindUnbound,
     this.verticalController,
+    this.canEditDate,
   });
 
   static const double timeAxisWidth = 54;
@@ -336,7 +346,8 @@ class _TimetableGridState extends State<TimetableGrid> {
   // ------------------------------------------------------------- gestures
 
   void _handleDown(PointerDownEvent event) {
-    // 只处理主指针；第二根手指/第二个按键不进入绘制状态机，避免打断一笔。
+    // 一笔进行中拒绝第二指针（鼠标第二键/触摸第二指）抢占；当前笔画的归属不变。
+    if (_pointer != null) return;
     _focus.requestFocus();
     if (event.buttons & kMiddleMouseButton != 0) {
       widget.controller.cycleBrush();
@@ -438,6 +449,12 @@ class _TimetableGridState extends State<TimetableGrid> {
     }
     for (final entry in byDay.entries) {
       final day = days[entry.key];
+      if (!widget.weeklyMode &&
+          widget.canEditDate != null &&
+          !widget.canEditDate!(day.date)) {
+        // coverage 之外的日期不写入：它们不会进入请求，也不应静默影响本地排程。
+        continue;
+      }
       final slots = entry.value.toSet().toList()..sort();
       if (_erasing) {
         _draft.eraseSlots(
@@ -540,7 +557,8 @@ class _TimetableGridState extends State<TimetableGrid> {
         ? state.label
         : interval.title!;
     final text = '${d.date} ${_hhmm(start)}-${_hhmm(end)} · $title · $origin$bound'
-        '${interval?.isPartialCell == true ? ' · 精确边界' : ''}';
+        '${interval?.isPartialCell == true ? ' · 精确边界' : ''}'
+        '${widget.weeklyMode || widget.canEditDate == null || widget.canEditDate!(d.date) ? '' : ' · 排程范围外（不可绘制）'}';
     if (text != _hoverText) {
       setState(() => _hoverText = text);
       widget.onHover?.call(text);
@@ -548,6 +566,9 @@ class _TimetableGridState extends State<TimetableGrid> {
   }
 
   static String _hhmm(int minute) => WallClockRange.formatMinute(minute);
+
+  static String _durationLabel(int minutes) =>
+      '${minutes ~/ 60} 小时 ${minutes % 60} 分';
 
   double _scaledHeaderHeight(BuildContext context) {
     final scale = MediaQuery.textScalerOf(context).scale(1).clamp(1.0, 1.6);
@@ -587,6 +608,7 @@ class _TimetableGridState extends State<TimetableGrid> {
                     TimetableGrid.scrollbarGutter,
               );
               return MouseRegion(
+                cursor: SystemMouseCursors.precise,
                 onHover: _handleHover,
                 child: Listener(
                   key: _viewportKey,
@@ -641,9 +663,11 @@ class _TimetableGridState extends State<TimetableGrid> {
   Widget _statusBar() {
     final hint = _hoverText ??
         '左键绘制 · 拖动连续绘制 · 右键擦除 · 中键切换画笔 · Ctrl+Z 撤销';
-    final stats = widget.weekStart.isNotEmpty && _draft.timetable.hasEntries
-        ? '每周可用 ${_draft.timetable.freeMinutesPerWeek ~/ 60} 小时 '
-            '${_draft.timetable.freeMinutesPerWeek % 60} 分'
+    final timetable = _draft.timetable;
+    // 两个口径分开命名：本周实际可用（按 7 个真实日期展开）与每周模板容量。
+    final stats = widget.weekStart.isNotEmpty && timetable.hasEntries
+        ? '本周可用 ${_durationLabel(timetable.freeMinutesInWeek(widget.weekStart))}'
+            ' · 每周模板 ${_durationLabel(timetable.freeMinutesPerWeek)}'
         : null;
     // 状态条在滚动区之外：长提示省略、窄窗口换行，最后一个格不会被它遮挡。
     return Container(
