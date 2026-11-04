@@ -537,8 +537,91 @@ static int tt_count_days(const char *from, const char *to)
     return count;
 }
 
+/* 1=周一 … 7=周日（Sakamoto）。 */
+static int tt_weekday_of(int y, int m, int d)
+{
+    static const int offsets[12] = {0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4};
+    if (m < 3) y -= 1;
+    int w = (y + y / 4 - y / 100 + y / 400 + offsets[m - 1] + d) % 7;
+    return w == 0 ? 7 : w;
+}
+
+static int tt_apply_rule_minutes(const cJSON *rule, int *states,
+                                 const char **tasks)
+{
+    int start, end, state;
+    const cJSON *task;
+    const char *task_id = NULL;
+    if (!tt_read_int(rule, "start", &start) || !tt_read_int(rule, "end", &end) ||
+        !tt_read_int(rule, "state", &state)) {
+        return 0;
+    }
+    if (start < 0 || end <= start || end > 1440 || state < 0 || state > 2) {
+        return 0;
+    }
+    task = cJSON_GetObjectItemCaseSensitive(rule, "taskId");
+    if (task != NULL && cJSON_IsString(task) &&
+        cJSON_GetStringValue(task)[0] != '\0') {
+        task_id = cJSON_GetStringValue(task);
+    }
+    for (int m = start; m < end; m++) {
+        states[m] = state;
+        tasks[m] = task_id;
+    }
+    return 1;
+}
+
+static int tt_rule_matches_day(const cJSON *rule, int weekly, const char *date,
+                               int weekday)
+{
+    if (weekly) {
+        const cJSON *weekdays = cJSON_GetObjectItemCaseSensitive(rule, "weekdays");
+        const cJSON *item;
+        if (!cJSON_IsArray(weekdays)) return 0;
+        cJSON_ArrayForEach(item, weekdays) {
+            int day;
+            if (tt_read_int_value(item, &day) && day == weekday) return 1;
+        }
+        return 0;
+    }
+    const cJSON *date_item = cJSON_GetObjectItemCaseSensitive(rule, "date");
+    return cJSON_IsString(date_item) &&
+           strcmp(cJSON_GetStringValue(date_item), date) == 0;
+}
+
+/*
+ * 按权威规则（defaultState → weekly → dates）独立展开某一天，写入每分钟的
+ * state 与 taskId。派生视图必须与这里的结果逐分钟一致。
+ */
+static int tt_expected_day(const cJSON *timetable, const char *date,
+                           int default_state, int *states, const char **tasks)
+{
+    const cJSON *rules;
+    const cJSON *rule;
+    int y, m, d;
+    int weekday;
+    if (!tt_parse_date_key(date, &y, &m, &d)) return 0;
+    weekday = tt_weekday_of(y, m, d);
+    for (int i = 0; i < 1440; i++) {
+        states[i] = default_state;
+        tasks[i] = NULL;
+    }
+    rules = cJSON_GetObjectItemCaseSensitive(timetable, "weekly");
+    cJSON_ArrayForEach(rule, rules) {
+        if (!tt_rule_matches_day(rule, 1, date, weekday)) continue;
+        if (!tt_apply_rule_minutes(rule, states, tasks)) return 0;
+    }
+    rules = cJSON_GetObjectItemCaseSensitive(timetable, "dates");
+    cJSON_ArrayForEach(rule, rules) {
+        if (!tt_rule_matches_day(rule, 0, date, 0)) continue;
+        if (!tt_apply_rule_minutes(rule, states, tasks)) return 0;
+    }
+    return 1;
+}
+
 /* 派生视图必须与权威规则同源：revision、时区、日期范围和每天 0–1440 全覆盖。 */
-static int tt_validate_effective(const cJSON *effective, int revision,
+static int tt_validate_effective(const cJSON *effective,
+                                 const cJSON *timetable, int revision,
                                  const char *timezone_id, int offset,
                                  const char *date_from, const char *date_to)
 {
@@ -548,6 +631,7 @@ static int tt_validate_effective(const cJSON *effective, int revision,
     const char *effective_tz = NULL;
     const char *from = NULL;
     const char *to = NULL;
+    int default_state = 0;
     int size;
     int i;
 
@@ -565,6 +649,15 @@ static int tt_validate_effective(const cJSON *effective, int revision,
     if (!tt_read_string(effective, "dateFrom", &from, 0)) return 0;
     if (!tt_read_string(effective, "dateTo", &to, 0)) return 0;
     if (strcmp(from, date_from) != 0 || strcmp(to, date_to) != 0) return 0;
+    {
+        const cJSON *coverage =
+            cJSON_GetObjectItemCaseSensitive(timetable, "coverage");
+        if (!cJSON_IsObject(coverage) ||
+            !tt_read_int(coverage, "defaultState", &default_state) ||
+            default_state < 0 || default_state > 2) {
+            return 0;
+        }
+    }
 
     days = cJSON_GetObjectItemCaseSensitive(effective, "days");
     if (!cJSON_IsArray(days)) return 0;
@@ -580,12 +673,17 @@ static int tt_validate_effective(const cJSON *effective, int revision,
         int cursor = 0;
         int count;
         int j;
+        int states[1440];
+        const char *tasks[1440];
         if (!cJSON_IsObject(day)) return 0;
         if (!tt_read_string(day, "date", &date, 0)) return 0;
         if (!tt_parse_date_key(date, NULL, NULL, NULL)) return 0;
         if (strcmp(date, date_from) < 0 || strcmp(date, date_to) > 0) return 0;
         if (i == 0 && strcmp(date, date_from) != 0) return 0;
         if (i == size - 1 && strcmp(date, date_to) != 0) return 0;
+        if (!tt_expected_day(timetable, date, default_state, states, tasks)) {
+            return 0;
+        }
         intervals = cJSON_GetObjectItemCaseSensitive(day, "intervals");
         if (!cJSON_IsArray(intervals)) return 0;
         count = cJSON_GetArraySize(intervals);
@@ -594,6 +692,7 @@ static int tt_validate_effective(const cJSON *effective, int revision,
             const cJSON *interval = cJSON_GetArrayItem(intervals, j);
             int start, end, state;
             const cJSON *task_id;
+            const char *effective_task = NULL;
             if (!cJSON_IsObject(interval)) return 0;
             if (!tt_read_int(interval, "start", &start) ||
                 !tt_read_int(interval, "end", &end) ||
@@ -606,7 +705,17 @@ static int tt_validate_effective(const cJSON *effective, int revision,
             task_id = cJSON_GetObjectItemCaseSensitive(interval, "taskId");
             if (task_id != NULL && !cJSON_IsNull(task_id)) {
                 if (!cJSON_IsString(task_id)) return 0;
-                if (cJSON_GetStringValue(task_id)[0] != '\0' && state != 2) {
+                if (cJSON_GetStringValue(task_id)[0] != '\0') {
+                    if (state != 2) return 0;
+                    effective_task = cJSON_GetStringValue(task_id);
+                }
+            }
+            /* 逐分钟比较：state 与 taskId 都必须等于权威规则的展开结果。 */
+            for (int m = start; m < end; m++) {
+                if (states[m] != state) return 0;
+                if ((tasks[m] == NULL) != (effective_task == NULL)) return 0;
+                if (tasks[m] != NULL &&
+                    strcmp(tasks[m], effective_task) != 0) {
                     return 0;
                 }
             }
@@ -695,7 +804,7 @@ char *ts_constraints_timetable_block(const char *timetable_json)
     if (payload_timetable != NULL) {
         effective = cJSON_GetObjectItemCaseSensitive(root, "effectiveTimetable");
         if (effective != NULL && !cJSON_IsNull(effective)) {
-            if (!tt_validate_effective(effective, revision, timezone_id,
+            if (!tt_validate_effective(effective, item, revision, timezone_id,
                                        offset, date_from, date_to)) {
                 cJSON_Delete(root);
                 return NULL;
