@@ -265,31 +265,44 @@ TS_BRIDGE_API int ts_bridge_probe_async(TsBridge *bridge,
                                         TsBridgeBuffer *out_error);
 
 /*
- * 启动一次“日历约束识别”（0.07）。
+ * 启动一次“日历约束识别”（0.07；0.1.1 起支持时间表 v2）。
  *
  * 请求体与 ts_bridge_analyze_async 相同（sources 里放已提交的用户补充与已上传
- * 附件的提取文本），但**不产出任务计划**：它只识别时间约束提案。
+ * 附件的提取文本），并且可以额外携带：
+ *   "requestSchemaVersion": 2,
+ *   "context": { "currentDate":"2026-10-20", "timezoneId":"Asia/Shanghai",
+ *                "timezoneOffsetMinutes":480 },
+ *   "calendarRevision": 3,
+ *   "timetable": { "schemaVersion":2, "revision":3,
+ *                  "coverage":{...}, "weekly":[...], "dates":[...] }
+ * 时间表会被规范化为提示词里的【结构化时间表】区块（本地事实，不作为 evidence）。
+ * 它**不产出任务计划**：只识别时间约束提案。
  *
  * 结果（ts_bridge_result，jobType = "constraints"）：
  * { "ok": true, "job":1, "jobType":"constraints",
- *   "constraints": { "schemaVersion":1,
- *                    "proposals":[ { "kind":"occupancy", "title":"上课",
- *                                    "occupancyKind":"course", "weekdays":[2,4],
- *                                    "date":null, "closed":false,
+ *   "constraints": { "schemaVersion":2,
+ *                    "calendar": { "schemaVersion":2, "proposals":[…], "notes":[…] },
+ *                    "proposals":[ { "kind":"occupancy", "state":0,
+ *                                    "title":"上课", "occupancyKind":"course",
+ *                                    "weekdays":[2,4], "date":null, "closed":false,
  *                                    "ranges":[{"start":480,"end":600}],
  *                                    "durationMinutes":null,
+ *                                    "taskId":null, "taskTitleHint":null,
  *                                    "evidence":"周二周四 8-10 上课",
- *                                    "source":"文件1:第2段",
+ *                                    "source":{"sourceId":"file-1","location":"第2段"},
  *                                    "needsTime":false, "question":null } ],
  *                    "notes":["…"] },
  *   "thinking": {"enabled":true,"effort":"high","protocol":"deepseek-chat"},
  *   "source": {…同分析…}, "elapsedMs": 1234 }
  *
+ * `kind=unclear` 允许 `ranges:[]` 且 `durationMinutes:null`，但必须有 evidence 与
+ * question；`kind=task` 的 taskId 只能来自请求的 knownTasks，否则保持 null。
+ *
  * 失败/取消：{ "ok": false, "jobType":"constraints",
  *              "errorKind":"cancelled|auth|protocol|…", "error":"可读原因" }
  *
  * 语义约束：proposals 里的每一条都只是**候选**，界面必须默认不勾选，只有用户
- * 明确确认后才写入正式的 weekly / exceptions / occupancies。
+ * 明确确认后才写入正式的 weekly / exceptions / occupancies / timetable。
  * 与探针共用 poll / cancel / result / release_job，最多 4 个并发后台请求。
  */
 TS_BRIDGE_API int ts_bridge_constraints_async(TsBridge *bridge,
@@ -397,4 +410,3 @@ TS_BRIDGE_API void ts_bridge_destroy(TsBridge *bridge);
 #endif
 
 #endif /* TS_BRIDGE_H */
-
