@@ -64,6 +64,8 @@ class BackupRestoreResult {
     this.restoredProfileCount = 0,
     this.backupPaths = const <String>[],
     this.rolledBackPaths = const <String>[],
+    this.rollbackFailedPaths = const <String>[],
+    this.commitAttempted = false,
     this.conflictConversationIds = const <String>[],
     this.sessionsReloaded = false,
     this.requiresRestart = false,
@@ -104,6 +106,13 @@ class BackupRestoreResult {
   /// Targets that were replaced and then put back by the rollback of a failed commit.
   final List<String> rolledBackPaths;
 
+  /// Targets whose rollback failed: the user must be told those files were not restored.
+  final List<String> rollbackFailedPaths;
+
+  /// True once the commit phase started renaming files. A validation failure before this
+  /// point is genuinely "nothing was touched"; a failed commit is not.
+  final bool commitAttempted;
+
   /// Conversation ids that exist locally with different content; the restore was
   /// rejected as a whole (nothing was written).
   final List<String> conflictConversationIds;
@@ -116,8 +125,13 @@ class BackupRestoreResult {
   /// callback was available, or the preferences could not be re-read in this run).
   final bool requiresRestart;
 
-  /// True when no file was replaced, so an error message may promise "nothing changed".
-  bool get dataUnchanged => ok || rolledBackPaths.isEmpty;
+  /// True only when no file was replaced, or every replaced file was verifiably put
+  /// back. An empty rollback list after a partially attempted commit is *not* proof of
+  /// "unchanged".
+  bool get dataUnchanged =>
+      ok ||
+      !commitAttempted ||
+      (rolledBackPaths.isNotEmpty && rollbackFailedPaths.isEmpty);
 
   String get summary {
     if (!ok) return error ?? '恢复失败';
@@ -596,16 +610,23 @@ class BackupService {
         }
       }
     } catch (e) {
-      final rolledBack = await _rollback(committed);
+      final rollback = await _rollback(committed);
       await _discardStaged(staged);
-      final names = rolledBack.map(_basenameOf).toList(growable: false);
-      final detail = rolledBack.isEmpty
+      final names = rollback.restored.map(_basenameOf).toList(growable: false);
+      final failed = rollback.failed.map(_basenameOf).toList(growable: false);
+      final detail = rollback.restored.isEmpty && rollback.failed.isEmpty
           ? '没有文件被替换，原有数据未改动'
-          : '已回滚 ${rolledBack.length} 个文件（${names.join('、')}），原有数据已恢复';
+          : (rollback.failed.isEmpty
+              ? '已回滚 ${rollback.restored.length} 个文件（${names.join('、')}），原有数据已恢复'
+              : '已回滚 ${rollback.restored.length} 个文件，'
+                  '但 ${rollback.failed.length} 个文件未能恢复（${failed.join('、')}）；'
+                  '请从 .bak 或备份文件人工恢复，不要继续覆盖');
       return BackupRestoreResult(
         ok: false,
         error: '恢复提交失败：${_shortError(e)}；$detail',
-        rolledBackPaths: rolledBack,
+        rolledBackPaths: rollback.restored,
+        rollbackFailedPaths: rollback.failed,
+        commitAttempted: true,
       );
     }
 
@@ -1097,9 +1118,12 @@ class BackupService {
     }
   }
 
-  /// Puts every replaced file back. Returns the target paths that were restored.
-  Future<List<String>> _rollback(List<_CommitEntry> committed) async {
+  /// Puts every replaced file back. Reports exactly what was restored and what failed;
+  /// a swallowed exception must never be presented as “original data restored”.
+  Future<({List<String> restored, List<String> failed})> _rollback(
+      List<_CommitEntry> committed) async {
     final restored = <String>[];
+    final failed = <String>[];
     for (final item in committed.reversed) {
       try {
         // A promoted target holds the restored bytes; the previous ones are in `.bak`.
@@ -1112,12 +1136,19 @@ class BackupService {
             await backup.rename(item.target.path);
           }
         }
-        restored.add(item.target.path);
+        if (backup != null && !await item.target.exists()) {
+          failed.add(item.target.path);
+        } else {
+          restored.add(item.target.path);
+        }
       } catch (_) {
-        // Best effort: the caller reports the original failure.
+        failed.add(item.target.path);
       }
     }
-    return List<String>.unmodifiable(restored);
+    return (
+      restored: List<String>.unmodifiable(restored),
+      failed: List<String>.unmodifiable(failed),
+    );
   }
 
   /// Recursively drops key-like fields. The model already never stores a key; this is
@@ -1250,4 +1281,3 @@ class _CommitEntry {
   final File? backup;
   bool promoted = false;
 }
-

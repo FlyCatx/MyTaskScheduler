@@ -17,6 +17,7 @@ import 'dart:convert';
 import 'dart:io';
 
 import '../model/settings.dart';
+import 'storage_migration.dart';
 
 /// Result of [SettingsStore.load].
 class SettingsPreferencesLoad {
@@ -160,32 +161,38 @@ class SettingsStore {
   }
 
   Future<void> _writeAtomic(File file, String payload) async {
-    final tmp = File('${file.path}.tmp');
-    final bak = File('${file.path}.bak');
-    await tmp.writeAsString(payload, flush: true);
-    var movedOld = false;
+    StorageWriteGate.beginOperation();
     try {
-      if (await file.exists()) {
-        if (await bak.exists()) await bak.delete();
-        await file.rename(bak.path);
-        movedOld = true;
-      }
-      await tmp.rename(file.path);
-    } catch (_) {
-      // Put the previous file back: a failed save must never destroy the old values.
-      if (movedOld && !await file.exists() && await bak.exists()) {
-        try {
-          await bak.rename(file.path);
-        } catch (_) {
-          // Best effort only; the caller reports the original failure.
-        }
-      }
+      final tmp = File(
+          '${file.path}.${DateTime.now().microsecondsSinceEpoch}.tmp');
+      final bak = File('${file.path}.bak');
+      await tmp.writeAsString(payload, flush: true);
+      var movedOld = false;
       try {
-        if (await tmp.exists()) await tmp.delete();
+        if (await file.exists()) {
+          if (await bak.exists()) await bak.delete();
+          await file.rename(bak.path);
+          movedOld = true;
+        }
+        await tmp.rename(file.path);
       } catch (_) {
-        // Leave the tmp file behind; the cache cleaner lists `*.tmp` explicitly.
+        // Put the previous file back: a failed save must never destroy the old values.
+        if (movedOld && !await file.exists() && await bak.exists()) {
+          try {
+            await bak.rename(file.path);
+          } catch (_) {
+            // Best effort only; the caller reports the original failure.
+          }
+        }
+        try {
+          if (await tmp.exists()) await tmp.delete();
+        } catch (_) {
+          // Leave the tmp file behind; the cache cleaner lists `*.tmp` explicitly.
+        }
+        rethrow;
       }
-      rethrow;
+    } finally {
+      StorageWriteGate.endOperation();
     }
   }
 
@@ -194,4 +201,3 @@ class SettingsStore {
     return text.length > 160 ? '${text.substring(0, 160)}…' : text;
   }
 }
-
