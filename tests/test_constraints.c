@@ -458,6 +458,51 @@ static void test_timetable_block(void)
     CHECK(block == NULL, "非闰年的 2 月 29 日必须拒绝");
     if (block != NULL) ts_free(block);
 
+    /* 元信息完全一致但 state 与权威规则冲突：必须拒绝，不能让模型自行选一份。 */
+    {
+        char conflict[8192];
+        snprintf(conflict, sizeof(conflict),
+                 "{\"timetable\":%s,\"effectiveTimetable\":"
+                 "{\"sourceRevision\":3,\"timezoneId\":\"Asia/Shanghai\","
+                 "\"timezoneOffsetMinutes\":480,\"dateFrom\":\"2026-10-19\","
+                 "\"dateTo\":\"2026-10-20\",\"days\":["
+                 "{\"date\":\"2026-10-19\",\"intervals\":["
+                 "{\"start\":0,\"end\":1440,\"state\":1}]},"
+                 "{\"date\":\"2026-10-20\",\"intervals\":["
+                 "{\"start\":0,\"end\":480,\"state\":0},"
+                 "{\"start\":480,\"end\":1440,\"state\":1}]}]}}",
+                 timetable);
+        block = ts_constraints_timetable_block(conflict);
+        CHECK(block == NULL, "派生视图 state 与权威规则冲突必须拒绝");
+        if (block != NULL) ts_free(block);
+    }
+
+    /* 原规则是 T1 的任务预留，派生视图写成 T2：同样必须拒绝。 */
+    {
+        const char *task_timetable =
+            "{\"schemaVersion\":2,\"revision\":5,"
+            "\"timezoneId\":\"Asia/Shanghai\",\"timezoneOffsetMinutes\":480,"
+            "\"coverage\":{\"dateFrom\":\"2026-10-20\",\"dateTo\":\"2026-10-20\","
+            "\"defaultState\":1},\"weekly\":[],"
+            "\"dates\":[{\"state\":2,\"start\":720,\"end\":780,"
+            "\"date\":\"2026-10-20\",\"taskId\":\"T1\"}]}";
+        const char *task_effective =
+            "{\"sourceRevision\":5,\"timezoneId\":\"Asia/Shanghai\","
+            "\"timezoneOffsetMinutes\":480,\"dateFrom\":\"2026-10-20\","
+            "\"dateTo\":\"2026-10-20\",\"days\":["
+            "{\"date\":\"2026-10-20\",\"intervals\":["
+            "{\"start\":0,\"end\":720,\"state\":1},"
+            "{\"start\":720,\"end\":780,\"state\":2,\"taskId\":\"T2\"},"
+            "{\"start\":780,\"end\":1440,\"state\":1}]}]}";
+        char payload_task[8192];
+        snprintf(payload_task, sizeof(payload_task),
+                 "{\"timetable\":%s,\"effectiveTimetable\":%s}",
+                 task_timetable, task_effective);
+        block = ts_constraints_timetable_block(payload_task);
+        CHECK(block == NULL, "派生视图 taskId 与权威规则冲突必须拒绝");
+        if (block != NULL) ts_free(block);
+    }
+
     block = ts_constraints_timetable_block("{\"schemaVersion\":1}");
     CHECK(block == NULL, "v1 时间表必须被拒绝，不能假装兼容");
     if (block != NULL) ts_free(block);
