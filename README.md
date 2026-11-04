@@ -1,41 +1,39 @@
 # TaskScheduler
 
-TaskScheduler is a Windows desktop application for turning notes and documents into an ordered task plan. It uses an OpenAI-compatible model to analyze supplied text, then validates dependencies and presents the plan locally. It does not execute tasks or run model-generated commands.
+TaskScheduler 是一款 Windows 桌面任务规划工具。它可分析用户提供的文字材料，生成任务计划，并在本地校验依赖关系、安排顺序和展示结果。模型连接由用户配置；应用不会执行模型生成的命令。
 
-## Features
+## 当前版本
 
-- C core for task validation, dependency analysis, scheduling, and export
-- Win32 and Flutter desktop interfaces
-- Configurable OpenAI-compatible model endpoint
-- Local settings and credential handling
-- TXT, JSON, PDF, DOCX, and PPTX text input support
+0.2.0（Windows x64）。请从 [GitHub Releases](https://github.com/FlyCatx/MyTaskScheduler/releases) 下载程序包。
 
-## Repository layout
+## 主要功能
 
-- `src/` — C application and shared business logic
-- `flutter_app/` — Flutter Windows interface
-- `tests/` — automated unit and local mock-service tests
-- `scripts/` — dependency, build, and packaging scripts
-- `third_party/` — vendored cJSON and libcurl files with licenses
+- 从文本和常见文档中提取任务信息。
+- 编辑任务、前置关系、时间安排和可用时间表。
+- 通过兼容 OpenAI API 的模型服务分析材料。
+- 在本地校验计划并查看甘特图等视图。
+- 使用本地应用数据保存设置和计划。
 
-Local build outputs, user settings, logs, one-off AI acceptance inputs, UI captures, and temporary probe files are excluded from this repository.
+## 项目结构
 
-## Build on Windows
+- `src/`：C 业务逻辑与本机接口。
+- `flutter_app/`：Flutter Windows 桌面界面。
+- `tests/`：自动化回归测试与本地模拟服务。
+- `scripts/`：依赖准备、构建和打包脚本。
 
-Install Visual Studio with C/C++ tools, CMake, and the Flutter SDK.
+## Windows 构建
 
-Build the C application and its offline tests:
+需要 Visual Studio C/C++ 工具、CMake 和 Flutter SDK。
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts/build.ps1 -Test
-```
-
-Build the Flutter Windows application:
-
-```powershell
 powershell -ExecutionPolicy Bypass -File scripts/build_flutter_app.ps1
 ```
 
-## Configuration
+Flutter 应用与 C 内核通过 `ts_bridge.dll` 协作。详细构建和目录说明见 [Flutter 部分说明](flutter_app/README.md)。
 
-Copy `config.example.json` to `config.json`, set the endpoint and model, and provide credentials through the environment variable configured by `api_key_env`. Do not commit local `config.json` or credential values.
+## 配置与数据
+
+首次使用时在应用设置中配置模型服务地址、模型名称和凭据。不要将本地设置文件、API 密钥或用户数据提交到仓库。
+
+版本说明：[0.1.2 到 0.2.0 更新](CHANGELOG-0.1.2-0.2.0.md)。

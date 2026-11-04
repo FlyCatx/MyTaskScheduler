@@ -310,6 +310,14 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_constraints.c)
     endif()
 endif()
 
+# 多显示器最大化几何（纯函数，不需要窗口/GPU）。
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_window_geometry.c)
+    add_executable(ts_test_window_geometry tests/test_window_geometry.c)
+    if(MSVC)
+        target_compile_options(ts_test_window_geometry PRIVATE /W4 /utf-8)
+    endif()
+endif()
+
 # JSON 导出（export_json.c）的运行期输出：真实 cJSON 构造 + 读回校验。
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_export_json.c)
     add_executable(ts_test_export_json tests/test_export_json.c)
@@ -410,6 +418,7 @@ set(TS_OFFLINE_TEST_TARGETS
     ts_test_settings
     ts_test_probe
     ts_test_gui
+    ts_test_window_geometry
 )
 
 foreach(ts_test_name IN LISTS TS_OFFLINE_TEST_TARGETS)
@@ -447,4 +456,3 @@ if(TS_CURL_VENDORED)
         endif()
     endforeach()
 endif()
-
