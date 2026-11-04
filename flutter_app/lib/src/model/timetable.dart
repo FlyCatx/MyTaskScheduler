@@ -20,6 +20,7 @@ import 'dart:math' as math;
 import 'package:crypto/crypto.dart';
 
 import 'calendar.dart';
+import 'timetable_transactions.dart';
 
 /// 一个 15 分钟格包含的分钟数。
 const int kTimetableSlotMinutes = 15;
@@ -58,7 +59,14 @@ enum TimetableState {
 enum TimetableOrigin {
   defaultRule('default'),
   manual('manual'),
-  model('model');
+  model('model'),
+
+  /// 外部日历忙碌（只读）。
+  ///
+  /// 只出现在「运行时合成时间表」里（见 state/timetable_composition.dart）：
+  /// 合成结果**绝不落盘**，手工时间表（session/version.timetable）里永远没有
+  /// 该来源。C 侧只校验 origin 是字符串，因此新增枚举值不改变协议。
+  external('external');
 
   const TimetableOrigin(this.wireName);
 
@@ -67,6 +75,7 @@ enum TimetableOrigin {
   static TimetableOrigin parse(Object? value) => switch ('$value') {
         'default' => TimetableOrigin.defaultRule,
         'model' => TimetableOrigin.model,
+        'external' => TimetableOrigin.external,
         _ => TimetableOrigin.manual,
       };
 }
@@ -324,6 +333,13 @@ class Timetable {
   final List<TimetableEntry> weekly;
   final List<TimetableEntry> dates;
 
+  /// 运行时合成快照专用：条目 id → 外部来源 id（[TimetableOrigin.external] 条目）。
+  ///
+  /// **不持久化**：[toJson] 不写、[tryParse] 读回为空，因此手工时间表与请求
+  /// 负载都不受影响；合成之后由 [toCalendarSettings] 生成带 `external/sourceId`
+  /// 的 [CalendarOccupancy]，供冲突解释说明“外部日历”来源。
+  final Map<String, String> externalEntrySources;
+
   const Timetable({
     this.revision = 0,
     this.timezoneId = kDefaultTimezoneId,
@@ -333,9 +349,18 @@ class Timetable {
     this.defaultState = 1,
     this.weekly = const <TimetableEntry>[],
     this.dates = const <TimetableEntry>[],
+    this.externalEntrySources = const <String, String>{},
   });
 
   bool get hasEntries => weekly.isNotEmpty || dates.isNotEmpty;
+
+  /// 合成快照里是否含有外部日历占用（只读）。
+  bool get hasExternalBusy =>
+      dates.any((e) => e.origin == TimetableOrigin.external);
+
+  /// 某个外部占用来源 id；非外部条目或未知条目返回 null。
+  String? externalSourceIdOf(TimetableEntry entry) =>
+      externalEntrySources[entry.id];
 
   List<TimetableEntry> get all => <TimetableEntry>[...weekly, ...dates];
 
@@ -348,6 +373,7 @@ class Timetable {
     int? defaultState,
     List<TimetableEntry>? weekly,
     List<TimetableEntry>? dates,
+    Map<String, String>? externalEntrySources,
   }) =>
       Timetable(
         revision: revision ?? this.revision,
@@ -359,6 +385,7 @@ class Timetable {
         defaultState: defaultState ?? this.defaultState,
         weekly: weekly ?? this.weekly,
         dates: dates ?? this.dates,
+        externalEntrySources: externalEntrySources ?? this.externalEntrySources,
       );
 
   Map<String, dynamic> toJson() => <String, dynamic>{
@@ -574,7 +601,10 @@ class Timetable {
       reservationId:
           state == TimetableState.task ? reservationId : null,
     ));
-    final sorted = isDate ? _normalizeLayer(kept) : _normalizeWeekly(kept);
+    // 日期层必须按“同一天”分组规范化：_normalizeLayer 只按分钟区间判断重叠，
+    // 不区分 date；把整个 dates 列表交给它会让不同日期同一时刻的规则互相切掉，
+    // 只有最后写入的那天存活（多天复制/跨日会直接踩中）。
+    final sorted = isDate ? _normalizeDates(kept) : _normalizeWeekly(kept);
     return isDate
         ? copyWith(dates: sorted)
         : copyWith(weekly: sorted);
@@ -649,8 +679,106 @@ class Timetable {
       if (e.end > end) kept.add(e.copyWith(id: '${e.id}-b', start: end));
     }
     return isDate
-        ? copyWith(dates: _normalizeLayer(kept))
+        ? copyWith(dates: _normalizeDates(kept))
         : copyWith(weekly: _normalizeWeekly(kept));
+  }
+
+  /// 跨日连续区间：按自然日拆分后逐日写入，整次调用返回一个新快照。
+  ///
+  /// [startDate] 与 [endDate] 均为 yyyy-MM-dd，结束必须晚于开始：跨日时
+  /// `endDate > startDate` 即可；同一日期时必须 `endMinute > startMinute`。
+  ///
+  /// 跨午夜按**自然日**拆分，不做星期取模：周一 23:30 → 周二 00:30 写成
+  /// 周一 `[1410,1440)` + 周二 `[0,30)`，既不会把周日→周一铺满整周，也不会
+  /// 产生 end>1440 的非法规则。中间整天写成 `[0,1440)`。
+  ///
+  /// 端点必须都落在 `[coverageFrom, coverageTo]` 内；越界、日期非法或区间非法
+  /// 时返回 null，由调用方明确报错，**不静默截断**。
+  ///
+  /// 这是一次纯计算：调用方应把返回值作为**一笔**事务提交
+  /// （`TimetableDraft.recordTransaction`），而不是逐日多笔。
+  Timetable? paintRange({
+    required String startDate,
+    required int startMinute,
+    required String endDate,
+    required int endMinute,
+    required TimetableState state,
+    TimetableOrigin origin = TimetableOrigin.manual,
+    String? title,
+    String? taskId,
+    String? reservationId,
+    required String coverageFrom,
+    required String coverageTo,
+  }) {
+    final from = _validatedDateKey(startDate);
+    final to = _validatedDateKey(endDate);
+    final coverFrom = _validatedDateKey(coverageFrom);
+    final coverTo = _validatedDateKey(coverageTo);
+    if (from == null || to == null || coverFrom == null || coverTo == null) {
+      return null;
+    }
+    if (coverFrom.compareTo(coverTo) > 0) return null;
+    if (from.compareTo(to) > 0) return null;
+    if (from.compareTo(coverFrom) < 0 || to.compareTo(coverTo) > 0) return null;
+    if (startMinute < 0 || startMinute >= kTimetableMinutesPerDay) return null;
+    if (endMinute < 0 || endMinute > kTimetableMinutesPerDay) return null;
+
+    if (from == to) {
+      if (endMinute <= startMinute) return null;
+      return paint(
+        date: from,
+        start: startMinute,
+        end: endMinute,
+        state: state,
+        origin: origin,
+        title: title,
+        taskId: taskId,
+        reservationId: reservationId,
+      );
+    }
+
+    // 跨日：枚举自然日（coverage 最多 400 天，这里同样设上限防止异常输入）。
+    final dayKeys = <String>[];
+    var cursor = from;
+    var guard = 0;
+    while (cursor != to && guard++ <= 400) {
+      dayKeys.add(cursor);
+      cursor = addDaysToDateKey(cursor, 1);
+    }
+    if (cursor != to) return null;
+    dayKeys.add(to);
+
+    final parts = <({String date, int start, int end})>[];
+    for (var i = 0; i < dayKeys.length; i++) {
+      final isFirst = i == 0;
+      final isLast = i == dayKeys.length - 1;
+      final partStart = isFirst ? startMinute : 0;
+      final partEnd = isLast ? endMinute : kTimetableMinutesPerDay;
+      if (partEnd <= partStart) continue;
+      parts.add((date: dayKeys[i], start: partStart, end: partEnd));
+    }
+    if (parts.isEmpty) return null;
+
+    var next = this;
+    for (var i = 0; i < parts.length; i++) {
+      final part = parts[i];
+      // 跨日蓝块不允许共享 reservationId：一个片段 id 只能对应一个已绑定片段，
+      // 否则 taskSegments 会撞 id。拆分后按顺序加后缀，仍保持稳定。
+      final partReservationId = (reservationId == null || reservationId.isEmpty)
+          ? reservationId
+          : (parts.length == 1 ? reservationId : '$reservationId-${i + 1}');
+      next = next.paint(
+        date: part.date,
+        start: part.start,
+        end: part.end,
+        state: state,
+        origin: origin,
+        title: title,
+        taskId: taskId,
+        reservationId: partReservationId,
+      );
+    }
+    return next;
   }
 
   /// 新会话的默认时间表：非占用区间为白格，默认占用见 [unavailable]。
@@ -865,6 +993,28 @@ class Timetable {
         date: entry.date,
         ranges: <WallClockRange>[WallClockRange(entry.start, entry.end)],
         provisional: false,
+      ));
+    }
+
+    // 运行时合成快照里的外部忙碌同样要变成“日期层占用”，排程/冲突检测才会把
+    // 它当作不可用。标记 external/sourceId 供解释层说明来源；标题固定为匿名串
+    // （外部事件标题绝不进入时间表或请求）。
+    for (final entry in dates) {
+      if (entry.origin != TimetableOrigin.external) continue;
+      if (entry.state != TimetableState.occupied) continue;
+      final date = entry.date;
+      if (date == null || date.isEmpty) continue;
+      occupancies.add(CalendarOccupancy(
+        id: entry.id,
+        title: (entry.title == null || entry.title!.isEmpty)
+            ? '外部日历'
+            : entry.title!,
+        kind: 'activity',
+        date: date,
+        ranges: <WallClockRange>[WallClockRange(entry.start, entry.end)],
+        provisional: false,
+        external: true,
+        sourceId: externalEntrySources[entry.id],
       ));
     }
 
@@ -1265,6 +1415,424 @@ class Timetable {
   }
 }
 
+/// 复制到多天的策略。
+enum CopyStrategy {
+  /// 只填空闲：不覆盖占用(0)、已有任务预留(2)与目标日自己的显式规则（用户锁定）。
+  fillFreeOnly('只填空闲'),
+
+  /// 替换目标所选时段：用源日期的时段整体改写目标日对应时刻（需确认）。
+  replaceSelection('替换所选时段');
+
+  const CopyStrategy(this.label);
+
+  final String label;
+}
+
+/// 一次“复制到多天”的预计结果，供预览与确认。
+///
+/// [result] 是应用后的完整时间表；[targetDates] 只含**实际发生写入**的目标日期
+/// （去重、升序）；无任何写入时 [isEmpty] 为 true，调用方不应产生撤销记录。
+class TimetableCopyPlan {
+  const TimetableCopyPlan({
+    required this.result,
+    this.targetDates = const <String>[],
+    this.changedMinutes = 0,
+    this.removedRanges = const <String>[],
+    this.affectedTaskIds = const <String>{},
+    this.protectedSkippedMinutes = 0,
+    this.warnings = const <String>[],
+  });
+
+  /// 应用后的时间表（复制一律写为日期例外，不改周模板）。
+  final Timetable result;
+
+  /// 实际发生写入的目标日期，去重升序；不含源日期与非法日期。
+  final List<String> targetDates;
+
+  /// 实际写入的分钟数。
+  final int changedMinutes;
+
+  /// 替换模式下会被移除/改写的目标区间，形如
+  /// `2026-10-20 10:00-11:00 占用`（只统计真正被改写、且与原内容不同的区间）。
+  final List<String> removedRanges;
+
+  /// 被移除/改写区间上的任务引用（非空 taskId）。
+  final Set<String> affectedTaskIds;
+
+  /// 仅填充模式下因目标受保护（占用/任务预留/目标日显式规则）而跳过的分钟数。
+  final int protectedSkippedMinutes;
+
+  /// 明确提示：未绑定蓝块、保留任务绑定时时长增加、非法日期被忽略等。
+  final List<String> warnings;
+
+  /// 无任何实际写入（UI 据此不产生撤销记录）。
+  bool get isEmpty => changedMinutes <= 0;
+}
+
+/// 应用预览：返回新 Timetable（纯函数，直接来自 [TimetableCopyPlan.result]）。
+Timetable applyCopyPlan(TimetableCopyPlan plan) => plan.result;
+
+/// 复制源日期的有效时段到多个目标日期（写为日期例外，不改周模板）。
+///
+/// * 源时段：`wholeDay == false`（默认）时只取源日期的**日期层显式规则**
+///   （用户在那一天画过/改过的内容）；`wholeDay == true` 时取该日展开后的
+///   完整 `0..1440` 有效区间，让目标日整体等于源日。
+/// * [CopyStrategy.fillFreeOnly]（默认）：只写目标日“当前有效状态为 free 且没有被
+///   目标日自己的显式日期规则覆盖”的分钟；占用(0)、任务预留(2)与目标日显式规则
+///   （含手动锁定的可用）都跳过并计入 [TimetableCopyPlan.protectedSkippedMinutes]。
+/// * [CopyStrategy.replaceSelection]：用源时段整体改写目标日对应时刻，并如实统计
+///   将被移除/改写的区间与任务引用。
+/// * [keepTaskBindings] 默认 false：复制的蓝块 taskId 置空（未绑定蓝块）；true 时
+///   保留 taskId，并对每个任务给出“预留时长将增加 N 分钟”的提示。
+/// * 目标日期去重升序；非法日期进 warnings 被忽略；源日期本身不作为目标。
+/// * 无变化时 [TimetableCopyPlan.isEmpty] 为 true，调用方不应产生撤销记录。
+TimetableCopyPlan planCopyDateRules({
+  required Timetable source,
+  required String sourceDate,
+  required Iterable<String> targetDates,
+  CopyStrategy strategy = CopyStrategy.fillFreeOnly,
+  bool keepTaskBindings = false,
+  bool wholeDay = false,
+}) {
+  final warnings = <String>[];
+  final removedRanges = <String>[];
+  final affectedTaskIds = <String>{};
+  final writtenDates = <String>[];
+  final addedBoundMinutes = <String, int>{};
+  var changedMinutes = 0;
+  var protectedSkippedMinutes = 0;
+
+  final sourceKey = _validatedDateKey(sourceDate);
+  if (sourceKey == null) {
+    warnings.add('源日期不是有效日期：$sourceDate');
+    return TimetableCopyPlan(result: source, warnings: warnings);
+  }
+
+  final targets = <String>{};
+  final invalid = <String>[];
+  for (final raw in targetDates) {
+    final key = _validatedDateKey(raw);
+    if (key == null) {
+      invalid.add(raw);
+      continue;
+    }
+    if (key == sourceKey) continue; // 源日期不需要复制给自己
+    targets.add(key);
+  }
+  if (invalid.isNotEmpty) warnings.add('忽略非法日期：${invalid.join('、')}');
+  final sortedTargets = targets.toList()..sort();
+
+  // 源时段。
+  final rules = <_CopyRule>[];
+  if (wholeDay) {
+    final weekday = weekdayOfDateKey(sourceKey);
+    for (final interval in source.dayIntervals(sourceKey, weekday)) {
+      if (interval.end <= interval.start) continue;
+      rules.add(_CopyRule(
+        start: interval.start,
+        end: interval.end,
+        state: interval.state,
+        title: interval.title,
+        taskId: interval.taskId,
+        reservationId: interval.reservationId,
+      ));
+    }
+  } else {
+    final entries = source.dates
+        .where((e) => e.date == sourceKey)
+        .toList(growable: false)
+      ..sort((a, b) => a.start.compareTo(b.start));
+    for (final e in entries) {
+      rules.add(_CopyRule(
+        start: e.start,
+        end: e.end,
+        state: e.state,
+        title: e.title,
+        taskId: e.taskId,
+        reservationId: e.reservationId,
+      ));
+    }
+  }
+
+  var unboundMinutes = 0;
+  final boundSourceTasks = <String>{};
+  for (final rule in rules) {
+    if (rule.state != TimetableState.task) continue;
+    if (rule.taskId == null || rule.taskId!.isEmpty) {
+      unboundMinutes += rule.end - rule.start;
+    } else {
+      boundSourceTasks.add(rule.taskId!);
+    }
+  }
+  if (unboundMinutes > 0) {
+    warnings.add('源日期含 $unboundMinutes 分钟未绑定的蓝色预留，复制后仍未绑定');
+  }
+  if (!keepTaskBindings && boundSourceTasks.isNotEmpty) {
+    warnings.add(
+        '源日期的蓝色预留绑定了 ${boundSourceTasks.length} 个任务，默认不复制绑定关系');
+  }
+
+  if (rules.isEmpty || sortedTargets.isEmpty) {
+    return TimetableCopyPlan(
+      result: source,
+      warnings: warnings,
+      protectedSkippedMinutes: 0,
+    );
+  }
+
+  var next = source;
+  for (final targetDate in sortedTargets) {
+    final weekday = weekdayOfDateKey(targetDate);
+    // 目标日“复制前”的有效区间与显式规则：整段判断都基于复制前状态，
+    // 这样 protectedSkippedMinutes / removedRanges 是“用户确认前看到的真实情况”。
+    final targetIntervals = next.dayIntervals(targetDate, weekday);
+    final targetExplicit =
+        next.dates.where((e) => e.date == targetDate).toList(growable: false);
+    final changedBefore = changedMinutes;
+
+    for (final rule in rules) {
+      final desiredTaskId = rule.state == TimetableState.task
+          ? (keepTaskBindings ? rule.taskId : null)
+          : null;
+
+      if (strategy == CopyStrategy.fillFreeOnly) {
+        // 源规则本身是“可用”时，填到目标的“可用”格上没有业务变化，直接跳过。
+        if (rule.state == TimetableState.free) continue;
+        final writable = _freeCopyRanges(
+          targetIntervals,
+          targetExplicit,
+          rule.start,
+          rule.end,
+        );
+        var writableMinutes = 0;
+        for (final range in writable) {
+          writableMinutes += range.end - range.start;
+        }
+        protectedSkippedMinutes +=
+            (rule.end - rule.start) - writableMinutes;
+        for (final range in writable) {
+          final minutes = range.end - range.start;
+          next = next.paint(
+            date: targetDate,
+            start: range.start,
+            end: range.end,
+            state: rule.state,
+            origin: TimetableOrigin.manual,
+            title: rule.title,
+            taskId: desiredTaskId,
+            reservationId: _copyReservationId(
+              rule,
+              targetDate,
+              range.start,
+              range.end,
+            ),
+          );
+          changedMinutes += minutes;
+          if (rule.state == TimetableState.task && desiredTaskId != null) {
+            addedBoundMinutes[desiredTaskId] =
+                (addedBoundMinutes[desiredTaskId] ?? 0) + minutes;
+          }
+        }
+        continue;
+      }
+
+      // replaceSelection：按目标当前状态/绑定切分，只改写真正不同的区间；
+      // 相同内容不写、不统计，确保无变化时 isEmpty 为 true。
+      for (final range in _replacedRanges(
+        targetIntervals,
+        rule.start,
+        rule.end,
+        rule.state,
+        desiredTaskId,
+      )) {
+        for (final interval in targetIntervals) {
+          if (interval.end <= range.start || interval.start >= range.end) {
+            continue;
+          }
+          final line = '$targetDate '
+              '${WallClockRange.formatMinute(interval.start)}-'
+              '${WallClockRange.formatMinute(interval.end)} '
+              '${interval.state.label}';
+          if (!removedRanges.contains(line)) removedRanges.add(line);
+          final taskId = interval.taskId;
+          if (interval.state == TimetableState.task &&
+              taskId != null &&
+              taskId.isNotEmpty) {
+            affectedTaskIds.add(taskId);
+          }
+        }
+        final minutes = range.end - range.start;
+        next = next.paint(
+          date: targetDate,
+          start: range.start,
+          end: range.end,
+          state: rule.state,
+          origin: TimetableOrigin.manual,
+          title: rule.title,
+          taskId: desiredTaskId,
+          reservationId: _copyReservationId(
+            rule,
+            targetDate,
+            range.start,
+            range.end,
+          ),
+        );
+        changedMinutes += minutes;
+        if (rule.state == TimetableState.task && desiredTaskId != null) {
+          addedBoundMinutes[desiredTaskId] =
+              (addedBoundMinutes[desiredTaskId] ?? 0) + minutes;
+        }
+      }
+    }
+
+    if (changedMinutes > changedBefore) writtenDates.add(targetDate);
+  }
+
+  if (keepTaskBindings) {
+    for (final entry in addedBoundMinutes.entries) {
+      warnings.add('任务 ${entry.key} 的预留时长将增加 ${entry.value} 分钟（多日复制）');
+    }
+  }
+
+  return TimetableCopyPlan(
+    result: next,
+    targetDates: writtenDates,
+    changedMinutes: changedMinutes,
+    removedRanges: removedRanges,
+    affectedTaskIds: affectedTaskIds,
+    protectedSkippedMinutes: protectedSkippedMinutes,
+    warnings: warnings,
+  );
+}
+
+/// 一条待复制的源时段（来自日期层规则或展开后的有效区间）。
+class _CopyRule {
+  const _CopyRule({
+    required this.start,
+    required this.end,
+    required this.state,
+    this.title,
+    this.taskId,
+    this.reservationId,
+  });
+
+  final int start;
+  final int end;
+  final TimetableState state;
+  final String? title;
+  final String? taskId;
+  final String? reservationId;
+}
+
+/// 每份复制出来的蓝块必须有独立身份：同一个蓝块复制到多天/多段时不能共享
+/// reservationId，否则 `taskSegments` 会撞 id。内容派生的 id 保证同一目标日期
+/// 同一区间重复计算时稳定。
+String? _copyReservationId(
+    _CopyRule rule, String targetDate, int start, int end) {
+  if (rule.state != TimetableState.task) return null;
+  final base = rule.reservationId;
+  if (base == null || base.isEmpty) {
+    return timetableEntryId(
+      state: TimetableState.task,
+      start: start,
+      end: end,
+      date: targetDate,
+      title: rule.title,
+    );
+  }
+  return '$base@$targetDate#$start-$end';
+}
+
+/// 仅填充模式可写的分钟：目标有效 free 区间 ∩ 源区间，再排除目标日显式规则。
+List<({int start, int end})> _freeCopyRanges(
+  List<TimetableInterval> targetIntervals,
+  List<TimetableEntry> targetExplicit,
+  int from,
+  int to,
+) {
+  final writable = <({int start, int end})>[];
+  for (final interval in targetIntervals) {
+    if (interval.state != TimetableState.free) continue;
+    final start = math.max(from, interval.start);
+    final end = math.min(to, interval.end);
+    if (end <= start) continue;
+    var pieces = <({int start, int end})>[(start: start, end: end)];
+    for (final entry in targetExplicit) {
+      if (entry.end <= from || entry.start >= to) continue;
+      final nextPieces = <({int start, int end})>[];
+      for (final piece in pieces) {
+        if (entry.end <= piece.start || entry.start >= piece.end) {
+          nextPieces.add(piece);
+          continue;
+        }
+        if (entry.start > piece.start) {
+          nextPieces.add(
+              (start: piece.start, end: math.min(entry.start, piece.end)));
+        }
+        if (entry.end < piece.end) {
+          nextPieces.add(
+              (start: math.max(entry.end, piece.start), end: piece.end));
+        }
+      }
+      pieces = nextPieces;
+    }
+    writable.addAll(pieces);
+  }
+  writable.sort((a, b) => a.start.compareTo(b.start));
+  return writable;
+}
+
+/// 替换模式下真正需要改写的区间：目标当前状态/绑定与源内容不同的连续分钟。
+List<({int start, int end})> _replacedRanges(
+  List<TimetableInterval> targetIntervals,
+  int from,
+  int to,
+  TimetableState state,
+  String? taskId,
+) {
+  final out = <({int start, int end})>[];
+  int? runStart;
+  for (var minute = from; minute < to; minute++) {
+    final current = _intervalAtMinute(targetIntervals, minute);
+    final same = current != null &&
+        current.state == state &&
+        (state != TimetableState.task ||
+            (current.taskId ?? '') == (taskId ?? ''));
+    if (same) {
+      if (runStart != null) {
+        out.add((start: runStart, end: minute));
+        runStart = null;
+      }
+    } else {
+      runStart ??= minute;
+    }
+  }
+  if (runStart != null) out.add((start: runStart, end: to));
+  return out;
+}
+
+TimetableInterval? _intervalAtMinute(
+    List<TimetableInterval> intervals, int minute) {
+  for (final interval in intervals) {
+    if (minute >= interval.start && minute < interval.end) return interval;
+  }
+  return null;
+}
+
+/// 严格日期键：必须能被 DateTime 原样回读（拒绝 2026-02-31 之类）。
+String? _validatedDateKey(String text) {
+  final key = parseDateKey(text);
+  if (key == null) return null;
+  final parts = key.split('-');
+  final date = DateTime.utc(
+    int.parse(parts[0]),
+    int.parse(parts[1]),
+    int.parse(parts[2]),
+  );
+  final roundTrip = WallClock.formatDateKey(date.year, date.month, date.day);
+  return roundTrip == key ? key : null;
+}
+
 /// 旧版设置里“默认不可用”的示例值（占 720 分钟/天）。
 const List<WallClockRange> kDefaultUnavailableRanges = <WallClockRange>[
   WallClockRange(0, 480),
@@ -1430,28 +1998,53 @@ Map<String, dynamic> deriveEffectiveTimetable(Timetable snapshot) {
   };
 }
 
-/// 编辑草稿：一次按下到抬起是一个撤销事务；重复经过同格不产生多条历史。
+/// 编辑草稿：一次用户操作 = 一笔撤销事务；重复经过同格不产生多条历史。
+///
+/// 历史由 [TimetableHistory] 承载（past/present/future），容量上限
+/// [historyCapacity] 笔，超出丢最旧；撤销/重做恢复的是完整 [Timetable] 快照，
+/// 因此 state、taskId、reservationId、日期规则与周规则都会一起恢复，不是只恢复
+/// 画布颜色。
+///
+/// 网格笔画仍走 [beginStroke]/[endStroke] 自动成笔；跨日、批量复制、批量绑定
+/// 等非笔画操作由调用方用 [recordTransaction] 显式记一笔（一次调用 = 一笔事务）。
 class TimetableDraft {
-  Timetable _timetable;
-  final List<Timetable> _undo = <Timetable>[];
+  TimetableDraft(Timetable timetable)
+      : _history = TimetableHistory(initial: timetable);
+
+  /// 历史容量上限：200 笔事务。
+  static const int historyCapacity = TimetableHistory.defaultCapacity;
+
+  final TimetableHistory _history;
   Timetable? _strokeBase;
+  String _strokeLabel = '编辑时间表';
 
-  TimetableDraft(this._timetable);
+  Timetable get timetable => _history.timetable!;
 
-  Timetable get timetable => _timetable;
-  bool get hasUndo => _undo.isNotEmpty || _strokeBase != null;
-  int get undoDepth => _undo.length;
+  bool get hasUndo => _history.canUndo || _strokeBase != null;
+
+  /// 与 [hasUndo] 等价的显式命名（工具栏/菜单读这个）。
+  bool get canUndo => hasUndo;
+
+  /// 进行中的笔画尚未提交，此时不提供重做。
+  bool get canRedo => _strokeBase == null && _history.canRedo;
+
+  int get undoDepth => _history.undoDepth;
+  int get redoDepth => _history.redoDepth;
+
+  /// 下一次撤销的动作名；没有可撤销事务时为 null。
+  String? get lastActionLabel => _history.undoLabel;
 
   void beginStroke() {
     if (_strokeBase != null) return;
-    _strokeBase = _timetable;
+    _strokeBase = timetable;
+    _strokeLabel = '编辑时间表';
   }
 
-  /// 把当前周表替换掉（例如切换“每周重复”或导航后重建），不进入撤销栈。
+  /// 把当前周表替换掉（例如切换“每周重复”或导航后重建），不进入撤销栈，
+  /// 并清空撤销/重做历史。
   void reset(Timetable next) {
     _strokeBase = null;
-    _undo.clear();
-    _timetable = next;
+    _history.markApplied(next);
   }
 
   void paintSlots({
@@ -1465,24 +2058,43 @@ class TimetableDraft {
     String? reservationId,
   }) {
     if (_strokeBase == null) beginStroke();
-    _timetable = _timetable.paintSlots(
+    final sorted = slots
+        .where((s) => s >= 0 && s < kTimetableSlotsPerDay)
+        .toSet()
+        .toList()
+      ..sort();
+    if (sorted.isEmpty) return;
+    _strokeLabel = '绘制${state.label} '
+        '${WallClockRange.formatMinute(sorted.first * kTimetableSlotMinutes)}-'
+        '${WallClockRange.formatMinute((sorted.last + 1) * kTimetableSlotMinutes)}';
+    _history.setPresent(_history.timetable!.paintSlots(
       date: date,
       weekday: weekday,
-      slots: slots,
+      slots: sorted,
       state: state,
       origin: origin,
       title: title,
       taskId: taskId,
       reservationId: reservationId,
-    );
+    ));
   }
 
   void eraseSlots({String? date, int? weekday, required Iterable<int> slots}) {
     if (_strokeBase == null) beginStroke();
     // 右键的语义是“恢复可用”，不是“删掉覆盖后让下层灰块回来”。
     // 因此显式写一条 free 规则；这样默认休息格被擦除后重启仍是白的。
-    for (final slot in slots) {
-      _timetable = _timetable.paint(
+    final sorted = slots
+        .where((s) => s >= 0 && s < kTimetableSlotsPerDay)
+        .toSet()
+        .toList()
+      ..sort();
+    if (sorted.isEmpty) return;
+    _strokeLabel = '擦除 '
+        '${WallClockRange.formatMinute(sorted.first * kTimetableSlotMinutes)}-'
+        '${WallClockRange.formatMinute((sorted.last + 1) * kTimetableSlotMinutes)}';
+    var next = _history.timetable!;
+    for (final slot in sorted) {
+      next = next.paint(
         date: date,
         weekday: weekday,
         start: slot * kTimetableSlotMinutes,
@@ -1492,22 +2104,24 @@ class TimetableDraft {
         title: '手动可用',
       );
     }
+    _history.setPresent(next);
   }
 
   void endStroke() {
     final before = _strokeBase;
     _strokeBase = null;
     if (before == null) return;
-    if (!_sameTimetable(before, _timetable)) {
-      _undo.add(before);
-      if (_undo.length > 100) _undo.removeAt(0);
-    }
+    _history.record(TimetableTransaction(
+      label: _strokeLabel,
+      before: before,
+      after: _history.timetable!,
+    ));
   }
 
   void cancelStroke() {
     final before = _strokeBase;
     _strokeBase = null;
-    if (before != null) _timetable = before;
+    if (before != null) _history.setPresent(before);
   }
 
   bool undo() {
@@ -1515,17 +2129,39 @@ class TimetableDraft {
       cancelStroke();
       return true;
     }
-    if (_undo.isEmpty) return false;
-    _timetable = _undo.removeLast();
-    return true;
+    return _history.undo() != null;
   }
 
-  /// 只有提交成功后才调用：已提交状态成为新的撤销基线。
+  /// 重做一笔；进行中的笔画未提交时返回 false（不丢弃用户正在画的内容）。
+  bool redo() {
+    if (_strokeBase != null) return false;
+    return _history.redo() != null;
+  }
+
+  /// 记录一笔非笔画事务（跨日、批量复制、批量绑定等），返回是否真的入栈。
+  ///
+  /// 内部 `before = 当前时间表`、`after = next`；业务数据相同（忽略 revision）时
+  /// 不入栈、不清空 redo，返回 false；有真实变化才清空 redo 并返回 true。调用方
+  /// 可据此决定是否提示“无修改”，不要凭“调用过”就声称产生了撤销记录。
+  /// 若此时还有未提交的笔画，它会被并入这一笔，不会额外多出一条历史。
+  bool recordTransaction(
+    Timetable next, {
+    required String label,
+    Set<String> affectedDates = const <String>{},
+  }) {
+    _strokeBase = null;
+    final before = _history.timetable!;
+    return _history.record(TimetableTransaction(
+      label: label,
+      before: before,
+      after: next,
+      affectedDates: affectedDates,
+    ));
+  }
+
+  /// 只有提交成功后才调用：已提交状态成为新的撤销基线，清空两栈。
   void markApplied() {
     _strokeBase = null;
-    _undo.clear();
+    _history.markApplied(_history.timetable!);
   }
-
-  static bool _sameTimetable(Timetable a, Timetable b) =>
-      jsonEncode(a.toJson()) == jsonEncode(b.toJson());
 }

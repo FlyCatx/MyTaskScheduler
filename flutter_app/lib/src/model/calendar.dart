@@ -339,6 +339,15 @@ class CalendarOccupancy {
   /// 0.1.1: 蓝色预留的稳定身份（绑定前后保持不变）。
   final String? reservationId;
 
+  /// 0.2.2: 该占用来自**外部日历**（只读、运行时合成），不是用户手工占用。
+  ///
+  /// 只用于本地解释层（冲突来源显示“外部日历”）；C 协议不读取本字段，外部日历
+  /// 数据也绝不写回会话/版本。旧数据缺失该字段时为 false。
+  final bool external;
+
+  /// 0.2.2: 外部来源 id（仅 [external] 为 true 时有值）。
+  final String? sourceId;
+
   const CalendarOccupancy({
     required this.id,
     required this.title,
@@ -349,6 +358,8 @@ class CalendarOccupancy {
     this.provisional = false,
     this.taskId,
     this.reservationId,
+    this.external = false,
+    this.sourceId,
   });
 
   bool get isWeekly => date == null || date!.isEmpty;
@@ -387,6 +398,9 @@ class CalendarOccupancy {
         'provisional': provisional,
         'taskId': taskId,
         'reservationId': reservationId,
+        // 0.2.2: 只对本地解释层有意义；旧数据缺字段时读回 false/null。
+        'external': external,
+        'sourceId': sourceId,
       };
 
   factory CalendarOccupancy.fromJson(Map<String, dynamic> j) => CalendarOccupancy(
@@ -407,6 +421,10 @@ class CalendarOccupancy {
         reservationId: (j['reservationId'] as String?)?.trim().isEmpty == true
             ? null
             : j['reservationId'] as String?,
+        external: j['external'] == true,
+        sourceId: (j['sourceId'] as String?)?.trim().isEmpty == true
+            ? null
+            : j['sourceId'] as String?,
       );
 }
 

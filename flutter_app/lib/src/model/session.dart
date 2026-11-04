@@ -54,10 +54,16 @@ class ChatMessage {
 class Attachment {
   final String id;
   final String label;
-  final String kind; // text | file
+  final String kind; // text | file | ocr
   final String? originalPath;
   final String text;
   final int byteLength;
+
+  /// 0.2.3（R3-O）：OCR 材料的来源/引擎信息（不含密钥与原始页图）。
+  ///
+  /// 旧数据没有该键 → null；未知来源不伪造。完整页级数据保存在
+  /// `<data>/ocr_materials/<attachmentId>.json`，这里只存摘要与相对路径。
+  final Map<String, dynamic>? provenance;
 
   const Attachment({
     required this.id,
@@ -66,6 +72,7 @@ class Attachment {
     this.originalPath,
     required this.text,
     required this.byteLength,
+    this.provenance,
   });
 
   Map<String, dynamic> toJson() => <String, dynamic>{
@@ -75,6 +82,7 @@ class Attachment {
         'originalPath': originalPath,
         'text': text,
         'byteLength': byteLength,
+        if (provenance != null) 'provenance': provenance,
       };
 
   factory Attachment.fromJson(Map<String, dynamic> j) => Attachment(
@@ -84,7 +92,90 @@ class Attachment {
         originalPath: j['originalPath'] as String?,
         text: (j['text'] as String?) ?? '',
         byteLength: (j['byteLength'] as num?)?.toInt() ?? 0,
+        provenance: j['provenance'] is Map
+            ? Map<String, dynamic>.from(j['provenance'] as Map)
+            : null,
       );
+}
+
+/// 0.2.2: 提交某个计划版本时**实际使用**的外部日历快照引用（历史提示用）。
+///
+/// 只记录指纹与各来源的 id/revision/内容哈希/导入范围；不含任何外部事件标题、
+/// 文件路径或用户隐私。旧版本没有该字段 → null（= 当时未使用外部日历），读取
+/// 不受影响。
+class ExternalCalendarRef {
+  const ExternalCalendarRef({
+    required this.fingerprint,
+    this.sources = const <ExternalCalendarSourceRef>[],
+  });
+
+  /// 提交时的外部日历集合指纹（与请求监听的指纹一致）。
+  final String fingerprint;
+
+  final List<ExternalCalendarSourceRef> sources;
+
+  bool get isEmpty => fingerprint.isEmpty && sources.isEmpty;
+
+  Map<String, dynamic> toJson() => <String, dynamic>{
+        'fingerprint': fingerprint,
+        'sources': sources.map((s) => s.toJson()).toList(growable: false),
+      };
+
+  /// 兼容旧数据：字段缺失或结构不合法时返回 null，绝不猜。
+  static ExternalCalendarRef? fromJson(Object? raw) {
+    if (raw is! Map) return null;
+    final j = Map<String, dynamic>.from(raw);
+    final fingerprint = (j['fingerprint'] as String?)?.trim() ?? '';
+    final sources = <ExternalCalendarSourceRef>[];
+    final rawSources = j['sources'];
+    if (rawSources is List) {
+      for (final item in rawSources) {
+        final source = ExternalCalendarSourceRef.fromJson(item);
+        if (source != null) sources.add(source);
+      }
+    }
+    if (fingerprint.isEmpty && sources.isEmpty) return null;
+    return ExternalCalendarRef(fingerprint: fingerprint, sources: sources);
+  }
+}
+
+/// 0.2.2: 历史版本引用的单个外部来源身份（无标题/路径）。
+class ExternalCalendarSourceRef {
+  const ExternalCalendarSourceRef({
+    required this.id,
+    required this.revision,
+    required this.contentHash,
+    required this.dateFrom,
+    required this.dateTo,
+  });
+
+  final String id;
+  final int revision;
+  final String contentHash;
+  final String dateFrom;
+  final String dateTo;
+
+  Map<String, dynamic> toJson() => <String, dynamic>{
+        'id': id,
+        'revision': revision,
+        'contentHash': contentHash,
+        'dateFrom': dateFrom,
+        'dateTo': dateTo,
+      };
+
+  static ExternalCalendarSourceRef? fromJson(Object? raw) {
+    if (raw is! Map) return null;
+    final j = Map<String, dynamic>.from(raw);
+    final id = (j['id'] as String?)?.trim() ?? '';
+    if (id.isEmpty) return null;
+    return ExternalCalendarSourceRef(
+      id: id,
+      revision: (j['revision'] as num?)?.toInt() ?? 0,
+      contentHash: (j['contentHash'] as String?)?.trim() ?? '',
+      dateFrom: (j['dateFrom'] as String?)?.trim() ?? '',
+      dateTo: (j['dateTo'] as String?)?.trim() ?? '',
+    );
+  }
 }
 
 class PlanVersion {
@@ -127,6 +218,10 @@ class PlanVersion {
   /// so rather than inventing a name.
   final ModelSource? modelSource;
 
+  /// 0.2.2: 生成本版本时使用的（运行时合成）外部日历快照引用。旧版本为 null，
+  /// 表示当时没有启用外部日历；仅用于历史提示，不参与计算。
+  final ExternalCalendarRef? externalCalendarRef;
+
   const PlanVersion({
     required this.id,
     required this.conversationId,
@@ -145,6 +240,7 @@ class PlanVersion {
     this.calendar = const CalendarSchedule(),
     this.timetable,
     this.modelSource,
+    this.externalCalendarRef,
   });
 
   LocalPlan get plan => LocalPlan(summary: summary, tasks: tasks, notes: notes);
@@ -161,6 +257,7 @@ class PlanVersion {
     List<PlanNote>? notes,
     CalendarSchedule? calendar,
     Timetable? timetable,
+    ExternalCalendarRef? externalCalendarRef,
   }) =>
       PlanVersion(
         id: id,
@@ -180,6 +277,7 @@ class PlanVersion {
         calendar: calendar ?? this.calendar,
         timetable: timetable ?? this.timetable,
         modelSource: modelSource,
+        externalCalendarRef: externalCalendarRef ?? this.externalCalendarRef,
       );
 
   Map<String, dynamic> toJson() => <String, dynamic>{
@@ -200,6 +298,8 @@ class PlanVersion {
         'timetable': timetable?.toJson(),
         // Null for older versions; `fromJson` keeps that "unknown" instead of guessing.
         'modelSource': modelSource?.toJson(),
+        // 0.2.2: 历史版本的外部日历引用（旧数据没有该键 → 读回 null）。
+        'externalCalendarRef': externalCalendarRef?.toJson(),
         'tasks': tasks.map((t) {
           // Local-only facts are stored next to the plain task fields: the C core
           // neither needs nor is allowed to decide them.
@@ -250,6 +350,8 @@ class PlanVersion {
           .toList(growable: false),
       calendar: CalendarSchedule.fromJson(j['calendar'], now: DateTime.now()),
       timetable: Timetable.tryParse(j['timetable']),
+      externalCalendarRef:
+          ExternalCalendarRef.fromJson(j['externalCalendarRef']),
     );
   }
 }
@@ -417,6 +519,13 @@ class Conversation {
   /// 是否把已提交的时间表随下一次模型请求发送。移除只影响请求附带项。
   final bool includeTimetable;
 
+  /// 0.2.2: 本会话启用并关联的外部日历来源 id 集合。
+  ///
+  /// 默认空 = 不启用外部日历（0.2.1 旧数据读回空集合，行为完全不变）。来源
+  /// 的启用/内容归全局来源管理；这里只记录“这个会话用哪些来源”。**不继承**：
+  /// 新会话默认为空，复制版本/切换会话都不会自动带上别的会话的来源。
+  final Set<String> externalSourceIds;
+
   const Conversation({
     required this.id,
     required this.title,
@@ -436,6 +545,7 @@ class Conversation {
     this.calendarProposals,
     this.calendarDraft,
     this.includeTimetable = true,
+    this.externalSourceIds = const <String>{},
   }) : activityAt = activityAt ?? updatedAt;
 
   String get generatedTitle {
@@ -486,6 +596,8 @@ class Conversation {
     Timetable? calendarDraft,
     bool clearCalendarDraft = false,
     bool? includeTimetable,
+    Set<String>? externalSourceIds,
+    bool clearExternalSourceIds = false,
   }) =>
       Conversation(
         id: id,
@@ -513,6 +625,9 @@ class Conversation {
         calendarDraft:
             clearCalendarDraft ? null : (calendarDraft ?? this.calendarDraft),
         includeTimetable: includeTimetable ?? this.includeTimetable,
+        externalSourceIds: clearExternalSourceIds
+            ? const <String>{}
+            : (externalSourceIds ?? this.externalSourceIds),
       );
 
   Map<String, dynamic> toJson() => <String, dynamic>{
@@ -531,6 +646,8 @@ class Conversation {
         'calendarProposals': calendarProposals?.toJson(),
         'calendarDraft': calendarDraft?.toJson(),
         'includeTimetable': includeTimetable,
+        // 0.2.2: 会话级外部日历关联；空集合 = 不启用（旧数据缺键时的默认）。
+        'externalSourceIds': (externalSourceIds.toList()..sort()),
         'pendingRequest': pendingRequest?.toJson(),
         'messages': messages.map((m) => m.toJson()).toList(growable: false),
         'attachments': attachments.map((a) => a.toJson()).toList(growable: false),
@@ -572,7 +689,20 @@ class Conversation {
       calendarProposals: CalendarProposalSet.fromJson(j['calendarProposals']),
       calendarDraft: Timetable.tryParse(j['calendarDraft']),
       includeTimetable: j['includeTimetable'] != false,
+      externalSourceIds: _externalSourceIdsFromJson(j['externalSourceIds']),
     );
+  }
+
+  /// 读回会话级外部来源 id；缺失/非法条目被忽略（旧数据 = 不启用）。
+  static Set<String> _externalSourceIdsFromJson(Object? raw) {
+    if (raw is! List) return const <String>{};
+    final out = <String>{};
+    for (final item in raw) {
+      if (item is! String) continue;
+      final id = item.trim();
+      if (id.isNotEmpty) out.add(id);
+    }
+    return out.isEmpty ? const <String>{} : Set<String>.unmodifiable(out);
   }
 }
 
