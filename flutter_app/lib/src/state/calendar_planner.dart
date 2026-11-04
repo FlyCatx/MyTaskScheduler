@@ -307,6 +307,11 @@ String describeUnavailable(
         dayStart.add(Duration(minutes: r.endMinute)),
       );
       if (blocked.overlaps(interval)) {
+        // 外部日历是只读来源：说清楚它不会被程序改动，避免用户以为可以在这里删除。
+        if (o.external) {
+          return '外部日历占用 ${WallClockRange.format(r)}'
+              '（只读外部忙碌，程序不会自动移动或删除）';
+        }
         return '${o.kindLabel}「${o.title}」占用 ${WallClockRange.format(r)}';
       }
     }
@@ -344,6 +349,68 @@ extension ConflictKindLabel on ConflictKind {
       };
 }
 
+/// 冲突的结构化来源：解释层用它说明“这条冲突是为什么出现的”。
+///
+/// 这是一个**旁路**字段：不参与既有的 [CalendarConflict.message] 展示，也不改变
+/// “允许保存冲突、不自动顺延其他任务”的产品策略。它区分“用户时间表造成的不可用”
+/// 与“程序可以给出建议的移动/拆分”，供本文件之外的解释层与建议层使用。
+enum ConflictSource {
+  /// 时间表里的课程/活动/休息占用。
+  userOccupancy,
+
+  /// 周可用范围外、日期关闭、规划范围外等“默认不可用”。
+  defaultUnavailable,
+
+  /// 其他任务已经占住的时间（已绑定的任务预留/已排片段）。
+  taskReservation,
+
+  /// 未绑定任务的蓝色预留：只占容量，不属于任何任务。
+  taskReservationUnbound,
+
+  /// 只读外部日历（ICS 导入）造成的忙碌。
+  ///
+  /// 外部事件在本程序里只读：解释层必须说明“来自只读外部日历，不会自动移动”，
+  /// 建议只能落在用户自己的安排/时间表一侧（或停用/更新该外部来源）。
+  externalCalendar,
+
+  /// 任务之间的前后依赖顺序。
+  dependency,
+
+  /// 超过截止时间。
+  deadline,
+
+  /// 规划范围内可用容量不足（例如片段超出规划范围）。
+  capacity,
+
+  /// 同一任务的两个片段互相重叠。
+  selfOverlap,
+}
+
+extension ConflictSourceLabel on ConflictSource {
+  String get label => switch (this) {
+        ConflictSource.userOccupancy => '用户占用',
+        ConflictSource.defaultUnavailable => '默认不可用',
+        ConflictSource.taskReservation => '任务预留',
+        ConflictSource.taskReservationUnbound => '未绑定预留',
+        ConflictSource.externalCalendar => '外部日历',
+        ConflictSource.dependency => '前置依赖',
+        ConflictSource.deadline => '截止时间',
+        ConflictSource.capacity => '容量不足',
+        ConflictSource.selfOverlap => '自身重叠',
+      };
+
+  /// 这类来源只能由用户在时间表/任务上明确调整，程序不得自动挪动或删除。
+  bool get requiresUserAction => switch (this) {
+        ConflictSource.userOccupancy ||
+        ConflictSource.defaultUnavailable ||
+        ConflictSource.taskReservation ||
+        ConflictSource.taskReservationUnbound ||
+        ConflictSource.externalCalendar =>
+          true,
+        _ => false,
+      };
+}
+
 /// One detected problem. These are *allowed* to exist — the user explicitly chose
 /// "允许保存冲突，但必须可见" — so they never block a save; they are listed and marked.
 class CalendarConflict {
@@ -355,6 +422,10 @@ class CalendarConflict {
   final DateTime end;
   final String message;
 
+  /// 结构化来源判定（旁路，不参与 [message]）。旧调用方/手工构造时可为 null，
+  /// 此时解释层可用 [conflictSourceOf] 重新判定。
+  final ConflictSource? source;
+
   const CalendarConflict({
     required this.kind,
     required this.taskId,
@@ -363,10 +434,106 @@ class CalendarConflict {
     required this.message,
     this.otherTaskId,
     this.segmentId,
+    this.source,
   });
 
   @override
   String toString() => '$kind($taskId): $message';
+}
+
+/// 判定一条冲突的结构化来源。已带 [CalendarConflict.source] 时原样返回；
+/// 否则按 [schedule] 的同一份设置快照重新判定（不修改任何数据）。
+ConflictSource conflictSourceOf(
+  CalendarConflict conflict, {
+  required CalendarSchedule schedule,
+  CalendarSettings? settings,
+}) {
+  final carried = conflict.source;
+  if (carried != null) return carried;
+  final effective = settings ?? schedule.settings;
+  final clock = effective.clock;
+  switch (conflict.kind) {
+    case ConflictKind.selfOverlap:
+      return ConflictSource.selfOverlap;
+    case ConflictKind.taskOverlap:
+      return ConflictSource.taskReservation;
+    case ConflictKind.dependencyOrder:
+    case ConflictKind.uncertainDependency:
+      return ConflictSource.dependency;
+    case ConflictKind.pastDeadline:
+      return ConflictSource.deadline;
+    case ConflictKind.outsideRange:
+      return ConflictSource.capacity;
+    case ConflictKind.unavailable:
+      return _unavailableSource(
+        effective,
+        clock,
+        TimeInterval(conflict.start, conflict.end),
+      );
+  }
+}
+
+/// 解释一个“不可用区间”到底是被什么挡住的（同 [CalendarSettings] 快照）。
+ConflictSource _unavailableSource(
+  CalendarSettings settings,
+  WallClock clock,
+  TimeInterval gap,
+) {
+  final blocker = occupancyBlockingInterval(settings, gap);
+  if (blocker != null) {
+    if (blocker.external) return ConflictSource.externalCalendar;
+    if (blocker.taskId != null && blocker.taskId!.isNotEmpty) {
+      return ConflictSource.taskReservation;
+    }
+    if ((blocker.reservationId != null &&
+            blocker.reservationId!.isNotEmpty) ||
+        _looksLikeUnboundReservation(blocker)) {
+      return ConflictSource.taskReservationUnbound;
+    }
+    return ConflictSource.userOccupancy;
+  }
+  return ConflictSource.defaultUnavailable;
+}
+
+/// 命中 [interval] 的具体占用（与 [describeUnavailable] 的检查顺序一致）。
+///
+/// 返回 null 表示该区间属于“默认不可用”（日期闭日、该星期没有可用范围，或
+/// 根本没有占用与之重叠），而不是某一条具体占用。外部日历占用带
+/// `external == true` 与 `sourceId`，解释层据此显示“外部日历”来源。
+CalendarOccupancy? occupancyBlockingInterval(
+  CalendarSettings settings,
+  TimeInterval interval,
+) {
+  final clock = settings.clock;
+  final dateKey = clock.dateKey(interval.start);
+  for (final e in settings.exceptions) {
+    if (e.date == dateKey && e.closed) return null;
+  }
+  final wall = clock.toWall(interval.start);
+  if (settings.weekly.forWeekday(wall.weekday).isEmpty) return null;
+  final dayStart = clock.dayStartUtc(interval.start);
+  for (final o in settings.occupancies) {
+    final matches =
+        o.isWeekly ? o.weekday == wall.weekday : o.date == dateKey;
+    if (!matches) continue;
+    for (final r in o.ranges) {
+      if (!r.isValid) continue;
+      final blocked = TimeInterval(
+        dayStart.add(Duration(minutes: r.startMinute)),
+        dayStart.add(Duration(minutes: r.endMinute)),
+      );
+      if (blocked.overlaps(interval)) return o;
+    }
+  }
+  return null;
+}
+
+/// 未绑定的蓝色预留由 `Timetable.toCalendarSettings` 转成一条 `activity` 占用，
+/// 标题缺省为「任务预留」；它没有 taskId/reservationId，因此仍可被识别出来。
+bool _looksLikeUnboundReservation(CalendarOccupancy o) {
+  if (o.taskId != null && o.taskId!.isNotEmpty) return false;
+  if (o.reservationId != null && o.reservationId!.isNotEmpty) return false;
+  return o.title.trim().startsWith('任务预留');
 }
 
 String formatDurationMinutes(int minutes) {
@@ -427,6 +594,9 @@ List<CalendarConflict> detectConflicts({
                 '${formatDurationMinutes(overlap.minutes)}'
             : '${nameOf(a.taskId)} 与 ${nameOf(b.taskId)} 重叠 '
                 '${formatDurationMinutes(overlap.minutes)}',
+        source: sameTask
+            ? ConflictSource.selfOverlap
+            : ConflictSource.taskReservation,
       ));
     }
   }
@@ -446,6 +616,7 @@ List<CalendarConflict> detectConflicts({
         end: gap.end,
         message: '${nameOf(s.taskId)} 落在不可用时段：'
             '${describeUnavailable(settings, gap)}',
+        source: _unavailableSource(settings, clock, gap),
       ));
     }
     if (s.start.isBefore(settings.startInstant) ||
@@ -458,6 +629,7 @@ List<CalendarConflict> detectConflicts({
         end: s.end,
         message: '${nameOf(s.taskId)} 超出规划范围 '
             '${settings.planningStartDate} 起 ${settings.planningDays} 天',
+        source: ConflictSource.capacity,
       ));
     }
   }
@@ -485,6 +657,7 @@ List<CalendarConflict> detectConflicts({
             end: own.first.end,
             message: '${nameOf(task.id)} 的前置 ${nameOf(depId)} 尚未安排，'
                 '这里的时间只是暂定',
+            source: ConflictSource.dependency,
           ));
         }
         continue;
@@ -499,6 +672,7 @@ List<CalendarConflict> detectConflicts({
           start: first,
           end: depEnd.isBefore(last) ? depEnd : last,
           message: '${nameOf(task.id)} 在前置 ${nameOf(depId)} 完成前就开始了',
+          source: ConflictSource.dependency,
         ));
       }
     }
@@ -513,6 +687,7 @@ List<CalendarConflict> detectConflicts({
         end: last,
         message: '${nameOf(task.id)} 的安排晚于截止 '
             '${_formatInstant(deadline.at!, clock)}',
+        source: ConflictSource.deadline,
       ));
     }
   }

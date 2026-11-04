@@ -25,8 +25,11 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import '../model/external_calendar.dart' show kExternalCalendarDirName;
 import '../model/session.dart';
 import '../model/settings.dart';
+import 'execution/execution_ledger.dart';
+import 'execution/execution_store.dart';
 import 'session_repository.dart';
 import 'settings_controller.dart';
 import 'settings_store.dart';
@@ -69,6 +72,10 @@ class BackupRestoreResult {
     this.conflictConversationIds = const <String>[],
     this.sessionsReloaded = false,
     this.requiresRestart = false,
+    this.externalCalendarFileCount = 0,
+    this.restoredExternalCalendarFileCount = 0,
+    this.executionRecordCount = 0,
+    this.restoredExecutionRecordCount = 0,
   });
 
   final bool ok;
@@ -125,6 +132,19 @@ class BackupRestoreResult {
   /// callback was available, or the preferences could not be re-read in this run).
   final bool requiresRestart;
 
+  /// 备份文件里包含的外部日历文件数（`<root>/external_calendar/` 下的文件）。
+  final int externalCalendarFileCount;
+
+  /// 实际写入的外部日历文件数（内容相同的会被跳过）。
+  final int restoredExternalCalendarFileCount;
+
+  /// 0.2.3（R3-E）：备份中包含/实际合并的执行记录条数。
+  ///
+  /// 同一份备份重复恢复时 [restoredExecutionRecordCount] 为 0 —— 记录已在本地，
+  /// 按 recordId 幂等跳过，不会重复累计。
+  final int executionRecordCount;
+  final int restoredExecutionRecordCount;
+
   /// True only when no file was replaced, or every replaced file was verifiably put
   /// back. An empty rollback list after a partially attempted commit is *not* proof of
   /// "unchanged".
@@ -137,6 +157,8 @@ class BackupRestoreResult {
     if (!ok) return error ?? '恢复失败';
     final applied = <String>[
       if (restoredConversationCount > 0) '$restoredConversationCount 个会话',
+      if (restoredExternalCalendarFileCount > 0)
+        '$restoredExternalCalendarFileCount 个外部日历文件',
       if (restoredPrefs) '应用偏好',
       if (restoredProfileCount > 0)
         '$restoredProfileCount 个模型连接（密钥需重新输入）',
@@ -267,13 +289,24 @@ class BackupService {
     required this.root,
     this.settings,
     SettingsStore? settingsStore,
+    this.execution,
     this.maxImportBytesLimit = maxImportBytes,
     this.isBusy,
     this.reloadSessions,
+    this.reloadExternalCalendar,
   }) : settingsStore = settingsStore ?? SettingsStore(root);
 
   /// Backup schema version written by this build.
   static const int schemaVersion = 1;
+
+  /// 外部日历数据目录名：`<root>/external_calendar/`。
+  ///
+  /// 备份把它作为**数据**一起保存（base64 文件内容），恢复后不依赖原 .ics 文件；
+  /// 外部日历快照本身已经包含标准化事件时间，所以重新导入源文件并不必要。
+  static const String externalCalendarDirectoryName = kExternalCalendarDirName;
+
+  /// 外部日历在备份文档里的结构版本。
+  static const int externalCalendarSchemaVersion = 1;
 
   /// Hard limit for an import file (a backup is text; 32 MB is generous). Overridable
   /// through [maxImportBytesLimit] so tests do not have to write 32 MB.
@@ -302,6 +335,13 @@ class BackupService {
   final SettingsController? settings;
   final SettingsStore settingsStore;
 
+  /// 执行计时账本（0.2.3 R3-E）。可空 = 本次运行未启用执行计时：
+  /// 备份里不带执行记录，恢复时如实提示，而不是假装已经恢复。
+  ///
+  /// 必须复用运行中的 [ExecutionStore]（它持有实例写锁）；另外 new 一个同目录的
+  /// store 会变成只读实例，无法合并。
+  final ExecutionStore? execution;
+
   /// Reports whether an analysis is in progress. A restore while a request is running
   /// could replace conversations the request is about to commit into, so it is refused
   /// before any file is touched. Defaults to "not busy".
@@ -311,6 +351,9 @@ class BackupService {
   /// throws) the result reports [BackupRestoreResult.requiresRestart] instead of claiming
   /// that the UI is up to date.
   final Future<void> Function()? reloadSessions;
+
+  /// 恢复外部日历文件后让内存里的服务重新加载。缺失时可报告“重启后生效”。
+  final Future<void> Function()? reloadExternalCalendar;
 
   static const Set<String> _sensitiveKeys = <String>{
     'apikey',
@@ -355,6 +398,14 @@ class BackupService {
   File _stagedFile(String name) =>
       File('${restoreStagingDirectory.path}${Platform.pathSeparator}$name');
 
+  /// `<root>/external_calendar/`（外部日历快照目录，由 ExternalCalendarStore 写入）。
+  Directory get externalCalendarDirectory => Directory(
+      '${root.path}${Platform.pathSeparator}$externalCalendarDirectoryName');
+
+  File _externalCalendarFile(String relativePosix) => File(
+      '${externalCalendarDirectory.path}${Platform.pathSeparator}'
+      '${relativePosix.replaceAll('/', Platform.pathSeparator)}');
+
   // --------------------------------------------------------------- export
 
   /// Writes one key-less backup JSON to [path].
@@ -365,6 +416,7 @@ class BackupService {
       final conversation = await store.loadConversation(summary.id);
       if (conversation != null) conversations.add(conversation.toJson());
     }
+    final externalCalendarFiles = await _readExternalCalendarFiles();
     final controller = settings;
     AppPreferences prefs;
     List<ProviderProfile> profiles;
@@ -385,6 +437,11 @@ class BackupService {
       'index': index.map((s) => _scrub(s.toJson())).toList(growable: false),
       'conversations':
           conversations.map((c) => _scrub(c) as Map<String, dynamic>).toList(growable: false),
+      // 外部日历：保存标准化后的来源/快照文件本身（base64），恢复后不依赖原 .ics。
+      'externalCalendar': <String, dynamic>{
+        'schemaVersion': externalCalendarSchemaVersion,
+        'files': externalCalendarFiles,
+      },
       'settings': <String, dynamic>{
         'schemaVersion': SettingsSnapshot.profilesSchemaVersion,
         'defaultProfileId': selection?.profileId ?? '',
@@ -397,6 +454,9 @@ class BackupService {
             .toList(growable: false),
         'note': 'API Key 保存在 Windows 凭据管理器，备份中不含密钥',
       },
+      // 0.2.3（R3-E）：执行记录单独一段。不含活动计时检查点（恢复时不会自动继续计时），
+      // 也不含任何材料原文/密钥；恢复按 recordId 幂等合并。
+      'executionLedger': execution?.ledger.toJson(),
     };
     final payload = const JsonEncoder.withIndent('  ').convert(document);
     final target = File(path);
@@ -424,6 +484,69 @@ class BackupService {
       conversationCount: conversations.length,
       profileCount: profiles.length,
       byteLength: utf8.encode(payload).length,
+    );
+  }
+
+  // -------------------------------------------------------- external calendar
+
+  /// 读取 `<root>/external_calendar/` 下的所有文件（相对路径 + base64 内容）。
+  ///
+  /// 只读取该目录内的普通文件；符号链接不跟随。读取失败时明确报错，绝不静默
+  /// 导出一份缺了外部日历的“成功”备份。
+  Future<List<Map<String, dynamic>>> _readExternalCalendarFiles() async {
+    final dir = externalCalendarDirectory;
+    final out = <Map<String, dynamic>>[];
+    try {
+      if (!await dir.exists()) return out;
+      await for (final entity in dir.list(recursive: true, followLinks: false)) {
+        if (entity is! File) continue;
+        final relative = _relativeInside(dir, entity);
+        if (relative == null) continue;
+        out.add(<String, dynamic>{
+          'path': relative,
+          'content': base64Encode(await entity.readAsBytes()),
+        });
+      }
+    } catch (e) {
+      throw BackupException('读取外部日历数据失败：${_shortError(e)}');
+    }
+    out.sort(
+        (a, b) => (a['path'] as String).compareTo(b['path'] as String));
+    return out;
+  }
+
+  /// 计划外部日历恢复：只有在本地不存在同名文件（或内容相同）时才写入。
+  ///
+  /// 本地已有**不同内容**的外部日历文件时不覆盖（与“恢复不静默覆盖会话”同一
+  /// 原则）：返回冲突列表，由调用方作为 warning 报告并保持本地数据不变。
+  Future<_ExternalCalendarRestorePlan> _planExternalCalendarRestore(
+      List<_ExternalCalendarBackupFile> files) async {
+    if (files.isEmpty) return const _ExternalCalendarRestorePlan();
+    final toWrite = <_ExternalCalendarBackupFile>[];
+    final conflicts = <String>[];
+    for (final file in files) {
+      final target = _externalCalendarFile(file.relativePath);
+      if (!await target.exists()) {
+        toWrite.add(file);
+        continue;
+      }
+      try {
+        final existing = await target.readAsBytes();
+        if (_sameBytes(existing, file.bytes)) continue;
+        conflicts.add(file.relativePath);
+      } catch (_) {
+        conflicts.add(file.relativePath);
+      }
+    }
+    if (conflicts.isNotEmpty) {
+      return _ExternalCalendarRestorePlan(
+        conflicts: List<String>.unmodifiable(conflicts),
+        total: files.length,
+      );
+    }
+    return _ExternalCalendarRestorePlan(
+      toWrite: List<_ExternalCalendarBackupFile>.unmodifiable(toWrite),
+      total: files.length,
     );
   }
 
@@ -531,6 +654,8 @@ class BackupService {
     final toWrite = parsed.conversations
         .where((c) => !identicalIds.contains(c.id))
         .toList(growable: false);
+    final externalPlan =
+        await _planExternalCalendarRestore(parsed.externalCalendarFiles);
     final localIndex = await store.loadIndex();
     final mergedIndex = <ConversationSummary>[
       ...parsed.index,
@@ -553,6 +678,15 @@ class BackupService {
             flush: true);
         staged.add(_StagedFile(
             tmp: tmp, target: _conversationFile(conversation.id)));
+      }
+      for (var i = 0; i < externalPlan.toWrite.length; i++) {
+        final external = externalPlan.toWrite[i];
+        final tmp = _stagedFile('tsc-restore-external-$i.bin');
+        await tmp.writeAsBytes(external.bytes, flush: true);
+        staged.add(_StagedFile(
+          tmp: tmp,
+          target: _externalCalendarFile(external.relativePath),
+        ));
       }
       if (indexChanged) {
         final indexTmp = _stagedFile('tsc-restore-index.json');
@@ -594,6 +728,7 @@ class BackupService {
     try {
       for (final item in staged) {
         File? backup;
+        await item.target.parent.create(recursive: true);
         if (await item.target.exists()) {
           backup = File('${item.target.path}.bak');
           if (await backup.exists()) await backup.delete();
@@ -669,9 +804,49 @@ class BackupService {
         }
       }
     }
-    final requiresRestart =
-        (parsed.conversations.isNotEmpty && !sessionsReloaded) ||
-            ((parsed.prefs != null && prefsToWrite) && !prefsReloaded);
+
+    // 外部日历文件已经写入磁盘；让内存里的服务重新加载，否则界面仍旧是旧来源。
+    var restoredExternalFiles = 0;
+    if (externalPlan.conflicts.isNotEmpty) {
+      warnings.add('本地已有不同的外部日历数据（${externalPlan.conflicts.length} 个文件），'
+          '为避免覆盖未恢复；如需替换请先导出/删除本地外部日历');
+    } else if (externalPlan.toWrite.isNotEmpty) {
+      restoredExternalFiles = externalPlan.toWrite.length;
+      final reload = reloadExternalCalendar;
+      if (reload != null) {
+        try {
+          await reload();
+        } catch (e) {
+          warnings.add('外部日历已恢复，但重新加载失败：${_shortError(e)}');
+        }
+      } else {
+        warnings.add('外部日历数据已恢复，重启后生效');
+      }
+    }
+
+    final requiresRestart = (parsed.conversations.isNotEmpty && !sessionsReloaded) ||
+        ((parsed.prefs != null && prefsToWrite) && !prefsReloaded) ||
+        (externalPlan.toWrite.isNotEmpty && reloadExternalCalendar == null);
+
+    // 0.2.3（R3-E）：合并执行记录。按 recordId 幂等去重，重复恢复不重复累计；
+    // 已存在的本地记录一律保留（不覆盖）。合并失败只作为 warning，不影响会话恢复。
+    var restoredExecutionRecords = 0;
+    final importedLedger = parsed.executionLedger;
+    if (importedLedger != null) {
+      final executionStore = execution;
+      if (executionStore == null) {
+        warnings.add('备份包含执行记录，但本次运行未启用执行计时，未合并执行记录');
+      } else {
+        try {
+          final merge = await executionStore.mergeRestored(importedLedger);
+          restoredExecutionRecords = merge.addedRecords;
+        } on ExecutionReadOnlyException catch (e) {
+          warnings.add('执行记录未合并：${e.message}');
+        } catch (e) {
+          warnings.add('执行记录合并失败：${_shortError(e)}');
+        }
+      }
+    }
 
     return BackupRestoreResult(
       ok: true,
@@ -683,6 +858,10 @@ class BackupService {
       prefsReloaded: prefsReloaded,
       profileCount: parsed.profiles.length,
       restoredProfileCount: restoredProfiles,
+      externalCalendarFileCount: parsed.externalCalendarFiles.length,
+      restoredExternalCalendarFileCount: restoredExternalFiles,
+      executionRecordCount: importedLedger?.records.length ?? 0,
+      restoredExecutionRecordCount: restoredExecutionRecords,
       backupPaths: committed
           .where((c) => c.promoted && c.backup != null)
           .map((c) => c.backup!.path)
@@ -1093,7 +1272,84 @@ class BackupService {
       profiles: profiles,
       defaultProfileId: defaultProfileId,
       defaultModelId: defaultModelId,
+      externalCalendarFiles:
+          _parseExternalCalendarFiles(decoded['externalCalendar']),
+      executionLedger: _parseExecutionLedger(decoded['executionLedger']),
     );
+  }
+
+  /// 解析备份里的执行记录段；旧备份/未启用计时的备份没有该键 → null（不合并）。
+  ExecutionLedger? _parseExecutionLedger(Object? raw) {
+    if (raw == null) return null;
+    if (raw is! Map) {
+      throw BackupException('备份文件的执行记录结构不正确，已拒绝导入');
+    }
+    final map = Map<String, dynamic>.from(raw);
+    // 严格校验结构：坏条目不能悄悄丢掉（否则会得到一份"看起来恢复成功"的残缺账本）。
+    for (final key in <String>['records', 'completionEvents']) {
+      final value = map[key];
+      if (value == null) continue;
+      if (value is! List) {
+        throw BackupException('备份文件的执行记录结构不正确（$key 不是列表），已拒绝导入');
+      }
+      for (final item in value) {
+        if (item is! Map) {
+          throw BackupException('备份文件的执行记录结构不正确（$key 存在非对象条目），已拒绝导入');
+        }
+      }
+    }
+    try {
+      return ExecutionLedger.fromJson(map);
+    } catch (e) {
+      throw BackupException('备份文件的执行记录无法解析：${_shortError(e)}');
+    }
+  }
+
+  /// 解析备份文档里的外部日历段；旧备份没有该键 → 空列表（不恢复外部日历）。
+  List<_ExternalCalendarBackupFile> _parseExternalCalendarFiles(Object? raw) {
+    if (raw == null) return const <_ExternalCalendarBackupFile>[];
+    if (raw is! Map) {
+      throw BackupException('备份文件的外部日历结构不正确，已拒绝导入');
+    }
+    final j = Map<String, dynamic>.from(raw);
+    final version = (j['schemaVersion'] as num?)?.toInt() ?? 0;
+    if (version != externalCalendarSchemaVersion) {
+      throw BackupException('备份文件的外部日历版本不受支持'
+          '（schemaVersion=$version，本程序支持 $externalCalendarSchemaVersion）');
+    }
+    final rawFiles = j['files'];
+    if (rawFiles == null) return const <_ExternalCalendarBackupFile>[];
+    if (rawFiles is! List) {
+      throw BackupException('备份文件的外部日历文件列表结构不正确，已拒绝导入');
+    }
+    final out = <_ExternalCalendarBackupFile>[];
+    final seen = <String>{};
+    for (final item in rawFiles) {
+      if (item is! Map) {
+        throw BackupException('备份文件的外部日历条目结构不正确，已拒绝导入');
+      }
+      final entry = Map<String, dynamic>.from(item);
+      final path = entry['path'];
+      final content = entry['content'];
+      if (path is! String || content is! String) {
+        throw BackupException('备份文件的外部日历条目缺少路径或内容，已拒绝导入');
+      }
+      final relative = _safeRelativePath(path);
+      if (relative == null) {
+        throw BackupException('备份文件的外部日历路径不合法：$path');
+      }
+      if (!seen.add(relative)) {
+        throw BackupException('备份文件中存在重复的外部日历路径：$relative');
+      }
+      List<int> bytes;
+      try {
+        bytes = base64Decode(content);
+      } catch (_) {
+        throw BackupException('备份文件的外部日历内容损坏：$relative');
+      }
+      out.add(_ExternalCalendarBackupFile(relative, bytes));
+    }
+    return List<_ExternalCalendarBackupFile>.unmodifiable(out);
   }
 
   // ------------------------------------------------------------ internals
@@ -1208,6 +1464,38 @@ class BackupService {
     return segments.isEmpty ? path : segments.last;
   }
 
+  /// 备份/恢复只接受目录内的相对路径：拒绝绝对路径、盘符和 `..`。
+  static String? _safeRelativePath(String raw) {
+    final normalized = raw.replaceAll('\\', '/');
+    if (normalized.isEmpty || normalized.length > 512) return null;
+    if (normalized.startsWith('/') || normalized.contains(':')) return null;
+    final segments = normalized.split('/');
+    for (final segment in segments) {
+      if (segment.isEmpty || segment == '.' || segment == '..') return null;
+    }
+    return normalized;
+  }
+
+  /// `<root>/external_calendar/` 内的文件 → 相对路径（posix 分隔符）；不在目录内返回 null。
+  static String? _relativeInside(Directory dir, File file) {
+    final base = dir.path.endsWith(Platform.pathSeparator)
+        ? dir.path
+        : '${dir.path}${Platform.pathSeparator}';
+    if (!file.path.startsWith(base)) return null;
+    final relative = file.path
+        .substring(base.length)
+        .replaceAll(Platform.pathSeparator, '/');
+    return _safeRelativePath(relative);
+  }
+
+  static bool _sameBytes(List<int> a, List<int> b) {
+    if (a.length != b.length) return false;
+    for (var i = 0; i < a.length; i++) {
+      if (a[i] != b[i]) return false;
+    }
+    return true;
+  }
+
   static String _shortError(Object e) {
     final text = e.toString();
     return text.length > 180 ? '${text.substring(0, 180)}…' : text;
@@ -1255,6 +1543,8 @@ class _ParsedBackup {
     required this.profiles,
     this.defaultProfileId = '',
     this.defaultModelId = '',
+    this.externalCalendarFiles = const <_ExternalCalendarBackupFile>[],
+    this.executionLedger,
   });
 
   final List<Conversation> conversations;
@@ -1263,6 +1553,33 @@ class _ParsedBackup {
   final List<ProviderProfile> profiles;
   final String defaultProfileId;
   final String defaultModelId;
+
+  /// 备份文档里的外部日历文件（相对路径 + 原始字节）。
+  final List<_ExternalCalendarBackupFile> externalCalendarFiles;
+
+  /// 0.2.3（R3-E）：备份文档里的执行记录账本；旧备份没有该键 → null（不合并）。
+  final ExecutionLedger? executionLedger;
+}
+
+/// 备份/恢复中的一个外部日历文件（路径为 `<root>/external_calendar/` 下的相对路径）。
+class _ExternalCalendarBackupFile {
+  const _ExternalCalendarBackupFile(this.relativePath, this.bytes);
+
+  final String relativePath;
+  final List<int> bytes;
+}
+
+/// 外部日历恢复计划：要么写入 [toWrite]，要么因本地内容不同而报告 [conflicts]。
+class _ExternalCalendarRestorePlan {
+  const _ExternalCalendarRestorePlan({
+    this.toWrite = const <_ExternalCalendarBackupFile>[],
+    this.conflicts = const <String>[],
+    this.total = 0,
+  });
+
+  final List<_ExternalCalendarBackupFile> toWrite;
+  final List<String> conflicts;
+  final int total;
 }
 
 class _StagedFile {
