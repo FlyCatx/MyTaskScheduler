@@ -20,7 +20,7 @@
 
 [CmdletBinding()]
 param(
-    [string]$Version = '0.1.2',
+    [string]$Version = '0.2.0',
     [string]$ApiKey = '',
     [string]$Model = 'deepseek-flash',
     [string]$Endpoint = 'https://api.deepseek.com/chat/completions',
@@ -42,10 +42,12 @@ if ([string]::IsNullOrWhiteSpace($ApiKey)) { $ApiKey = $env:TS_RELEASE_API_KEY }
 if ([string]::IsNullOrWhiteSpace($ApiKey) -and -not $NoApiKey) {
     throw 'API key is required: pass -ApiKey, set $env:TS_RELEASE_API_KEY, or use -NoApiKey for a key-free package'
 }
-# Product version and pubspec/build version must agree: 0.05 == 0.0.5, 0.06 == 0.0.6, 0.07 == 0.0.7, 0.08 == 0.0.8, 0.09 == 0.0.9, 0.1.0 == 0.1.0, 0.1.1 == 0.1.1, 0.1.2 == 0.1.2.
-$pubVersion = (Select-String -Path (Join-Path $appDir 'pubspec.yaml') -Pattern '^version:\s*([0-9]+\.[0-9]+\.[0-9]+)' |
+# Product version and pubspec/build version must agree: 0.05 == 0.0.5, 0.06 == 0.0.6, 0.07 == 0.0.7, 0.08 == 0.0.8, 0.09 == 0.0.9, 0.1.0 == 0.1.0, 0.1.1 == 0.1.1, 0.1.2 == 0.1.2, 0.2.0 == 0.2.0.
+# Keep the +build suffix for VERSION.txt traceability; compare only the semver part.
+$pubFull = (Select-String -Path (Join-Path $appDir 'pubspec.yaml') -Pattern '^version:\s*([0-9]+\.[0-9]+\.[0-9]+(?:\+[0-9]+)?)' |
     Select-Object -First 1).Matches.Groups[1].Value
-$versionAliases = @{ '0.05' = '0.0.5'; '0.06' = '0.0.6'; '0.07' = '0.0.7'; '0.08' = '0.0.8'; '0.09' = '0.0.9'; '0.1.0' = '0.1.0'; '0.1.1' = '0.1.1'; '0.1.2' = '0.1.2' }
+$pubVersion = ($pubFull -split '\+')[0]
+$versionAliases = @{ '0.05' = '0.0.5'; '0.06' = '0.0.6'; '0.07' = '0.0.7'; '0.08' = '0.0.8'; '0.09' = '0.0.9'; '0.1.0' = '0.1.0'; '0.1.1' = '0.1.1'; '0.1.2' = '0.1.2'; '0.2.0' = '0.2.0' }
 if ($versionAliases.ContainsKey($Version) -and $pubVersion -ne $versionAliases[$Version]) {
     throw "version mismatch: product $Version requires pubspec $($versionAliases[$Version]) (found $pubVersion)"
 }
@@ -163,7 +165,7 @@ TaskScheduler $Version (Windows x64, Flutter UI)
 
 Build date      : $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss zzz')
 Product version : $Version
-Build version   : $pubVersion (pubspec; $Version and $pubVersion are the same release)
+Build version   : $pubFull (pubspec; product version $Version)
 UI              : Flutter (Windows desktop)
 Core            : existing C core, called through ts_bridge.dll (ABI 2)
 Model           : $Model
@@ -175,7 +177,7 @@ Bridge size     : $($bridgeItem.Length) bytes (ts_bridge.dll)
 
 Verification of this build:
   - $verification
-  - Detailed commands, exit codes and screenshots: TASKSCHEDULER_0_1_2_ACCEPTANCE_REPORT.md (next to this package)
+  - Detailed commands, exit codes and screenshots: docs/TASKSCHEDULER_$($Version.Replace('.','_'))_ACCEPTANCE_REPORT.md (repository)
 
 Data location (default): <program folder>\TaskSchedulerData
   (falls back to %LOCALAPPDATA%\TaskSchedulerFlutter etc. when the program folder is
