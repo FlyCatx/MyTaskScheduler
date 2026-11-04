@@ -18,6 +18,7 @@ import 'package:taskscheduler_flutter/src/model/settings.dart';
 import 'package:taskscheduler_flutter/src/state/settings_controller.dart';
 import 'package:taskscheduler_flutter/src/state/settings_store.dart';
 import 'package:taskscheduler_flutter/src/ui/settings/settings_model_page.dart';
+import 'package:taskscheduler_flutter/src/ui/settings/settings_widgets.dart';
 import 'package:taskscheduler_flutter/src/ui/theme.dart';
 
 import '../support/test_support.dart';
@@ -748,31 +749,76 @@ void main() {
     expect(tile.hoverColor, Colors.transparent);
   });
 
-  testWidgets('表单滚动区有独立 controller、固定沟槽和显式滚动条', (tester) async {
+  testWidgets('统一视口：唯一 controller 的显式滚动条、固定沟槽、与连接列表互不共享',
+      (tester) async {
+    // R2-ST：模型页交出整页纵向滚动职责，改由设置窗口的 SettingsPageViewport 提供
+    // 唯一 controller + 显式滚动条 + 18 DIP 右侧沟槽；连接列表保留自己的受限列滚动，
+    // 两个 controller 各自 attach 一个 position，绝不共享。
     final controller = await _loaded(tester, profiles: [sampleProfile()]);
-    await _pump(tester, controller);
+    await tester.binding.setSurfaceSize(const Size(900, 640));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    await tester.pumpWidget(MaterialApp(
+      theme: buildAppTheme(),
+      home: Scaffold(
+        body: SettingsPageViewport(
+          child: SettingsModelPage(controller: controller),
+        ),
+      ),
+    ));
+    await tester.pumpAndSettle();
 
-    final page = find.byType(SettingsModelPage);
-    final outerScroll = find
-        .descendant(of: page, matching: find.byType(SingleChildScrollView))
-        .first;
-    final view = tester.widget<SingleChildScrollView>(outerScroll);
-    final padding = view.padding! as EdgeInsets;
+    // 页面内容不再自己包整页滚动区（连接列表的 ListView 是列内滚动，不是整页滚动）。
+    expect(
+      find.descendant(
+        of: find.byType(SettingsModelPage),
+        matching: find.byType(SingleChildScrollView),
+      ),
+      findsNothing,
+      reason: '模型页不得再自己包一整页 SingleChildScrollView',
+    );
+
+    final viewport = find.byKey(const Key('settings-viewport-scroll'));
+    final scroll = tester.widget<SingleChildScrollView>(viewport);
+    final padding = scroll.padding! as EdgeInsets;
     expect(padding.right, greaterThanOrEqualTo(16),
         reason: '右侧必须为滚动条留出 16–20 逻辑像素沟槽');
 
-    final barFinder = find
-        .descendant(of: page, matching: find.byType(Scrollbar))
-        .first;
-    final bar = tester.widget<Scrollbar>(barFinder);
+    final barFinder = find.byKey(const Key('settings-viewport-scrollbar'));
+    final bar = tester.widget<RawScrollbar>(barFinder);
     expect(bar.controller, isNotNull, reason: '滚动区要使用自己的 controller');
+    expect(identical(bar.controller, scroll.controller), isTrue,
+        reason: '滚动条必须绑定同一个 controller');
     expect(bar.thumbVisibility, isTrue);
     expect(bar.thickness, 8);
+    expect(bar.crossAxisMargin, 4, reason: '轨道距视口右边缘 4 DIP');
 
     // 右侧控件缩在沟槽左边：思考开关的右边缘与滚动视口右边缘至少差一个沟槽。
-    final scrollRect = tester.getRect(outerScroll);
+    final scrollRect = tester.getRect(viewport);
     final switchRect = tester.getRect(find.byType(Switch).first);
     expect(switchRect.right, lessThanOrEqualTo(scrollRect.right - 16),
         reason: '滚动条不能盖住思考开关/输入框边框');
+
+    // 连接列表的独立滚动：不是主视口那个 controller，各自只有一个 position。
+    final listView = tester.widget<ListView>(
+      find
+          .descendant(
+              of: find.byType(SettingsModelPage),
+              matching: find.byType(ListView))
+          .first,
+    );
+    expect(listView.controller, isNotNull);
+    expect(identical(listView.controller, bar.controller), isFalse,
+        reason: '连接列表不得与主视口共享同一个 ScrollController');
+    expect(bar.controller!.positions.length, 1);
+    expect(listView.controller!.positions.length, 1);
+
+    // 主视口真的能滚到凭据区。
+    final apiKey = find.text('API Key');
+    final before = tester.getTopLeft(apiKey).dy;
+    await tester.drag(viewport, const Offset(0, -200));
+    await tester.pumpAndSettle();
+    expect(tester.getTopLeft(apiKey).dy, lessThan(before),
+        reason: '鼠标/触控板滚动必须能到达页面下部');
+    expect(tester.takeException(), isNull);
   });
 }

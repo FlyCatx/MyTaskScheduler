@@ -24,10 +24,8 @@ import 'package:taskscheduler_flutter/src/ui/settings/settings_about_page.dart';
 import 'package:taskscheduler_flutter/src/ui/settings/settings_account_page.dart';
 import 'package:taskscheduler_flutter/src/ui/settings/settings_dialog.dart';
 import 'package:taskscheduler_flutter/src/ui/settings/settings_general_page.dart';
-import 'package:taskscheduler_flutter/src/ui/settings/settings_model_page.dart';
 import 'package:taskscheduler_flutter/src/ui/settings/settings_notifications_page.dart';
 import 'package:taskscheduler_flutter/src/ui/settings/settings_shortcuts_page.dart';
-import 'package:taskscheduler_flutter/src/ui/settings/settings_storage_page.dart';
 import 'package:taskscheduler_flutter/src/ui/theme.dart';
 
 import '../support/test_support.dart';
@@ -339,13 +337,16 @@ void main() {
       ));
       await tester.pump();
 
+      // R2-ST: 模型 / 存储页不再自带整页滚动区，两者的纵向滚动都由设置窗口的
+      // SettingsPageViewport 统一提供（唯一 controller + 显式滚动条 + 18 DIP 沟槽）。
       await tester.tap(find.text('模型').last);
       await tester.pump();
-      final modelScroll = find
-          .descendant(
-              of: find.byType(SettingsModelPage),
-              matching: find.byType(SingleChildScrollView))
-          .first;
+      final modelScroll = find.descendant(
+        of: find.byKey(const ValueKey('settings-viewport-model')),
+        matching: find.byType(SingleChildScrollView),
+      );
+      expect(modelScroll, findsOneWidget,
+          reason: '模型页必须由统一视口提供滚动区');
       final apiKey = find.text('API Key');
       final before = tester.getTopLeft(apiKey).dy;
       await tester.drag(modelScroll, const Offset(0, -260));
@@ -355,11 +356,12 @@ void main() {
 
       await tester.tap(find.text('存储').last);
       await tester.pump();
-      final storageScroll = find
-          .descendant(
-              of: find.byType(SettingsStoragePage),
-              matching: find.byType(SingleChildScrollView))
-          .first;
+      final storageScroll = find.descendant(
+        of: find.byKey(const ValueKey('settings-viewport-storage')),
+        matching: find.byType(SingleChildScrollView),
+      );
+      expect(storageScroll, findsOneWidget,
+          reason: '存储页必须由统一视口提供滚动区（不再自己包一层）');
       final cache = find.textContaining('清理');
       final cacheBefore = tester.getTopLeft(cache.first).dy;
       await tester.drag(storageScroll, const Offset(0, -300));
@@ -613,4 +615,3 @@ void main() {
     });
   });
 }
-

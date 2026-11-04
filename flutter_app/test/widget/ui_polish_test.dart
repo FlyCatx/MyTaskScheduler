@@ -150,13 +150,13 @@ void main() {
 
       expect(find.byType(SettingsDialog), findsOneWidget);
 
-      // Rail: all seven entries, in the agreed order.
+      // Rail: all entries, in the agreed order. 0.2.2 adds 「外部日历」.
       for (final section in SettingsSection.values) {
         expect(find.text(section.label), findsWidgets,
             reason: '左栏缺少「${section.label}」');
       }
       expect(SettingsSection.values.map((s) => s.label).toList(),
-          ['账户安全', '通用', '模型', '快捷键', '通知', '存储', '关于']);
+          ['账户安全', '通用', '模型', '快捷键', '通知', '存储', '外部日历', '关于']);
 
       // Centred card: its centre must match the shell's centre.
       final dialog = tester.getRect(find.byType(SettingsDialog));
@@ -245,4 +245,3 @@ void main() {
     });
   });
 }
-
