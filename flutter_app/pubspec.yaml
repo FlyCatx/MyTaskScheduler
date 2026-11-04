@@ -1,7 +1,7 @@
 name: taskscheduler_flutter
 description: "TaskScheduler 桌面界面（Flutter），复用现有 C 内核的校验、依赖与排序。"
 publish_to: 'none'
-version: 0.2.0+13
+version: 0.2.3+16
 
 environment:
   sdk: ">=3.6.0 <4.0.0"
@@ -18,6 +18,8 @@ dependencies:
   # existing Dart >=3.6.0 lower bound (6.6+ requires Dart 3.8).
   archive: ^4.5.2
   xml: ">=6.5.0 <6.6.0"
+  timezone: ^0.11.2
+  rrule: ^0.2.18
 dev_dependencies:
   flutter_test:
     sdk: flutter
