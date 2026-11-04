@@ -41,6 +41,20 @@ class FlutterWindow : public Win32Window {
 
   bool IsWindowMaximized(HWND window) const;
 
+  // One hit-test result for the whole borderless frame. Used by the parent's
+  // WM_NCHITTEST and by the Flutter view's subclass so both agree on which
+  // client points belong to the native caption/resize borders.
+  // Returns HTCLIENT for ordinary client points.
+  int ComputeHitTest(int x, int y);
+  // The Flutter view is a child HWND covering the client area, so Windows sends
+  // WM_NCHITTEST to it first. Return HTTRANSPARENT for caption/resize points so
+  // the parent (this window) receives the real mouse and starts the native
+  // move/resize loop; ordinary points keep going to Flutter.
+  static LRESULT CALLBACK ChildHitTestProc(HWND hwnd, UINT message,
+                                           WPARAM wparam, LPARAM lparam,
+                                           UINT_PTR subclass_id,
+                                           DWORD_PTR ref_data);
+
   // The project to run.
   flutter::DartProject project_;
 

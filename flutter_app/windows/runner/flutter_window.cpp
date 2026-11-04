@@ -1,5 +1,6 @@
 #include "flutter_window.h"
 
+#include <commctrl.h>
 #include <flutter/standard_method_codec.h>
 #include <flutter_windows.h>
 #include <windowsx.h>
@@ -7,6 +8,7 @@
 #include <optional>
 
 #include "flutter/generated_plugin_registrant.h"
+#include "window_geometry.h"
 
 namespace {
 
@@ -75,6 +77,13 @@ bool FlutterWindow::OnCreate() {
                  result) { HandleWindowMethod(call, std::move(result)); });
 
   SetChildContent(flutter_controller_->view()->GetNativeWindow());
+
+  // The Flutter view covers the client area; without this subclass Windows would
+  // send WM_NCHITTEST to the child and the parent's caption hit-test would never
+  // run. The subclass forwards caption/resize points to the parent.
+  SetWindowSubclass(flutter_controller_->view()->GetNativeWindow(),
+                    &FlutterWindow::ChildHitTestProc, 1,
+                    reinterpret_cast<DWORD_PTR>(this));
 
   flutter_controller_->engine()->SetNextFrameCallback([&]() {
     this->Show();
@@ -166,6 +175,63 @@ bool FlutterWindow::IsWindowMaximized(HWND window) const {
   return window != nullptr && IsZoomed(window) != 0;
 }
 
+int FlutterWindow::ComputeHitTest(int x, int y) {
+  HWND window = GetHandle();
+  RECT client = {0, 0, 0, 0};
+  GetClientRect(window, &client);
+  const int width = client.right - client.left;
+  const int height = client.bottom - client.top;
+
+  if (!IsZoomed(window) && width > 0 && height > 0) {
+    const UINT dpi = FlutterDesktopGetDpiForHWND(window);
+    const int border_x = GetSystemMetricsForDpi(SM_CXSIZEFRAME, dpi) +
+                         GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi);
+    const int border_y = GetSystemMetricsForDpi(SM_CYSIZEFRAME, dpi) +
+                         GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi);
+    const bool left = x < border_x;
+    const bool right = x >= width - border_x;
+    const bool top = y < border_y;
+    const bool bottom = y >= height - border_y;
+    if (top && left) return HTTOPLEFT;
+    if (top && right) return HTTOPRIGHT;
+    if (bottom && left) return HTBOTTOMLEFT;
+    if (bottom && right) return HTBOTTOMRIGHT;
+    if (left) return HTLEFT;
+    if (right) return HTRIGHT;
+    if (top) return HTTOP;
+    if (bottom) return HTBOTTOM;
+  }
+
+  if (has_drag_region_ && x >= drag_region_.left && x < drag_region_.right &&
+      y >= drag_region_.top && y < drag_region_.bottom) {
+    return HTCAPTION;
+  }
+  return HTCLIENT;
+}
+
+LRESULT CALLBACK FlutterWindow::ChildHitTestProc(HWND hwnd, UINT message,
+                                                 WPARAM wparam, LPARAM lparam,
+                                                 UINT_PTR subclass_id,
+                                                 DWORD_PTR ref_data) {
+  auto* self = reinterpret_cast<FlutterWindow*>(ref_data);
+  if (message == WM_NCHITTEST && self != nullptr) {
+    HWND parent = GetParent(hwnd);
+    if (parent != nullptr) {
+      POINT point = {GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
+      ScreenToClient(parent, &point);
+      // HTTRANSPARENT makes the system continue with the parent window, whose
+      // WM_NCHITTEST returns HTCAPTION / HTLEFT / ... and drives the native
+      // move-resize loop. Plain client points stay with Flutter.
+      if (self->ComputeHitTest(point.x, point.y) != HTCLIENT) {
+        return HTTRANSPARENT;
+      }
+    }
+  } else if (message == WM_NCDESTROY) {
+    RemoveWindowSubclass(hwnd, &FlutterWindow::ChildHitTestProc, subclass_id);
+  }
+  return DefSubclassProc(hwnd, message, wparam, lparam);
+}
+
 LRESULT
 FlutterWindow::MessageHandler(HWND hwnd, UINT const message,
                               WPARAM const wparam,
@@ -198,18 +264,25 @@ FlutterWindow::MessageHandler(HWND hwnd, UINT const message,
       info->ptMinTrackSize.y = ScaleForDpi(kMinHeight, dpi);
 
       /*
-       * Maximize to the exact monitor work area. The client area is clamped in
-       * WM_NCCALCSIZE as well, so the title bar never covers the taskbar.
+       * Maximize to the exact monitor work area. ptMaxPosition is relative to the
+       * monitor origin (not the virtual desktop), so a secondary or negative
+       * origin monitor still lands on its own taskbar-aware work area.
        */
       MONITORINFO monitor_info = {};
       monitor_info.cbSize = sizeof(monitor_info);
       HMONITOR monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
       if (GetMonitorInfo(monitor, &monitor_info)) {
         const RECT& work = monitor_info.rcWork;
-        info->ptMaxPosition.x = work.left;
-        info->ptMaxPosition.y = work.top;
-        info->ptMaxSize.x = work.right - work.left;
-        info->ptMaxSize.y = work.bottom - work.top;
+        const RECT& screen = monitor_info.rcMonitor;
+        TsPixelRect monitor_rect = {screen.left, screen.top, screen.right,
+                                    screen.bottom};
+        TsPixelRect work_rect = {work.left, work.top, work.right, work.bottom};
+        const TsMaximizePlacement placement =
+            ts_maximize_placement(monitor_rect, work_rect);
+        info->ptMaxPosition.x = placement.x;
+        info->ptMaxPosition.y = placement.y;
+        info->ptMaxSize.x = placement.width;
+        info->ptMaxSize.y = placement.height;
       }
       return 0;
     }
@@ -238,50 +311,28 @@ FlutterWindow::MessageHandler(HWND hwnd, UINT const message,
     case WM_NCHITTEST: {
       /*
        * The client covers the whole window rect (WM_NCCALCSIZE), so DefWindowProc
-       * no longer reports the sizing border. Re-create the resize hit targets
-       * explicitly, otherwise "hide the title bar" would also remove resizing.
+       * no longer reports the sizing border. Re-create the resize hit targets in
+       * one place (ComputeHitTest) shared with the Flutter view's subclass.
        */
-      RECT client = {0, 0, 0, 0};
-      GetClientRect(hwnd, &client);
-      const int width = client.right - client.left;
-      const int height = client.bottom - client.top;
       POINT point = {GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
       POINT origin = {0, 0};
       ClientToScreen(hwnd, &origin);
-      const int x = point.x - origin.x;
-      const int y = point.y - origin.y;
+      return ComputeHitTest(point.x - origin.x, point.y - origin.y);
+    }
 
-      if (!IsZoomed(hwnd) && width > 0 && height > 0) {
-        const UINT dpi = FlutterDesktopGetDpiForHWND(hwnd);
-        const int border_x = GetSystemMetricsForDpi(SM_CXSIZEFRAME, dpi) +
-                             GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi);
-        const int border_y = GetSystemMetricsForDpi(SM_CYSIZEFRAME, dpi) +
-                             GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi);
-        const bool left = x < border_x;
-        const bool right = x >= width - border_x;
-        const bool top = y < border_y;
-        const bool bottom = y >= height - border_y;
-        if (top && left) return HTTOPLEFT;
-        if (top && right) return HTTOPRIGHT;
-        if (bottom && left) return HTBOTTOMLEFT;
-        if (bottom && right) return HTBOTTOMRIGHT;
-        if (left) return HTLEFT;
-        if (right) return HTRIGHT;
-        if (top) return HTTOP;
-        if (bottom) return HTBOTTOM;
-      }
-
-      // Report the blank title-bar strip as caption so Windows itself handles
-      // dragging, double-click maximize/restore and Aero Snap. Menus, buttons
-      // and the resize border are not part of this rectangle.
-      if (has_drag_region_) {
-        if (x >= drag_region_.left && x < drag_region_.right &&
-            y >= drag_region_.top && y < drag_region_.bottom) {
-          return HTCAPTION;
+    case WM_SETCURSOR:
+      // The blank caption area is native (Flutter does not receive hover there),
+      // so show a move cursor explicitly; borders keep their sizing cursors.
+      if (LOWORD(lparam) == HTCLIENT) {
+        POINT point = {0, 0};
+        GetCursorPos(&point);
+        ScreenToClient(hwnd, &point);
+        if (ComputeHitTest(point.x, point.y) == HTCAPTION) {
+          SetCursor(LoadCursor(nullptr, IDC_SIZEALL));
+          return TRUE;
         }
       }
       break;
-    }
 
     case WM_CLOSE:
       // Closing from the title bar, the app menu, Alt+F4 or the taskbar all
