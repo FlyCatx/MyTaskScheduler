@@ -17,10 +17,12 @@ import '../model/session.dart';
 import '../model/settings.dart';
 import '../model/timetable.dart';
 import '../state/calendar_planner.dart';
+import '../state/conflict_suggestions.dart';
 import '../state/task_interaction.dart';
 import './widgets/bezier_ui.dart';
 import './widgets/bezier_menu.dart';
 import 'calendar_settings_dialog.dart';
+import 'conflict_panel.dart';
 import 'segment_edit_dialog.dart';
 import 'theme.dart';
 
@@ -149,6 +151,7 @@ class _CalendarGanttViewState extends State<CalendarGanttView> {
   Timer? _nowTimer;
   DateTime? _flashUntil;
   String? _flashSegmentId;
+  Timer? _flashTimer;
 
   _DragSession? _drag;
   Timer? _autoScroll;
@@ -240,6 +243,7 @@ class _CalendarGanttViewState extends State<CalendarGanttView> {
   void dispose() {
     _autoScroll?.cancel();
     _nowTimer?.cancel();
+    _flashTimer?.cancel();
     _horizontal.removeListener(_onHorizontal);
     _horizontal.dispose();
     _vertical.dispose();
@@ -1061,11 +1065,15 @@ class _CalendarGanttViewState extends State<CalendarGanttView> {
               Icon(Icons.warning_amber_rounded,
                   size: 14, color: TsColors.blocked),
               const SizedBox(width: 6),
-              Text('冲突 ${conflicts.length} 处（允许保存，不会自动顺延其他任务）',
-                  style: TextStyle(
-                      fontSize: 11.5,
-                      fontWeight: FontWeight.w600,
-                      color: TsColors.textPrimary)),
+              Expanded(
+                child: Text(
+                    '冲突 ${conflicts.length} 处（允许保存，不会自动顺延其他任务）'
+                    ' · 点击查看解释与建议',
+                    style: TextStyle(
+                        fontSize: 11.5,
+                        fontWeight: FontWeight.w600,
+                        color: TsColors.textPrimary)),
+              ),
             ],
           ),
           const SizedBox(height: 4),
@@ -1075,32 +1083,37 @@ class _CalendarGanttViewState extends State<CalendarGanttView> {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  for (final c in conflicts)
-                    GestureDetector(
-                      behavior: HitTestBehavior.opaque,
-                      onTap: () => _locateConflict(c),
-                      child: Padding(
-                        padding: const EdgeInsets.symmetric(vertical: 2),
-                        child: Row(
-                          children: [
-                            Text(c.kind.label,
-                                style: TextStyle(
-                                    fontSize: 10.5,
-                                    color: c.kind.isBlocking
-                                        ? TsColors.blocked
-                                        : TsColors.pending)),
-                            const SizedBox(width: 6),
-                            Expanded(
-                              child: Text(
-                                c.message,
-                                maxLines: 1,
-                                overflow: TextOverflow.ellipsis,
-                                style: TextStyle(
-                                    fontSize: 11,
-                                    color: TsColors.textSecondary),
+                  for (var i = 0; i < conflicts.length; i++)
+                    Material(
+                      color: Colors.transparent,
+                      child: InkWell(
+                        key: Key('calendar-conflict-row-$i'),
+                        onTap: () => _openConflictDetails(conflicts[i]),
+                        child: Padding(
+                          padding: const EdgeInsets.symmetric(vertical: 2),
+                          child: Row(
+                            children: [
+                              Text(conflicts[i].kind.label,
+                                  style: TextStyle(
+                                      fontSize: 10.5,
+                                      color: conflicts[i].kind.isBlocking
+                                          ? TsColors.blocked
+                                          : TsColors.pending)),
+                              const SizedBox(width: 6),
+                              Expanded(
+                                child: Text(
+                                  conflicts[i].message,
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: TextStyle(
+                                      fontSize: 11,
+                                      color: TsColors.textSecondary),
+                                ),
                               ),
-                            ),
-                          ],
+                              Icon(Icons.chevron_right,
+                                  size: 13, color: TsColors.textFaint),
+                            ],
+                          ),
                         ),
                       ),
                     ),
@@ -1109,6 +1122,55 @@ class _CalendarGanttViewState extends State<CalendarGanttView> {
             ),
           ),
         ],
+      ),
+    );
+  }
+
+  /// 打开冲突详情：解释、定位（复用 [_locateConflict]）与本地建议。
+  /// 只读取当前快照，不修改数据；提交由对话框经 [CalendarActions.commit]
+  /// （生产环境 = AppController.applyCalendarEdit，可撤销）完成。
+  Future<void> _openConflictDetails(CalendarConflict conflict) async {
+    final snapshot = _conflictSnapshot();
+    final details = explainConflicts(
+      schedule: snapshot.schedule,
+      tasks: snapshot.tasks,
+      now: snapshot.now,
+      taskNames: snapshot.taskNames,
+    );
+    ConflictDetail? target;
+    for (final candidate in details) {
+      if (sameConflict(candidate.conflict, conflict)) {
+        target = candidate;
+        break;
+      }
+    }
+    target ??= details.isEmpty ? null : details.first;
+    final detail = target;
+    if (detail == null || !mounted) return;
+    await showConflictDetailsDialog(
+      context,
+      detail: detail,
+      snapshot: snapshot,
+      currentSnapshot: _conflictSnapshot,
+      commit: widget.actions.commit,
+      canEdit: widget.actions.canEdit,
+      onLocate: () => _locateConflict(conflict),
+    );
+  }
+
+  /// 当前 UI 看到的一份快照：排程 + 任务 + 版本戳（提交前会再次读取做版本校验）。
+  ConflictSnapshot _conflictSnapshot() {
+    final rows = _buildRows();
+    final tasks = _schedulingTasks(rows);
+    return ConflictSnapshot(
+      schedule: widget.schedule,
+      tasks: tasks,
+      now: _now ?? DateTime.now(),
+      taskNames: {for (final t in tasks) t.id: t.name},
+      stamp: ConflictVersionStamp(
+        planRevision: widget.version?.revision ?? 0,
+        timetableRevision: widget.actions.timetable?.revision ?? -1,
+        scheduleSignature: calendarScheduleSignature(widget.schedule),
       ),
     );
   }
@@ -1138,7 +1200,8 @@ class _CalendarGanttViewState extends State<CalendarGanttView> {
         _flashSegmentId = segment!.id;
         _flashUntil = DateTime.now().add(const Duration(seconds: 2));
       });
-      Timer(const Duration(seconds: 2), () {
+      _flashTimer?.cancel();
+      _flashTimer = Timer(const Duration(seconds: 2), () {
         if (mounted) setState(() => _flashSegmentId = null);
       });
     }
@@ -1151,26 +1214,27 @@ class _CalendarGanttViewState extends State<CalendarGanttView> {
 
   // ------------------------------------------------------------ conflicts
 
+  List<SchedulingTask> _schedulingTasks(List<_CalendarRow> rows) => <SchedulingTask>[
+        for (final row in rows)
+          if (!row.isCaption)
+            SchedulingTask(
+              id: row.task!.id,
+              name: row.task!.name,
+              estimatedHours: row.task!.estimateHours,
+              dependsOn: widget.version?.plan.taskById(row.task!.id)?.dependsOn ??
+                  const <String>[],
+              deadline:
+                  widget.version?.plan.taskById(row.task!.id)?.deadline,
+              isDone: row.task!.isDone,
+              isBlocked: row.task!.isBlocked,
+              isPending: row.task!.isPending,
+            ),
+      ];
+
   List<CalendarConflict> _conflicts(List<_CalendarRow> rows) {
-    final scheduling = <SchedulingTask>[
-      for (final row in rows)
-        if (!row.isCaption)
-          SchedulingTask(
-            id: row.task!.id,
-            name: row.task!.name,
-            estimatedHours: row.task!.estimateHours,
-            dependsOn: widget.version?.plan.taskById(row.task!.id)?.dependsOn ??
-                const <String>[],
-            deadline:
-                widget.version?.plan.taskById(row.task!.id)?.deadline,
-            isDone: row.task!.isDone,
-            isBlocked: row.task!.isBlocked,
-            isPending: row.task!.isPending,
-          ),
-    ];
     return detectConflicts(
       schedule: widget.schedule,
-      tasks: scheduling,
+      tasks: _schedulingTasks(rows),
       now: _now ?? DateTime.now(),
       taskNames: {for (final r in rows) if (!r.isCaption) r.task!.id: r.task!.name},
     );
@@ -1180,6 +1244,12 @@ class _CalendarGanttViewState extends State<CalendarGanttView> {
 
   Future<void> _openSettings() async {
     final applyTimetable = widget.actions.applyTimetable;
+    // 绑定面板需要任务预估时长；从甘特图打开的时间表编辑器必须与从输入区打开时
+    // 表现一致，否则已知工时会显示成“未知”，超额预留也不会提示。
+    final taskEstimatedHours = <String, double?>{
+      for (final task in _schedulingTasks(_buildRows()))
+        task.id: task.estimatedHours,
+    };
     final result = await showCalendarSettingsDialog(
       context,
       settings: _settings,
@@ -1190,6 +1260,7 @@ class _CalendarGanttViewState extends State<CalendarGanttView> {
       initialMode: widget.actions.defaultEditor,
       defaultUnavailableRanges: widget.actions.defaultUnavailableRanges,
       taskNames: widget.actions.taskNames,
+      taskEstimatedHours: taskEstimatedHours,
       onApply: applyTimetable == null
           ? null
           : (r) => applyTimetable(

@@ -27,6 +27,10 @@ class TaskDetailCard extends StatelessWidget {
   /// model call), which is what "保留条件确认" means here.
   final void Function(int index)? onCycleCondition;
 
+  /// 0.2.3（R3-E）：执行计时/实际耗时区（开始、暂停、继续、停止、完成、手工补记）。
+  /// 由接线方构造，卡片本身不依赖计时控制器；null = 本构建未启用执行计时。
+  final Widget? executionSection;
+
   const TaskDetailCard({
     super.key,
     required this.task,
@@ -36,6 +40,7 @@ class TaskDetailCard extends StatelessWidget {
     this.canEdit = false,
     this.onEdit,
     this.onCycleCondition,
+    this.executionSection,
   });
 
   @override
@@ -126,6 +131,11 @@ class TaskDetailCard extends StatelessWidget {
                       ],
                     ),
                   ),
+                  if (executionSection != null)
+                    _Section(
+                      label: '执行与实际耗时',
+                      child: executionSection!,
+                    ),
                   if (task.steps.isNotEmpty)
                     _Section(
                       label: '执行步骤',
@@ -340,4 +350,3 @@ class _Section extends StatelessWidget {
     );
   }
 }
-

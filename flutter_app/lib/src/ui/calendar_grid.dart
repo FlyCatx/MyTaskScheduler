@@ -13,18 +13,24 @@
 import 'dart:async';
 import 'dart:math' as math;
 
+import 'package:flutter/foundation.dart' show setEquals;
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import '../model/calendar.dart';
+import '../model/external_calendar.dart';
 import '../model/timetable.dart';
 import '../model/settings.dart';
 import 'edit_commands.dart';
 import 'theme.dart';
 import 'widgets/bezier_ui.dart';
 
-/// 画笔控制器：把“当前画笔 / 是否每周重复 / 撤销”暴露给工具栏与测试。
+/// 画笔控制器：把“当前画笔 / 撤销重做 / 蓝块选择”暴露给工具栏与测试。
+///
+/// 蓝块选择状态由 controller 统一持有：选择模式下左键单击蓝色块 = 切换选中，
+/// 不产生绘制/擦除，也不产生撤销事务；选中集合用稳定身份
+/// `entry.reservationId ?? entry.id` 表示（蓝块复制/绑定后仍可定位）。
 class TimetableGridController extends ChangeNotifier {
   TimetableGridController({
     required TimetableDraft draft,
@@ -34,10 +40,15 @@ class TimetableGridController extends ChangeNotifier {
 
   final TimetableDraft _draft;
   TimetableState _brush;
+  bool _selectionMode = false;
+  final Set<String> _selected = <String>{};
 
   TimetableState get brush => _brush;
   TimetableDraft get draft => _draft;
   bool get canUndo => _draft.hasUndo;
+  bool get canRedo => _draft.canRedo;
+  int get undoDepth => _draft.undoDepth;
+  int get redoDepth => _draft.redoDepth;
 
   void setBrush(TimetableState state) {
     if (_brush == state) return;
@@ -56,10 +67,101 @@ class TimetableGridController extends ChangeNotifier {
     if (_draft.undo()) notifyListeners();
   }
 
+  /// 重做一笔；成功才通知（失败无副作用）。
+  void redo() {
+    if (_draft.redo()) notifyListeners();
+  }
+
   void markApplied() {
     _draft.markApplied();
     notifyListeners();
   }
+
+  // ------------------------------------------------------------ 蓝块选择
+
+  /// 选择模式：开启后左键单击蓝色块 = 切换选中，不再绘制/擦除。
+  bool get selectionMode => _selectionMode;
+
+  /// 已选蓝色块身份集合（不可变快照）。
+  ///
+  /// 身份 = `entry.reservationId ?? entry.id`；已被撤销/删除的块会自动剔除，
+  /// 调用方按同一规则反查条目：
+  /// `dates.where((e) => e.isTask && selected.contains(e.reservationId ?? e.id))`。
+  Set<String> get selectedReservationIds {
+    final live = _liveTaskIdentities();
+    return Set<String>.unmodifiable(
+      _selected.where(live.contains).toSet(),
+    );
+  }
+
+  bool get hasSelection => selectedReservationIds.isNotEmpty;
+
+  /// 选中的蓝色块条目数（只统计当前时间表里仍存在的条目）。
+  int get selectedBlockCount {
+    final ids = selectedReservationIds;
+    if (ids.isEmpty) return 0;
+    return _draft.timetable.dates
+        .where((e) => e.isTask && ids.contains(_identityOf(e)))
+        .length;
+  }
+
+  /// 选中条目的分钟数合计。
+  int get selectedMinutes {
+    final ids = selectedReservationIds;
+    if (ids.isEmpty) return 0;
+    var total = 0;
+    for (final e in _draft.timetable.dates) {
+      if (!e.isTask || !ids.contains(_identityOf(e))) continue;
+      total += e.minutes;
+    }
+    return total;
+  }
+
+  void setSelectionMode(bool enabled) {
+    if (_selectionMode == enabled) return;
+    _selectionMode = enabled;
+    if (!enabled) _selected.clear();
+    notifyListeners();
+  }
+
+  void toggleSelectionMode() => setSelectionMode(!_selectionMode);
+
+  /// 切换一个蓝色块的选中状态（选择模式的主入口）。
+  void toggleSelection(String reservationId) {
+    final id = reservationId.trim();
+    if (id.isEmpty) return;
+    if (!_selected.add(id)) _selected.remove(id);
+    notifyListeners();
+  }
+
+  /// [toggleSelection] 的旧命名别名，保持已接入调用方可编译。
+  void toggleReservation(String reservationId) => toggleSelection(reservationId);
+
+  void setSelectedReservations(Iterable<String> ids) {
+    final next = <String>{
+      for (final id in ids)
+        if (id.trim().isNotEmpty) id.trim(),
+    };
+    if (setEquals(next, _selected)) return;
+    _selected
+      ..clear()
+      ..addAll(next);
+    notifyListeners();
+  }
+
+  void clearSelection() {
+    if (_selected.isEmpty) return;
+    _selected.clear();
+    notifyListeners();
+  }
+
+  Set<String> _liveTaskIdentities() => <String>{
+        for (final e in _draft.timetable.dates)
+          if (e.isTask) _identityOf(e),
+      };
+
+  static String _identityOf(TimetableEntry entry) =>
+      entry.reservationId ?? entry.id;
 }
 
 /// 一个 15 分钟格坐标（显示层）。
@@ -161,9 +263,10 @@ List<TimetableCell> crossedGridCells(Offset from, Offset to) {
   return out;
 }
 
-/// 网格的编辑命令目标：撤销接日程事务，其他文本命令不适用。
+/// 网格的编辑命令目标：撤销/重做接日程事务，其他文本命令不适用。
 ///
-/// 网格没有实现重做，因此重做在标题栏菜单里保持禁用，不伪装成功。
+/// 网格自己的撤销栈是时间表事务（一笔拖动 = 一笔），因此重做也必须走同一套
+/// 业务快照恢复，而不是交给文本编辑器的 UndoHistory。
 class TimetableGridEditTarget implements EditTarget {
   TimetableGridEditTarget({
     required this.controller,
@@ -179,13 +282,22 @@ class TimetableGridEditTarget implements EditTarget {
   bool get isAlive => _isAlive();
 
   @override
-  bool canExecute(EditCommand command) =>
-      command == EditCommand.undo && controller.canUndo;
+  bool canExecute(EditCommand command) => switch (command) {
+        EditCommand.undo => controller.canUndo,
+        EditCommand.redo => controller.canRedo,
+        _ => false,
+      };
 
   @override
   Future<void> execute(EditCommand command) async {
-    if (command != EditCommand.undo) return;
-    controller.undo();
+    switch (command) {
+      case EditCommand.undo:
+        controller.undo();
+      case EditCommand.redo:
+        controller.redo();
+      default:
+        return;
+    }
     onChanged?.call();
   }
 }
@@ -215,6 +327,19 @@ class TimetableGrid extends StatefulWidget {
   /// 避免在 coverage 之外画出不会随请求发送的规则。为 null 时全部允许。
   final bool Function(String date)? canEditDate;
 
+  /// 选择模式下用户点选导致选中集合变化后回调新集合（身份规则见
+  /// [TimetableGridController.selectedReservationIds]）。
+  final ValueChanged<Set<String>>? onSelectionChanged;
+
+  /// 只读外部日历占用（来自 ExternalCalendarService.busyFor）。
+  ///
+  /// 这些实例**不进入** [TimetableDraft]：网格只在最底层用浅灰斜纹叠加显示，
+  /// 不参与绘制/擦除/蓝块绑定与撤销事务。为空时渲染与 0.2.1 完全一致。
+  final List<ExternalBusyInstance> externalBusy;
+
+  /// 外部来源 id → 名称（仅供悬停/点选信息显示，本地使用，不进入模型请求）。
+  final Map<String, String> externalSourceNames;
+
   const TimetableGrid({
     super.key,
     required this.controller,
@@ -227,6 +352,9 @@ class TimetableGrid extends StatefulWidget {
     this.onBindUnbound,
     this.verticalController,
     this.canEditDate,
+    this.onSelectionChanged,
+    this.externalBusy = const <ExternalBusyInstance>[],
+    this.externalSourceNames = const <String, String>{},
   });
 
   static const double timeAxisWidth = 54;
@@ -303,7 +431,13 @@ class _TimetableGridState extends State<TimetableGrid> {
   }
 
   void _onController() {
-    if (!_disposed && mounted) setState(() {});
+    if (_disposed) return;
+    // 切到选择模式时丢掉进行中的半笔：选择模式下单击不能被当成绘制。
+    if (widget.controller.selectionMode && _pointer != null) {
+      _endStroke(commit: false);
+      return;
+    }
+    if (mounted) setState(() {});
   }
 
   void _onFocusChange() {
@@ -343,6 +477,86 @@ class _TimetableGridState extends State<TimetableGrid> {
     return box.globalToLocal(event.position);
   }
 
+  // ------------------------------------------------------------ selection
+
+  /// 选中蓝色块在网格上的高亮区间（按日期分组，分钟坐标）。
+  ///
+  /// 用“日期 + 分钟区间”匹配而不是只用 reservationId：旧数据里没有
+  /// reservationId 的未绑定蓝块也必须能高亮。
+  Map<String, List<({int start, int end})>> _selectionRanges() {
+    final ids = widget.controller.selectedReservationIds;
+    if (ids.isEmpty) return const <String, List<({int start, int end})>>{};
+    final out = <String, List<({int start, int end})>>{};
+    for (final entry in _draft.timetable.dates) {
+      if (!entry.isTask || entry.date == null) continue;
+      final identity = entry.reservationId ?? entry.id;
+      if (!ids.contains(identity)) continue;
+      out.putIfAbsent(entry.date!, () => <({int start, int end})>[]).add(
+            (start: entry.start, end: entry.end),
+          );
+    }
+    return out;
+  }
+
+  /// 选择模式下点选一格：命中日期层蓝色块则切换选中，否则不改任何数据。
+  void _toggleSelectionAt(TimetableCell cell, List<TimetableDay> days) {
+    if (cell.day < 0 || cell.day >= days.length) return;
+    final date = days[cell.day].date;
+    final minute = cell.slot * kTimetableSlotMinutes;
+    final identities = <String>{};
+    for (final entry in _draft.timetable.dates) {
+      if (entry.date != date || !entry.isTask) continue;
+      if (!entry.coversMinute(minute)) continue;
+      identities.add(entry.reservationId ?? entry.id);
+    }
+    if (identities.isEmpty) return;
+    final next = widget.controller.selectedReservationIds.toSet();
+    if (identities.every(next.contains)) {
+      next.removeAll(identities);
+    } else {
+      next.addAll(identities);
+    }
+    widget.controller.setSelectedReservations(next);
+    widget.onSelectionChanged?.call(widget.controller.selectedReservationIds);
+  }
+
+  // ---------------------------------------------------- 外部日历（只读占用）
+
+  /// 命中的外部占用实例；外部数据不进入草稿，命中只用于“显示信息、禁止编辑”。
+  ExternalBusyInstance? _externalAt(TimetableCell cell) {
+    final busyList = widget.externalBusy;
+    if (busyList.isEmpty) return null;
+    final days = _days;
+    if (cell.day < 0 || cell.day >= days.length) return null;
+    final date = days[cell.day].date;
+    final minute = cell.slot * kTimetableSlotMinutes;
+    for (final busy in busyList) {
+      if (busy.dayKey != date) continue;
+      if (minute >= busy.startMinute && minute < busy.endMinute) return busy;
+    }
+    return null;
+  }
+
+  /// 外部占用的可读信息：显式写出「外部日历」「只读」，避免只靠颜色区分。
+  String externalBusyLabel(ExternalBusyInstance busy) {
+    final name = widget.externalSourceNames[busy.sourceId];
+    final source = (name == null || name.trim().isEmpty)
+        ? busy.sourceId
+        : name.trim();
+    final tentative = busy.tentative ? ' · 暂定' : '';
+    return '${busy.dayKey} ${_hhmm(busy.startMinute)}-${_hhmm(busy.endMinute)}'
+        ' · 外部日历$tentative · 来源：$source · 只读（不可绘制/擦除/绑定）';
+  }
+
+  /// 点选外部占用只显示信息：不落笔、不擦除、不改选择、不产生撤销事务。
+  void _showExternalInfo(ExternalBusyInstance busy, {required bool notify}) {
+    final text = externalBusyLabel(busy);
+    if (text != _hoverText) {
+      setState(() => _hoverText = text);
+    }
+    if (notify) widget.onHover?.call(text);
+  }
+
   // ------------------------------------------------------------- gestures
 
   void _handleDown(PointerDownEvent event) {
@@ -350,6 +564,7 @@ class _TimetableGridState extends State<TimetableGrid> {
     if (_pointer != null) return;
     _focus.requestFocus();
     if (event.buttons & kMiddleMouseButton != 0) {
+      if (widget.controller.selectionMode) return;
       widget.controller.cycleBrush();
       return;
     }
@@ -360,6 +575,18 @@ class _TimetableGridState extends State<TimetableGrid> {
     if (local == null) return;
     final cell = _geometry.hit(local);
     if (cell == null) return;
+    // 外部日历占用是只读的：点选只显示信息，不绘制/擦除/选中/绑定。
+    final external = _externalAt(cell);
+    if (external != null) {
+      _showExternalInfo(external, notify: true);
+      return;
+    }
+    if (widget.controller.selectionMode) {
+      // 选择模式只做选中切换：不落笔、不产生撤销事务；右键也不擦除。
+      if (isErase) return;
+      _toggleSelectionAt(cell, _days);
+      return;
+    }
     _pointer = event.pointer;
     _erasing = isErase;
     _lastGlobal = event.position;
@@ -556,9 +783,17 @@ class _TimetableGridState extends State<TimetableGrid> {
     final title = (interval?.title == null || interval!.title!.isEmpty)
         ? state.label
         : interval.title!;
-    final text = '${d.date} ${_hhmm(start)}-${_hhmm(end)} · $title · $origin$bound'
+    final manualText =
+        '${d.date} ${_hhmm(start)}-${_hhmm(end)} · $title · $origin$bound'
         '${interval?.isPartialCell == true ? ' · 精确边界' : ''}'
         '${widget.weeklyMode || widget.canEditDate == null || widget.canEditDate!(d.date) ? '' : ' · 排程范围外（不可绘制）'}';
+    // 外部占用叠加：手工数据优先显示；命中外部实例时追加只读信息。
+    final external = _externalAt(cell);
+    final text = external == null
+        ? manualText
+        : (interval == null || interval.state == TimetableState.free)
+            ? externalBusyLabel(external)
+            : '$manualText · 叠加：${externalBusyLabel(external)}';
     if (text != _hoverText) {
       setState(() => _hoverText = text);
       widget.onHover?.call(text);
@@ -590,10 +825,20 @@ class _TimetableGridState extends State<TimetableGrid> {
           child: Focus(
             focusNode: _focus,
             onKeyEvent: (node, event) {
-              if (event is KeyDownEvent &&
-                  event.logicalKey == LogicalKeyboardKey.keyZ &&
-                  HardwareKeyboard.instance.isControlPressed) {
+              if (event is! KeyDownEvent) return KeyEventResult.ignored;
+              final keyboard = HardwareKeyboard.instance;
+              final control = keyboard.isControlPressed || keyboard.isMetaPressed;
+              if (!control) return KeyEventResult.ignored;
+              final key = event.logicalKey;
+              // Ctrl+Z 撤销；Ctrl+Y 与 Ctrl+Shift+Z 都重做（与标题栏菜单一致）。
+              if (key == LogicalKeyboardKey.keyZ && !keyboard.isShiftPressed) {
                 widget.controller.undo();
+                _changed();
+                return KeyEventResult.handled;
+              }
+              if (key == LogicalKeyboardKey.keyY ||
+                  (key == LogicalKeyboardKey.keyZ && keyboard.isShiftPressed)) {
+                widget.controller.redo();
                 _changed();
                 return KeyEventResult.handled;
               }
@@ -641,6 +886,10 @@ class _TimetableGridState extends State<TimetableGrid> {
                                     width: _gridWidth,
                                     rowHeight: TimetableGrid.rowHeight,
                                     topInset: TimetableGrid.topInset,
+                                    selected: _selectionRanges(),
+                                    externalBusy: widget.externalBusy,
+                                    externalSourceNames:
+                                        widget.externalSourceNames,
                                   ),
                                 ),
                               ),
@@ -661,8 +910,13 @@ class _TimetableGridState extends State<TimetableGrid> {
   }
 
   Widget _statusBar() {
+    final controller = widget.controller;
+    final selected = controller.selectedReservationIds;
     final hint = _hoverText ??
-        '左键绘制 · 拖动连续绘制 · 右键擦除 · 中键切换画笔 · Ctrl+Z 撤销';
+        (controller.selectionMode
+            ? '选择模式：单击蓝色块选中/取消'
+                '${selected.isEmpty ? '' : ' · 已选 ${selected.length} 块 · ${_durationLabel(controller.selectedMinutes)}'}'
+            : '左键绘制 · 拖动连续绘制 · 右键擦除 · 中键切换画笔 · Ctrl+Z 撤销 · Ctrl+Y 重做');
     final timetable = _draft.timetable;
     // 两个口径分开命名：本周实际可用（按 7 个真实日期展开）与每周模板容量。
     final stats = widget.weekStart.isNotEmpty && timetable.hasEntries
@@ -812,16 +1066,37 @@ class _GridPainter extends CustomPainter {
   final double rowHeight;
   final double topInset;
 
+  /// 选中蓝色块的高亮区间：日期 → 分钟区间列表（选择模式）。
+  final Map<String, List<({int start, int end})>> selected;
+
+  /// 只读外部日历占用；只在网格最底层画斜纹，不覆盖手工数据。
+  final List<ExternalBusyInstance> externalBusy;
+
+  /// 外部来源 id → 名称（当前只用于将来扩展；绘制层不显示标题，保护隐私）。
+  final Map<String, String> externalSourceNames;
+
   _GridPainter({
     required this.days,
     required this.width,
     required this.rowHeight,
     required this.topInset,
+    this.selected = const <String, List<({int start, int end})>>{},
+    this.externalBusy = const <ExternalBusyInstance>[],
+    this.externalSourceNames = const <String, String>{},
   });
 
   static const Color _free = Color(0xFFFFFFFF);
   static const Color _occupied = Color(0xFF4B5563);
   static const Color _occupiedSoft = Color(0xFFE5E7EB);
+
+  // 外部占用的视觉：浅灰底 + 灰色斜纹 + 左侧实心标记条 + 「外部」文字。
+  // 斜纹与标记条是形状差异，不只靠颜色，和手工占用（实心深灰）/蓝块区分开。
+  static const Color _externalFill = Color(0xFFF1F2F4);
+  static const Color _externalHatch = Color(0xFF9CA3AF);
+  static const Color _externalMarker = Color(0xFF6B7280);
+  static const Color _externalBorder = Color(0xFF9CA3AF);
+  static const double _externalMarkerWidth = 3;
+  static const double _externalHatchSpacing = 7;
 
   @override
   void paint(Canvas canvas, Size size) {
@@ -837,6 +1112,9 @@ class _GridPainter extends CustomPainter {
       fill.color = _free;
       canvas.drawRect(
           Rect.fromLTWH(left, topInset, dayWidth, height), fill);
+
+      // 外部占用画在手工数据下面：手工占用/蓝块始终可见、可编辑。
+      _paintExternalBusy(canvas, day, left, dayWidth);
 
       for (final interval in day.intervals) {
         if (interval.state == TimetableState.free) continue;
@@ -875,6 +1153,34 @@ class _GridPainter extends CustomPainter {
                 Offset(left + 3, y), Offset(left + dayWidth - 4, y + 4), line);
           }
         }
+        // 选择模式高亮：选中的蓝色块加蓝色边框与淡色底，避免只靠颜色区分
+        // 未选中/已选中；未绑定蓝块也能高亮（按日期+分钟匹配）。
+        if (interval.state == TimetableState.task) {
+          final ranges = selected[day.date];
+          if (ranges != null) {
+            for (final range in ranges) {
+              final overlapStart = math.max(range.start, interval.start);
+              final overlapEnd = math.min(range.end, interval.end);
+              if (overlapEnd <= overlapStart) continue;
+              final highlightTop =
+                  topInset + overlapStart / 60 * 4 * rowHeight;
+              final highlightBottom =
+                  topInset + overlapEnd / 60 * 4 * rowHeight;
+              final rect = Rect.fromLTWH(
+                  left + 1, highlightTop, dayWidth - 2,
+                  highlightBottom - highlightTop);
+              canvas.drawRect(
+                  rect, Paint()..color = const Color(0x332563EB));
+              canvas.drawRect(
+                rect,
+                Paint()
+                  ..style = PaintingStyle.stroke
+                  ..strokeWidth = 2
+                  ..color = const Color(0xFF2563EB),
+              );
+            }
+          }
+        }
       }
 
       // 15 分钟线与小时线。
@@ -909,12 +1215,94 @@ class _GridPainter extends CustomPainter {
     );
   }
 
+  /// 画一个自然日内的外部占用：浅灰斜纹 + 左侧标记条 + 「外部」文字。
+  ///
+  /// [dayWidth]/[left] 是该日在网格里的横向几何；实例的 [ExternalBusyInstance.dayKey]
+  /// 与当前天一致时才画，[startMinute]/[endMinute] 是当天内的分钟。
+  void _paintExternalBusy(
+      Canvas canvas, TimetableDay day, double left, double dayWidth) {
+    if (externalBusy.isEmpty) return;
+    for (final busy in externalBusy) {
+      if (busy.dayKey != day.date) continue;
+      final start = busy.startMinute.clamp(0, kTimetableMinutesPerDay);
+      final end = busy.endMinute.clamp(0, kTimetableMinutesPerDay);
+      if (end <= start) continue;
+      final top = topInset + start / 60 * 4 * rowHeight;
+      final bottom = topInset + end / 60 * 4 * rowHeight;
+      final rect = Rect.fromLTWH(left + 1, top, dayWidth - 2, bottom - top);
+      if (rect.width <= 0 || rect.height <= 0) continue;
+
+      // 浅灰底。
+      canvas.drawRect(rect, Paint()..color = _externalFill);
+
+      // 灰色斜纹：裁剪在实例矩形内，不会画到相邻格子。
+      canvas.save();
+      canvas.clipRect(rect);
+      final hatch = Paint()
+        ..color = _externalHatch.withValues(alpha: 0.55)
+        ..strokeWidth = 1;
+      for (var y = rect.top - rect.width;
+          y < rect.bottom;
+          y += _externalHatchSpacing) {
+        canvas.drawLine(
+          Offset(rect.left, y),
+          Offset(rect.right, y + rect.width),
+          hatch,
+        );
+      }
+      canvas.restore();
+
+      // 左侧来源/只读标记条（形状差异，不只靠颜色）。
+      canvas.drawRect(
+        Rect.fromLTWH(rect.left, rect.top, _externalMarkerWidth, rect.height),
+        Paint()..color = _externalMarker,
+      );
+      // 每个实例的左上角再画一个小圆点，强调“这是外部来源”。
+      if (rect.height >= 12) {
+        canvas.drawCircle(
+          Offset(rect.left + _externalMarkerWidth + 4, rect.top + 4),
+          2.2,
+          Paint()..color = _externalMarker,
+        );
+      }
+      // 顶部虚线边框：与手工占用（实心描边）区分。
+      final border = Paint()
+        ..color = _externalBorder
+        ..strokeWidth = 1;
+      for (var x = rect.left + 3; x < rect.right; x += 6) {
+        canvas.drawLine(Offset(x, rect.top),
+            Offset(math.min(x + 3, rect.right), rect.top), border);
+      }
+      // 足够高时写「外部」两个字：文字本身也是非颜色区分。
+      if (rect.height >= 18 && rect.width >= 34) {
+        final label = TextPainter(
+          text: TextSpan(
+            text: '外部',
+            style: TextStyle(
+              fontSize: 8,
+              color: TsColors.textSecondary,
+              height: 1,
+            ),
+          ),
+          textDirection: TextDirection.ltr,
+        )..layout();
+        label.paint(
+          canvas,
+          Offset(rect.left + _externalMarkerWidth + 2, rect.top + 2),
+        );
+      }
+    }
+  }
+
   @override
   bool shouldRepaint(covariant _GridPainter old) =>
       old.days != days ||
       old.width != width ||
       old.rowHeight != rowHeight ||
-      old.topInset != topInset;
+      old.topInset != topInset ||
+      old.selected != selected ||
+      old.externalBusy != externalBusy ||
+      old.externalSourceNames != externalSourceNames;
 }
 
 // ---------------------------------------------------------------- navigation

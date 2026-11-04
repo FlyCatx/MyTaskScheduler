@@ -20,11 +20,17 @@ import '../model/display.dart';
 import '../model/session.dart';
 import '../model/shortcuts.dart';
 import '../state/app_controller.dart';
+import '../state/execution/effort_review_service.dart';
+import '../state/execution/effort_stats.dart';
 import '../state/settings_controller.dart';
+import 'analysis/chunked_analysis_dialog.dart';
 import 'calendar_gantt.dart';
 import 'calendar_settings_dialog.dart';
 import 'composer.dart';
 import 'desktop_window.dart';
+import 'execution/effort_review_dialog.dart';
+import 'execution/execution_actions.dart';
+import 'execution/execution_status_strip.dart';
 import './widgets/bezier_ui.dart';
 import './widgets/bezier_menu.dart';
 import 'dag_graph.dart';
@@ -33,6 +39,7 @@ import 'gantt_chart.dart';
 import 'history_panel.dart';
 import 'model_selection_dialog.dart';
 import 'notes_panel.dart';
+import 'ocr/ocr_import_dialog.dart';
 import 'settings_dialog.dart';
 import './widgets/status_strip.dart';
 import 'summary_bar.dart';
@@ -45,6 +52,43 @@ import 'user_menu.dart';
 enum ChartMode { tree, gantt }
 
 enum _CloseChoice { retry, cancel, discard }
+
+/// **等效宽度**（可用逻辑宽度 ÷ 文字缩放）≥ 该值时显示常驻侧栏；否则不常驻，
+/// 用户展开时只显示临时抽屉。
+///
+/// 0.2.2 把断点从 940 提到 1080：常驻侧栏宽 244，若在 940 附近就常驻，主区放不下
+/// 依赖视图标题行与输入框工具栏（实测 940–1040 在 1.0 倍字号下就横向溢出）。窗口
+/// 窄（例如 960 的原生最小宽度）时宁可改走抽屉形态、让主区拿整宽，也不要挤出一个
+/// 横向溢出。
+///
+/// 断点按**等效宽度**判断（见 [resolveSidebarWide] 的调用处）：文字放大后同样的
+/// 逻辑宽度能装下的内容变少，所以 1.5 倍字号下需要更宽的窗口才显示常驻侧栏，
+/// 否则主区仍会被挤到溢出。
+const double kSidebarResidentMinWidth = 1080;
+
+/// 断点滞回（DIP）：跨过 [kSidebarResidentMinWidth] 后还要再走这么多才切换形态，
+/// 避免把窗口拖到断点附近时侧栏反复展开/收起（抖动）。
+const double kSidebarBreakpointHysteresis = 24;
+
+/// 由**等效宽度**与前一次形态判定是否「宽」（= 常驻侧栏形态）。
+///
+/// 「等效宽度」= 可用逻辑宽度 ÷ 文字缩放（clamp 到 1.0..2.0），因此 1.5 倍字号下
+/// 1120 DIP 的窗口只按 747 判断 —— 主区拿到整宽，不会有“文字太大 + 常驻侧栏”
+/// 双重挤压。调用方负责做除法；本函数保持纯函数，可直接单测断点行为。
+///
+/// 滞回规则：
+///   * 之前没有判定（首帧）→ 直接按 1080 判断；
+///   * 窄 → 宽：需要 ≥ 1080 + 24 = 1104；
+///   * 宽 → 窄：需要 < 1080 - 24 = 1056。
+bool resolveSidebarWide(double effectiveWidth, bool? previous) {
+  if (previous == null) return effectiveWidth >= kSidebarResidentMinWidth;
+  if (previous) {
+    return effectiveWidth >=
+        kSidebarResidentMinWidth - kSidebarBreakpointHysteresis;
+  }
+  return effectiveWidth >=
+      kSidebarResidentMinWidth + kSidebarBreakpointHysteresis;
+}
 
 class AppShell extends StatefulWidget {
   final AppController controller;
@@ -79,7 +123,22 @@ class _AppShellState extends State<AppShell> {
   final FocusNode _searchFocus = FocusNode(debugLabel: 'conversation-search');
 
   ChartMode _chartMode = ChartMode.tree;
-  bool _showHistory = true;
+
+  /// 侧栏的**用户偏好**：唯一状态，只有用户动作会改它（标题栏按钮 / Ctrl+B /
+  /// 侧栏收起按钮 / 搜索会话快捷键）。
+  ///
+  /// 窗口尺寸永远**不**写这里——0.2.1 在 LayoutBuilder 里直接写 `_showHistory`，
+  /// 于是窗口缩窄一次侧栏就永久消失、放大/最大化也不会自己回来。这是本次修复的根因。
+  bool _sidebarWanted = true;
+
+  /// 窄窗口下的**临时抽屉**。只在可用逻辑宽度小于断点时显示；关闭它不会改
+  /// [_sidebarWanted]，所以「窄屏里关掉抽屉」不会被误当成「用户收起了侧栏」——
+  /// 窗口变宽后侧栏会按用户偏好自动恢复。
+  bool _sidebarDrawerOpen = false;
+
+  /// 上一次布局判定的宽/窄结果（带滞回，见 [_isWideFor]）；null = 还没判过。
+  bool? _wideLayout;
+
   double _listWidth = 360;
   String? _lastConversationId;
   RunState? _previousRun;
@@ -130,6 +189,12 @@ class _AppShellState extends State<AppShell> {
     });
     // 原生关闭（标题栏 X、菜单退出、Alt+F4、任务栏关闭）统一走保存流程。
     _window.onCloseRequested = _handleWindowClose;
+    // 本地 OCR 的文件选择器：直接使用原生对话框；不可用时对话框会明确说明。
+    OcrFilePicker.defaultPick = () async {
+      final gw = c.gateway;
+      if (gw == null) return const <String>[];
+      return gw.pickTextFiles(title: '选择扫描 PDF 或图片（本地 OCR）');
+    };
     _window.attach().then((_) {
       if (mounted) _window.setCloseGuard(true);
     });
@@ -157,6 +222,8 @@ class _AppShellState extends State<AppShell> {
         if (choice == _CloseChoice.discard) break;
         // retry: loop and flush again.
       }
+      // 计时检查点必须在窗口销毁前落盘（活动计时保存后暂停，不把退出期间算成工作）。
+      await c.shutdown();
       await _window.confirmClose();
     } finally {
       _closing = false;
@@ -222,6 +289,171 @@ class _AppShellState extends State<AppShell> {
 
   void _onSettingsChanged() {
     if (mounted) setState(() {});
+  }
+
+  // --------------------------------------------------------------- sidebar
+
+  /// 当前**等效宽度**（可用逻辑宽度 ÷ 文字缩放）是否算「宽」（= 常驻侧栏形态），
+  /// 带 ±[kSidebarBreakpointHysteresis] 滞回，见 [resolveSidebarWide]。只读
+  /// [_wideLayout]（上一次判定），不碰 [_sidebarWanted]。
+  bool _isWideFor(double effectiveWidth) =>
+      resolveSidebarWide(effectiveWidth, _wideLayout);
+
+  /// 把 LayoutBuilder 的可用逻辑宽度换成「等效宽度」：文字放大后同样宽度能装下的
+  /// 内容更少，所以断点要按缩放折算。clamp 避免极端设置（<1.0 或 >2.0）把形态
+  /// 翻来翻去。
+  static double _effectiveWidth(double width, TextScaler textScaler) {
+    final scale = textScaler.scale(1).clamp(1.0, 2.0);
+    return width / scale;
+  }
+
+  /// 标题栏按钮 / Ctrl+B：宽屏切换「常驻侧栏偏好」，窄屏只开关临时抽屉。
+  void _toggleSidebar() {
+    setState(() {
+      if (_wideLayout == true) {
+        _sidebarWanted = !_sidebarWanted;
+        if (!_sidebarWanted) _sidebarDrawerOpen = false;
+      } else {
+        // 窄屏没有常驻侧栏可收起：这里只开关临时抽屉，不写用户偏好。
+        _sidebarDrawerOpen = !_sidebarDrawerOpen;
+      }
+    });
+    if (_sidebarDrawerOpen) _focusRootSoon();
+  }
+
+  /// 折叠状态下唯一的展开入口（rail）以及搜索会话快捷键都走这里。
+  void _expandSidebar() {
+    if (_wideLayout == true) {
+      setState(() => _sidebarWanted = true);
+    } else {
+      setState(() => _sidebarDrawerOpen = true);
+      _focusRootSoon();
+    }
+  }
+
+  /// 侧栏头部「收起」按钮：只改用户偏好（宽屏才会出现常驻侧栏）。
+  void _collapseSidebar() {
+    setState(() {
+      _sidebarWanted = false;
+      _sidebarDrawerOpen = false;
+    });
+  }
+
+  /// 关闭窄屏临时抽屉。**不**改 [_sidebarWanted]：用户只是关掉了这个临时浮层，
+  /// 不是决定“以后都不要侧栏”。窗口变宽后侧栏按偏好自动恢复。
+  void _closeSidebarDrawer() {
+    if (!_sidebarDrawerOpen) return;
+    setState(() => _sidebarDrawerOpen = false);
+    _focusRootSoon();
+  }
+
+  /// 让全局快捷键（尤其是 Esc）有焦点所有者。
+  void _focusRootSoon() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) _rootFocus.requestFocus();
+    });
+  }
+
+  /// 会话列表本身（常驻侧栏与窄屏抽屉共用同一份实现）。
+  ///
+  /// 只读取现有状态（会话、搜索词、列表模式），不修改它们；折叠/展开不会改变
+  /// 当前会话、搜索词或选中任务。[searchFocusNode] 只在列表可见时传入，避免隐藏
+  /// 的常驻列表与抽屉同时挂同一个 FocusNode。
+  Widget _sidebarList({FocusNode? searchFocusNode}) {
+    return HistorySidebarList(
+      summaries: c.searchSummaries(
+        _conversationQuery,
+        archived: _listMode == ConversationListMode.archived,
+        deleted: _listMode == ConversationListMode.trash,
+      ),
+      currentId: c.conversation?.id,
+      mode: _listMode,
+      query: _conversationQuery,
+      onQuery: (value) => setState(() => _conversationQuery = value),
+      onMode: (mode) => setState(() => _listMode = mode),
+      onOpen: (id) {
+        c.openConversation(id);
+        // 抽屉是临时浮层：选中会话后自动收起（不改用户偏好）。
+        if (_sidebarDrawerOpen) _closeSidebarDrawer();
+      },
+      onMenu: _showConversationMenu,
+      searchFocusNode: searchFocusNode,
+    );
+  }
+
+  /// 窄屏临时抽屉 / 覆盖面板：标题行（新建 + 关闭）+ 会话列表 + 账户入口。
+  ///
+  /// 它有明确的关闭按钮；点击遮罩或按 Esc 也会关闭。关闭**不改**
+  /// [_sidebarWanted]，所以窗口重新变宽时常驻侧栏会按用户偏好恢复。
+  Widget _buildSidebarDrawer() {
+    return Positioned.fill(
+      top: AppTitleBar.height,
+      child: Stack(
+        children: [
+          // 遮罩：点击空白处关闭抽屉。
+          Positioned.fill(
+            child: GestureDetector(
+              key: const Key('sidebar-drawer-barrier'),
+              behavior: HitTestBehavior.opaque,
+              onTap: _closeSidebarDrawer,
+              child: Container(color: Colors.black.withValues(alpha: 0.22)),
+            ),
+          ),
+          Positioned(
+            left: 0,
+            top: 0,
+            bottom: 0,
+            width: kSidebarWidth,
+            child: Material(
+              key: const Key('sidebar-drawer'),
+              color: TsColors.sidebar,
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  SizedBox(
+                    height: TsSizes.textScaleAwareHeight(context, kTopBarHeight),
+                    child: Padding(
+                      padding: const EdgeInsets.only(left: 14, right: 4),
+                      child: Row(
+                        children: [
+                          const Text(
+                            '会话',
+                            style: TextStyle(
+                              fontSize: 13.5,
+                              fontWeight: FontWeight.w600,
+                            ),
+                          ),
+                          const Spacer(),
+                          IconButton(
+                            tooltip: '新建会话',
+                            visualDensity: VisualDensity.compact,
+                            onPressed: _onNewConversation,
+                            icon: const Icon(Icons.edit_square, size: 17),
+                          ),
+                          IconButton(
+                            key: const Key('sidebar-drawer-close'),
+                            tooltip: '关闭会话栏',
+                            visualDensity: VisualDensity.compact,
+                            onPressed: _closeSidebarDrawer,
+                            icon: const Icon(Icons.close, size: 17),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                  Expanded(child: _sidebarList(searchFocusNode: _searchFocus)),
+                  Container(height: 1, color: TsColors.border),
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(10, 8, 10, 10),
+                    child: UserMenuButton(onOpenSettings: _openSettings),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
   }
 
   /// In-app completion/failure notice. The 120-second reminder is a *request control*
@@ -297,7 +529,12 @@ class _AppShellState extends State<AppShell> {
       child: Actions(
         actions: <Type, Action<Intent>>{
           _CloseDetailIntent: CallbackAction<_CloseDetailIntent>(onInvoke: (_) {
-            c.interaction.closeDetail();
+            // Esc 先关最上层浮层：窄屏临时抽屉优先，其次才是详情卡。
+            if (_sidebarDrawerOpen) {
+              _closeSidebarDrawer();
+            } else {
+              c.interaction.closeDetail();
+            }
             return null;
           }),
           _NewSessionIntent: CallbackAction<_NewSessionIntent>(onInvoke: (_) {
@@ -328,9 +565,14 @@ class _AppShellState extends State<AppShell> {
           }),
           _SearchConversationsIntent:
               CallbackAction<_SearchConversationsIntent>(onInvoke: (_) {
-            setState(() => _showHistory = true);
+            // 搜索会话需要侧栏可见：宽屏打开常驻侧栏，窄屏打开临时抽屉。
+            if (_wideLayout == true) {
+              setState(() => _sidebarWanted = true);
+            } else {
+              setState(() => _sidebarDrawerOpen = true);
+            }
             WidgetsBinding.instance.addPostFrameCallback((_) {
-              _searchFocus.requestFocus();
+              if (mounted) _searchFocus.requestFocus();
             });
             return null;
           }),
@@ -340,7 +582,7 @@ class _AppShellState extends State<AppShell> {
           }),
           _ToggleSidebarIntent:
               CallbackAction<_ToggleSidebarIntent>(onInvoke: (_) {
-            setState(() => _showHistory = !_showHistory);
+            _toggleSidebar();
             return null;
           }),
           _StopAnalysisIntent: CallbackAction<_StopAnalysisIntent>(onInvoke: (_) {
@@ -359,9 +601,38 @@ class _AppShellState extends State<AppShell> {
             // longer look like mismatched grey/white blocks.
             backgroundColor: TsColors.surface,
             body: LayoutBuilder(builder: (context, constraints) {
-              final wide = constraints.maxWidth >= 940;
-              if (!wide) _showHistory = false;
-              final showSidebar = _showHistory && wide;
+              /*
+               * 侧栏形态只由两件事决定（R2-SB）：
+               *   * **等效宽度**（可用逻辑宽度 ÷ 文字缩放）是否够宽 —— 带滞回；
+               *   * 用户偏好 _sidebarWanted —— 只有用户动作会改它。
+               *
+               * 这里**不写** _sidebarWanted：窗口缩窄/放大只改变“常驻侧栏能不能显示”，
+               * 不会把用户的选择记成“不要侧栏”，所以缩窄再放大能自动恢复；
+               * 用户手动收起后，放大/最大化也仍然保持收起。
+               *
+               * 用等效宽度而不是原始宽度：1.5 倍字号下 1120 DIP 只按 747 判断，
+               * 侧栏改走抽屉、主区拿整宽，避免“文字大 + 常驻侧栏”双重挤压导致溢出。
+               */
+              final effectiveWidth = _effectiveWidth(
+                constraints.maxWidth,
+                MediaQuery.textScalerOf(context),
+              );
+              final wide = _isWideFor(effectiveWidth);
+              if (_wideLayout != wide) {
+                _wideLayout = wide;
+                if (wide && _sidebarDrawerOpen) {
+                  // 变宽后常驻侧栏接管，窄屏临时抽屉不再有意义。这是形态切换，
+                  // 不是“用户关抽屉”，所以只清临时状态，不碰 _sidebarWanted。
+                  WidgetsBinding.instance.addPostFrameCallback((_) {
+                    if (mounted && _sidebarDrawerOpen) {
+                      setState(() => _sidebarDrawerOpen = false);
+                    }
+                  });
+                }
+              }
+              // 常驻侧栏 = 宽屏 && 用户想要；窄屏永远不常驻，只用临时抽屉。
+              final residentSidebar = wide && _sidebarWanted;
+              final drawerOpen = !wide && _sidebarDrawerOpen;
               /*
                * Three full-width bands instead of two independent columns:
                *   top    — sidebar title | summary bar      (same height)
@@ -370,15 +641,15 @@ class _AppShellState extends State<AppShell> {
                * Putting both sides of a band in ONE Row is what actually makes the
                * heights match; two Columns would drift apart as content changes.
                */
-              return Column(
+              final shell = Column(
                 children: [
                   // 自绘标题栏：替代 Windows 原生标题栏的可见部分；拖动/吸附/缩放
                   // 仍由原生 WM_NCHITTEST 处理。
                   AppTitleBar(
                     window: _window,
-                    sidebarVisible: showSidebar,
-                    onToggleSidebar: () =>
-                        setState(() => _showHistory = !_showHistory),
+                    // 抽屉打开时按钮语义是“收起”，所以也算可见。
+                    sidebarVisible: residentSidebar || drawerOpen,
+                    onToggleSidebar: _toggleSidebar,
                     onOpenAbout: _openAbout,
                     onExit: _exitApplication,
                   ),
@@ -388,13 +659,17 @@ class _AppShellState extends State<AppShell> {
                     child: Row(
                       crossAxisAlignment: CrossAxisAlignment.stretch,
                       children: [
-                        if (showSidebar)
+                        if (residentSidebar)
                           HistorySidebarHeader(
                             onNew: _onNewConversation,
-                            onCollapse: () => setState(() => _showHistory = false),
+                            onCollapse: _collapseSidebar,
                           )
                         else
-                          SidebarRail(onExpand: () => setState(() => _showHistory = true)),
+                          // 折叠形态只在中间带保留**唯一**一个展开入口；顶/底带
+                          // 只留同宽占位，右侧内容因此不会横向跳动。
+                          const _SidebarRailSpacer(
+                            key: Key('sidebar-collapsed-header'),
+                          ),
                         Expanded(
                           child: SummaryBar(
                             conversation: conv,
@@ -415,27 +690,39 @@ class _AppShellState extends State<AppShell> {
                     child: Row(
                       crossAxisAlignment: CrossAxisAlignment.stretch,
                       children: [
-                        if (showSidebar)
-                          HistorySidebarList(
-                            summaries: c.searchSummaries(
-                              _conversationQuery,
-                              archived:
-                                  _listMode == ConversationListMode.archived,
-                              deleted:
-                                  _listMode == ConversationListMode.trash,
+                        /*
+                         * 折叠/展开只改变可见性，不销毁会话列表：
+                         *   * rail 一直在树里（折叠时可见，展开时 offstage），所以整个
+                         *     shell 只有一个展开入口，且不随形态切换重建；
+                         *   * 会话列表同理，展开→折叠→展开后**滚动位置**还在（离屏时
+                         *     不参与语义/焦点，也不会被点到）。
+                         */
+                        Offstage(
+                          offstage: residentSidebar,
+                          child: SizedBox(
+                            width: kRailWidth,
+                            child: SidebarRail(
+                              key: const Key('sidebar-rail-expand'),
+                              onExpand: _expandSidebar,
                             ),
-                            currentId: conv?.id,
-                            mode: _listMode,
-                            query: _conversationQuery,
-                            onQuery: (value) =>
-                                setState(() => _conversationQuery = value),
-                            onMode: (mode) => setState(() => _listMode = mode),
-                            onOpen: (id) => c.openConversation(id),
-                            onMenu: _showConversationMenu,
-                            searchFocusNode: _searchFocus,
-                          )
-                        else
-                          SidebarRail(onExpand: () => setState(() => _showHistory = true)),
+                          ),
+                        ),
+                        Offstage(
+                          offstage: !residentSidebar,
+                          child: SizedBox(
+                            width: kSidebarWidth,
+                            child: ExcludeFocus(
+                              excluding: !residentSidebar,
+                              child: ExcludeSemantics(
+                                excluding: !residentSidebar,
+                                child: _sidebarList(
+                                  searchFocusNode:
+                                      residentSidebar ? _searchFocus : null,
+                                ),
+                              ),
+                            ),
+                          ),
+                        ),
                         Expanded(
                           child: Column(
                             children: [
@@ -447,6 +734,10 @@ class _AppShellState extends State<AppShell> {
                                 statusMessage: c.statusMessage,
                                 onDismissError: c.clearMessages,
                               ),
+                              // 0.2.3（R3-E）：常驻执行计时状态区。切会话/切视图都
+                              // 还能看到正在计时的任务；空闲时也保留“工时回顾”入口。
+                              if (c.executionTimer != null)
+                                _buildExecutionStatusArea(),
                               if (c.waitPromptVisible && run != null)
                                 WaitPromptBar(
                                   run: run,
@@ -476,15 +767,19 @@ class _AppShellState extends State<AppShell> {
                     child: Row(
                       crossAxisAlignment: CrossAxisAlignment.stretch,
                       children: [
-                        if (showSidebar)
+                        if (residentSidebar)
                           SidebarBottomBand(
                             child: UserMenuButton(
                               onOpenSettings: _openSettings,
                             ),
                           )
                         else
-                          SidebarRail(
-                              onExpand: () => setState(() => _showHistory = true)),
+                          // 折叠形态的底部带：账户入口有真实语义（打开设置/账户页），
+                          // 保留；它不是一个重复的侧栏展开开关。
+                          _CollapsedSidebarFooterBand(
+                            key: const Key('sidebar-collapsed-footer'),
+                            onOpenSettings: _openSettings,
+                          ),
                         Expanded(
                           child: ComposerBand(
                             child: Composer(
@@ -522,6 +817,15 @@ class _AppShellState extends State<AppShell> {
                       ],
                     ),
                   ),
+                ],
+              );
+              if (!drawerOpen) return shell;
+              // 窄屏临时抽屉：覆盖在内容之上，有明确关闭按钮，Esc 也走
+              // `_CloseDetailIntent`（见 _buildShortcuts/_CloseDetailIntent）。
+              return Stack(
+                children: [
+                  Positioned.fill(child: shell),
+                  _buildSidebarDrawer(),
                 ],
               );
             }),
@@ -643,7 +947,10 @@ class _AppShellState extends State<AppShell> {
                                         snapshot: snapshot,
                                         interaction: c.interaction,
                                         version: c.viewVersion,
-                                        calendar: c.calendar,
+                                        // 合成快照：只读外部忙碌已并入 settings，冲突检测/
+                                        // 不可用时段因此包含外部占用；手工时间表本身不变。
+                                        calendar:
+                                            c.currentCalendarSchedule ?? c.calendar,
                                         initialMode:
                                             c.conversation?.ganttMode ?? 'relative',
                                         onModeChanged: (mode) =>
@@ -775,6 +1082,7 @@ class _AppShellState extends State<AppShell> {
           canEdit: c.canEditPlan,
           onEdit: () => _editTask(task, snapshot),
           onCycleCondition: (index) => _cycleCondition(task, index, snapshot),
+          executionSection: _buildExecutionSection(task),
         ),
       ),
     );
@@ -859,13 +1167,26 @@ class _AppShellState extends State<AppShell> {
   }
 
   /// Opens the settings window. Unsaved changes are handled inside the dialog.
+  ///
+  /// The external-calendar service is optional; when the app was bootstrapped without
+  /// one the settings page shows an explicit "service unavailable" notice.
   Future<void> _openSettings({SettingsSection initial = SettingsSection.account}) async {
+    final conv = c.conversation;
     await showSettingsDialog(
       context,
       controller: s,
       initial: initial,
       storageSource: c.storageSource,
       storageMemoryOnly: !c.storageIsPersistent,
+      externalCalendar: c.externalCalendar,
+      timezoneId: c.calendar.settings.timezoneId,
+      currentConversationTitle: conv?.generatedTitle,
+      // 0.2.3（R3-E）：备份/恢复执行记录必须复用运行中的存储实例。
+      executionStore: c.executionTimer?.store,
+      // 外部日历来源变化后刷新只读占用/排程等界面（不重新规划、不改手工时间表）。
+      onExternalCalendarChanged: () {
+        if (mounted) setState(() {});
+      },
     );
     if (mounted) _rootFocus.requestFocus();
   }
@@ -904,8 +1225,18 @@ class _AppShellState extends State<AppShell> {
       return;
     }
     final conv = c.conversation;
-    final settings = c.viewVersion?.calendar.settings ?? c.calendar.settings;
+    // 编辑的是“当前看到的版本”：外部忙碌已合成进排程快照，所以设置也用合成快照的
+    // settings，冲突提示/不可用时段才与图上一致；没有版本时退回当前日历设置。
+    final settings = c.currentCalendarSchedule?.settings ??
+        c.viewVersion?.calendar.settings ??
+        c.calendar.settings;
+    // 时间表仍是手工权威数据：外部日历只作为只读输入传给编辑器展示。
     final timetable = c.currentTimetable();
+    // 绑定面板需要“任务预估时长”才能显示预留与计划时长的差异；工时未知的任务以
+    // null 传入，面板显示“未知”，绝不按 0 计算。
+    final taskEstimatedHours = <String, double?>{
+      for (final task in c.schedulingTasks()) task.id: task.estimatedHours,
+    };
     final result = await showCalendarSettingsDialog(
       context,
       settings: settings,
@@ -915,7 +1246,11 @@ class _AppShellState extends State<AppShell> {
       initialMode: c.defaultCalendarEditor,
       defaultUnavailableRanges: c.defaultUnavailableRanges,
       taskNames: c.taskNamesById,
+      taskEstimatedHours: taskEstimatedHours,
       useDefaultTimetable: conv?.calendarDraft == null && c.viewVersion == null,
+      // 外部日历只读展示：编辑器可看到斜纹占用与来源，但绝不会写回手工时间表。
+      externalCalendar: c.externalCalendar,
+      externalSourceIds: c.currentExternalSourceIds,
       onApply: (r) => c.applyTimetableSettings(
         r.settings,
         r.timetable ?? timetable,
@@ -936,6 +1271,236 @@ class _AppShellState extends State<AppShell> {
   /// Multi-selection is enabled, so one dialog can add several files; each is read and
   /// validated independently and per-file failures are reported without losing the ones
   /// that succeeded.
+  // --------------------------------------------- execution (0.2.3 R3-E/R3-R)
+
+  /// 常驻执行状态区：左侧是当前计时任务（空闲时也保留入口），右侧是工时回顾。
+  Widget _buildExecutionStatusArea() {
+    final timer = c.executionTimer!;
+    return Row(
+      children: [
+        Expanded(
+          child: ExecutionStatusStrip(
+            controller: timer,
+            showWhenIdle: true,
+            onOpenTask: _openActiveTimerTask,
+          ),
+        ),
+        Tooltip(
+          message: '工时回顾与 CSV 导出',
+          child: TextButton.icon(
+            key: const Key('open-effort-review'),
+            onPressed: _openEffortReview,
+            icon: const Icon(Icons.assessment_outlined, size: 14),
+            label: const Text('回顾', style: TextStyle(fontSize: 11.5)),
+            style: TextButton.styleFrom(
+              visualDensity: VisualDensity.compact,
+              padding: const EdgeInsets.symmetric(horizontal: 8),
+            ),
+          ),
+        ),
+        if (c.conversation != null && !c.isRunning && !c.chunkedAnalysisRunning)
+          Tooltip(
+            message: '超大材料分块分析（多次模型请求，费用未知）',
+            child: TextButton.icon(
+              key: const Key('open-chunked-analysis'),
+              onPressed: _openChunkedAnalysis,
+              icon: const Icon(Icons.call_split, size: 14),
+              label: const Text('分块分析', style: TextStyle(fontSize: 11.5)),
+              style: TextButton.styleFrom(
+                visualDensity: VisualDensity.compact,
+                padding: const EdgeInsets.symmetric(horizontal: 8),
+              ),
+            ),
+          ),
+        if (c.ocr != null && !c.isRunning)
+          Tooltip(
+            message: '扫描 PDF / 图片：本地离线 OCR，识别后可校对',
+            child: TextButton.icon(
+              key: const Key('open-ocr-import'),
+              onPressed: _openOcrImport,
+              icon: const Icon(Icons.document_scanner_outlined, size: 14),
+              label: const Text('OCR', style: TextStyle(fontSize: 11.5)),
+              style: TextButton.styleFrom(
+                visualDensity: VisualDensity.compact,
+                padding: const EdgeInsets.symmetric(horizontal: 8),
+              ),
+            ),
+          ),
+      ],
+    );
+  }
+
+  /// 打开本地 OCR 导入（不依赖先尝试文本提取）。
+  Future<void> _openOcrImport() async {
+    final service = c.ocr;
+    if (service == null) {
+      _showSnack('本地 OCR 未启用');
+      return;
+    }
+    await showOcrImportDialog(
+      context,
+      service: service,
+      onConfirm: (material) async {
+        final error = await c.addOcrMaterial(material);
+        if (error != null) {
+          _showSnack(error);
+          return false;
+        }
+        return true;
+      },
+    );
+  }
+
+  /// 打开分块分析对话框（先做不联网的本地预估，用户确认后才发请求）。
+  Future<void> _openChunkedAnalysis() async {
+    final estimate = c.describeChunkedAnalysis();
+    if (estimate == null) {
+      _showSnack('当前没有可分析的文本材料（请先粘贴材料或添加文件）');
+      return;
+    }
+    await ChunkedAnalysisDialog.show(
+      context,
+      controller: c,
+      estimate: estimate,
+    );
+  }
+
+  /// 点状态区里的任务名：切到计时任务所在会话（不改计时状态）。
+  void _openActiveTimerTask() {
+    final active = c.executionTimer?.active;
+    if (active == null) return;
+    if (active.conversationId != c.conversation?.id) {
+      c.openConversation(active.conversationId);
+    }
+  }
+
+  /// 任务详情卡里的“执行与实际耗时”区；未启用计时时返回 null（完全隐藏）。
+  Widget? _buildExecutionSection(DisplayTask task) {
+    final timer = c.executionTimer;
+    if (timer == null) return null;
+    final ref = c.executionRefFor(task.id);
+    if (ref == null) return null;
+    final effort = c.executionTaskEffort(task.id);
+    final lines = <String>[];
+    if (effort == null || !effort.factsKnown) {
+      lines.add('实际耗时：$kEffortUnknownLabel（尚未计时或补记）');
+    } else {
+      final parts = <String>[
+        '实际 ${formatEffortHours(effort.actualHours)}',
+        if (effort.baselineHours != null)
+          '基线 ${formatEffortHours(effort.baselineHours)}',
+      ];
+      final deviation = effort.deviationHours;
+      if (deviation != null) {
+        final sign = deviation >= 0 ? '+' : '';
+        final pct = effort.deviationPercent;
+        parts.add('偏差 $sign${formatEffortHours(deviation)}'
+            '${pct == null ? '' : '（${formatEffortPercent(pct)}）'}');
+      }
+      lines.add(parts.join(' · '));
+    }
+    if (effort != null && effort.totalPending > Duration.zero) {
+      lines.add('待校正 ${formatEffortDuration(effort.totalPending)}'
+          '（未计入实际，需确认）');
+    }
+    if (effort != null &&
+        !effort.isDone &&
+        effort.suggestedRemainingHours != null) {
+      lines.add('剩余建议 ${formatEffortHours(effort.suggestedRemainingHours)}'
+          '（建议值，未自动完成）');
+    }
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        for (final line in lines)
+          Padding(
+            padding: const EdgeInsets.only(bottom: 4),
+            child: Text(line,
+                style: TextStyle(
+                    fontSize: 12,
+                    height: 1.4,
+                    color: TsColors.textSecondary)),
+          ),
+        const SizedBox(height: 4),
+        ExecutionActions(
+          controller: timer,
+          taskRef: ref,
+          done: task.status == 'done',
+          onToggleCompletion: () async {
+            await c.toggleCompletion(task.id);
+          },
+        ),
+      ],
+    );
+  }
+
+  Future<void> _openEffortReview() async {
+    final timer = c.executionTimer;
+    if (timer == null) return;
+    final tasks = c.executionTaskContext().values.toList(growable: false);
+    final conversations = <ExecutionConversationInfo>[
+      for (final summary in c.summaries)
+        ExecutionConversationInfo(id: summary.id, title: summary.displayTitle),
+    ];
+    await EffortReviewDialog.show(
+      context,
+      service: EffortReviewService(ledger: timer.ledger),
+      tasks: tasks,
+      conversations: conversations,
+      onExport: _exportReviewCsv,
+    );
+  }
+
+  /// 导出回顾 CSV：复用现有的“输入保存路径”对话框，写入由 AppController 负责。
+  Future<bool> _exportReviewCsv(
+      String name, String csv, String suggestedPath) async {
+    final pathController = TextEditingController(
+      text: suggestedPath.contains('\\') || suggestedPath.contains('/')
+          ? suggestedPath
+          : '${_defaultDir()}\\$suggestedPath',
+    );
+    final path = await showDialog<String>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: Text('导出$name'),
+        content: SizedBox(
+          width: 520,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              TextField(
+                controller: pathController,
+                style: const TextStyle(fontSize: 12),
+                decoration: const InputDecoration(labelText: '保存路径'),
+              ),
+              const SizedBox(height: 8),
+              Text(
+                'CSV 含时区、统计范围、口径与未知值；不含 API Key 与材料原文。',
+                style: TextStyle(fontSize: 11.5, color: TsColors.textFaint),
+              ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.of(context).pop(),
+              child: const Text('取消')),
+          FilledButton(
+            onPressed: () =>
+                Navigator.of(context).pop(pathController.text.trim()),
+            child: const Text('导出'),
+          ),
+        ],
+      ),
+    );
+    if (path == null || path.isEmpty) return false;
+    final error = await c.writeEffortCsv(path: path, csv: csv);
+    if (!mounted) return error == null;
+    _showSnack(error ?? '已导出$name 到 $path');
+    return error == null;
+  }
+
   Future<void> _addFile() async {
     final gw = c.gateway;
     if (gw == null) {
@@ -957,10 +1522,34 @@ class _AppShellState extends State<AppShell> {
       final ok = await c.addTextFile(path);
       if (ok) {
         added++;
-      } else {
-        final name = path.split(Platform.pathSeparator).last;
-        failures.add('$name：${c.errorMessage ?? '无法添加'}');
+        continue;
       }
+      final name = path.split(Platform.pathSeparator).last;
+      // 扫描型 PDF / 图片：文本提取明确返回 unsupported_ocr 且本地 OCR 可用时，
+      // 直接进入 OCR 导入（页范围→识别→校对→加入材料），而不是只报“不支持”。
+      if (c.lastDocumentErrorCode == 'unsupported_ocr' && c.ocr != null) {
+        if (!mounted) return;
+        final confirmed = await showOcrImportDialog(
+          context,
+          service: c.ocr!,
+          initialFilePath: path,
+          onConfirm: (material) async {
+            final error = await c.addOcrMaterial(material);
+            if (error != null) {
+              _showSnack(error);
+              return false;
+            }
+            return true;
+          },
+        );
+        if (confirmed) {
+          added++;
+          continue;
+        }
+        failures.add('$name：未完成本地 OCR 导入');
+        continue;
+      }
+      failures.add('$name：${c.errorMessage ?? '无法添加'}');
     }
     if (!mounted) return;
     if (failures.isEmpty) {
@@ -1518,11 +2107,17 @@ class _ChartHeader extends StatelessWidget {
           const Text('依赖视图',
               style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600)),
           const SizedBox(width: 10),
-          Text(
-            '${snapshot.tasks.length} 个任务 · ${snapshot.order.length} 个进入建议顺序',
-            style: TextStyle(fontSize: 11.5, color: TsColors.textFaint),
+          // 计数是“可以截断”的说明文字：窄窗口 / 1.5 倍字号下必须让位给右侧的视图
+          // 切换器，而不是把整行撑出横向溢出（0.2.1 在 960–1040 就是这样溢出的）。
+          Expanded(
+            child: Text(
+              '${snapshot.tasks.length} 个任务 · ${snapshot.order.length} 个进入建议顺序',
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(fontSize: 11.5, color: TsColors.textFaint),
+            ),
           ),
-          const Spacer(),
+          const SizedBox(width: 8),
           BezierSegments(
             height: 30,
             itemWidth: 88,
@@ -1612,4 +2207,59 @@ class _ToggleSidebarIntent extends Intent {
 
 class _StopAnalysisIntent extends Intent {
   const _StopAnalysisIntent();
+}
+
+/// 折叠形态下顶/底带里的同宽占位（与 [SidebarRail] 一样 40 DIP 宽）。
+///
+/// 它只画侧栏背景与右边框，**不**放展开按钮：0.2.1 的截图里上/中/下三个重复的
+/// 展开图标就是三条带各放了一个 [SidebarRail] 造成的；现在整个折叠状态只有中间
+/// 带那一个展开入口，顶/底带只负责让右侧内容不横向跳动。
+class _SidebarRailSpacer extends StatelessWidget {
+  const _SidebarRailSpacer({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: kRailWidth,
+      decoration: BoxDecoration(
+        color: TsColors.sidebar,
+        border: Border(right: BorderSide(color: TsColors.border)),
+      ),
+    );
+  }
+}
+
+/// 折叠形态的底部带：保留有真实语义的账户入口（打开设置/账户页）。
+///
+/// 它不是折叠开关——不展开侧栏，所以不会与唯一的 rail 入口重复。常驻侧栏展开时
+/// 账户入口在 [SidebarBottomBand] 里（完整用户菜单）。
+class _CollapsedSidebarFooterBand extends StatelessWidget {
+  const _CollapsedSidebarFooterBand({
+    super.key,
+    required this.onOpenSettings,
+  });
+
+  final VoidCallback onOpenSettings;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: kRailWidth,
+      decoration: BoxDecoration(
+        color: TsColors.sidebar,
+        border: Border(right: BorderSide(color: TsColors.border)),
+      ),
+      padding: const EdgeInsets.fromLTRB(5, 0, 5, 10),
+      child: Align(
+        alignment: Alignment.bottomCenter,
+        child: IconButton(
+          key: const Key('sidebar-collapsed-account'),
+          tooltip: '账户与设置',
+          onPressed: onOpenSettings,
+          style: TsButtons.icon(size: 28),
+          icon: const Icon(Icons.person_outline, size: 16),
+        ),
+      ),
+    );
+  }
 }

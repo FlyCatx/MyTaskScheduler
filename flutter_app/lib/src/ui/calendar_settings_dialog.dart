@@ -13,11 +13,16 @@ import 'package:flutter/material.dart';
 
 import '../model/calendar.dart';
 import '../model/calendar_proposals.dart';
+import '../model/external_calendar.dart';
 import '../model/settings.dart';
 import '../model/timetable.dart';
 import '../state/calendar_constraints.dart';
+import '../state/external_calendar_service.dart';
 import '../state/time_ranges.dart';
 import './calendar_grid.dart';
+import './external_calendar_dialog.dart';
+import './task_binding_panel.dart';
+import './timetable_copy_dialog.dart';
 import './widgets/bezier_ui.dart';
 import 'theme.dart';
 
@@ -79,7 +84,15 @@ Future<CalendarSettingsResult?> showCalendarSettingsDialog(
   List<UnavailableRange> defaultUnavailableRanges =
       const <UnavailableRange>[],
   Map<String, String> taskNames = const <String, String>{},
+  Map<String, double?> taskEstimatedHours = const <String, double?>{},
   bool useDefaultTimetable = false,
+  // R2：外部日历（只读）。null = 不显示外部日历入口，行为与 0.2.1 完全一致。
+  ExternalCalendarService? externalCalendar,
+  Set<String> externalSourceIds = const <String>{},
+  ExternalCalendarPickFiles? externalCalendarPickFiles,
+  /// 外部日历导入成功后的通知（应用层据此刷新只读占用/冲突视图）。
+  /// 编辑器自身已经监听 service 的 ChangeNotifier；这个回调是给宿主窗口的可选接线。
+  VoidCallback? onExternalCalendarChanged,
   Future<bool> Function(CalendarSettingsResult result)? onApply,
 }) {
   return showDialog<CalendarSettingsResult>(
@@ -93,7 +106,12 @@ Future<CalendarSettingsResult?> showCalendarSettingsDialog(
       initialMode: initialMode,
       defaultUnavailableRanges: defaultUnavailableRanges,
       taskNames: taskNames,
+      taskEstimatedHours: taskEstimatedHours,
       useDefaultTimetable: useDefaultTimetable,
+      externalCalendar: externalCalendar,
+      externalSourceIds: externalSourceIds,
+      externalCalendarPickFiles: externalCalendarPickFiles,
+      onExternalCalendarChanged: onExternalCalendarChanged,
       onApply: onApply,
     ),
   );
@@ -176,7 +194,23 @@ class _CalendarSettingsDialog extends StatefulWidget {
   final CalendarEditorMode initialMode;
   final List<UnavailableRange> defaultUnavailableRanges;
   final Map<String, String> taskNames;
+
+  /// 任务 ID → 预估工时（小时）；null/缺省表示工时未知（不按 0 处理）。
+  final Map<String, double?> taskEstimatedHours;
   final bool useDefaultTimetable;
+
+  /// R2：外部日历服务（只读）。null 时不显示「外部日历」入口。
+  final ExternalCalendarService? externalCalendar;
+
+  /// 当前会话启用/关联的外部来源 id（只读展示用）。
+  final Set<String> externalSourceIds;
+
+  /// 导入向导的文件选择注入（生产默认走全局注册的原生文件选择）。
+  final ExternalCalendarPickFiles? externalCalendarPickFiles;
+
+  /// 外部日历导入成功后的可选通知（宿主窗口刷新只读占用/冲突视图）。
+  final VoidCallback? onExternalCalendarChanged;
+
   final Future<bool> Function(CalendarSettingsResult result)? onApply;
 
   const _CalendarSettingsDialog({
@@ -188,7 +222,12 @@ class _CalendarSettingsDialog extends StatefulWidget {
     this.initialMode = CalendarEditorMode.fill,
     this.defaultUnavailableRanges = const <UnavailableRange>[],
     this.taskNames = const <String, String>{},
+    this.taskEstimatedHours = const <String, double?>{},
     this.useDefaultTimetable = false,
+    this.externalCalendar,
+    this.externalSourceIds = const <String>{},
+    this.externalCalendarPickFiles,
+    this.onExternalCalendarChanged,
     this.onApply,
   });
 
@@ -222,6 +261,24 @@ class _CalendarSettingsDialogState extends State<_CalendarSettingsDialog> {
   late CalendarSettings _applied;
   String? _applyStatus;
   bool _busy = false;
+
+  /// R1：跨日时段模式（显式入口，与普通画笔分开；一次提交一笔事务）。
+  bool _rangeMode = false;
+  late final TextEditingController _rangeStartDate;
+  late final TextEditingController _rangeStartTime;
+  late final TextEditingController _rangeEndDate;
+  late final TextEditingController _rangeEndTime;
+  String? _rangeStatus;
+
+  /// R1：蓝块选择模式的筛选（选择状态本身由 [_grid] 持有）。
+  static const String _filterAll = '\u0000all';
+  static const String _filterUnbound = '\u0000unbound';
+  String _selectionFilter = _filterAll;
+
+  /// 撤销/重做按钮的缓存 enabled 状态：拖动绘制时只在状态变化时重建弹窗，
+  /// 避免每画一格就 rebuild 整棵弹窗树，同时保证按钮实时可用。
+  bool _lastCanUndo = false;
+  bool _lastCanRedo = false;
 
   /// 打开时的规划输入，用于区分“用户主动改了范围”与“旧数据本来的范围”。
   late final String _initialPlanningStart;
@@ -326,10 +383,25 @@ class _CalendarSettingsDialogState extends State<_CalendarSettingsDialog> {
     _initialPlanningStart = _startDate.text.trim();
     _initialPlanningDays = int.tryParse(_planningDays.text.trim()) ?? 0;
     _initialDataSignature = _dataSignature();
+    // 跨日时段默认值：覆盖范围首日 22:00 → 次日 02:00，用户可改任意日期时间。
+    _rangeStartDate =
+        TextEditingController(text: _draft.timetable.dateFrom);
+    _rangeStartTime = TextEditingController(text: '22:00');
+    _rangeEndDate = TextEditingController(
+        text: addDaysToDateKey(_draft.timetable.dateFrom, 1));
+    _rangeEndTime = TextEditingController(text: '02:00');
     _grid = TimetableGridController(draft: _draft);
+    _lastCanUndo = _grid.canUndo;
+    _lastCanRedo = _grid.canRedo;
     _grid.addListener(() {
       if (mounted) setState(() {});
     });
+    // R2：外部日历来源提交后由 ChangeNotifier 通知；只读占用随通知刷新。
+    widget.externalCalendar?.addListener(_onExternalCalendarChanged);
+  }
+
+  void _onExternalCalendarChanged() {
+    if (mounted) setState(() {});
   }
 
   @override
@@ -352,6 +424,7 @@ class _CalendarSettingsDialogState extends State<_CalendarSettingsDialog> {
   @override
   void dispose() {
     if (_proposalLoading) widget.proposals?.cancel?.call();
+    widget.externalCalendar?.removeListener(_onExternalCalendarChanged);
     _scroll.dispose();
     _gridScroll.dispose();
     _grid.dispose();
@@ -359,6 +432,10 @@ class _CalendarSettingsDialogState extends State<_CalendarSettingsDialog> {
     _planningDays.dispose();
     _snap.dispose();
     _offset.dispose();
+    _rangeStartDate.dispose();
+    _rangeStartTime.dispose();
+    _rangeEndDate.dispose();
+    _rangeEndTime.dispose();
     for (final c in _weekly.values) {
       c.dispose();
     }
@@ -830,6 +907,8 @@ class _CalendarSettingsDialogState extends State<_CalendarSettingsDialog> {
         _applyStatus = '已应用';
         _applied = result.settings;
         _draft.markApplied();
+        _lastCanUndo = _grid.canUndo;
+        _lastCanRedo = _grid.canRedo;
         // 刚提交成功的数据就是新的“已保存基线”，随后关闭不应再提示丢弃。
         _initialDataSignature = _dataSignature();
       });
@@ -903,6 +982,9 @@ class _CalendarSettingsDialogState extends State<_CalendarSettingsDialog> {
       }
       merged = merged.copyWith(dateFrom: union.from, dateTo: union.to);
       _draft.reset(merged);
+      // reset 清空历史：撤销/重做缓存同步为 disabled。
+      _lastCanUndo = _grid.canUndo;
+      _lastCanRedo = _grid.canRedo;
     }
     setState(() {
       _mode = mode;
@@ -1023,6 +1105,436 @@ class _CalendarSettingsDialogState extends State<_CalendarSettingsDialog> {
     setState(() => _weekStart = weekStartFor(selected, widget.weekStartsOn));
   }
 
+  // ---------------------------------------- R1：跨日 / 复制到… / 蓝块绑定
+
+  /// 解析 `HH:mm`（也接受 `H:mm`、`23`）；24:00 仅作为结束时刻合法。
+  static int? _parseClock(String text) {
+    final match = RegExp(r'^\s*(\d{1,2})\s*[:：]?\s*(\d{2})?\s*$')
+        .firstMatch(text.trim());
+    if (match == null) return null;
+    final hour = int.tryParse(match.group(1)!);
+    if (hour == null) return null;
+    final minute =
+        match.group(2) == null ? 0 : int.tryParse(match.group(2)!);
+    if (minute == null) return null;
+    if (hour == 24 && minute == 0) return kTimetableMinutesPerDay;
+    if (hour < 0 || hour > 23 || minute < 0 || minute > 59) return null;
+    return hour * 60 + minute;
+  }
+
+  static int _minutesBetween(
+      String startDate, int startMinute, String endDate, int endMinute) {
+    final a = parseDateKey(startDate);
+    final b = parseDateKey(endDate);
+    if (a == null || b == null) return 0;
+    final first = DateTime.utc(int.parse(a.substring(0, 4)),
+        int.parse(a.substring(5, 7)), int.parse(a.substring(8)));
+    final last = DateTime.utc(int.parse(b.substring(0, 4)),
+        int.parse(b.substring(5, 7)), int.parse(b.substring(8)));
+    return last.difference(first).inDays * kTimetableMinutesPerDay +
+        endMinute -
+        startMinute;
+  }
+
+  /// 当前输入的跨日区间；任一部分无法解析时返回 null。
+  ({String startDate, int startMinute, String endDate, int endMinute})
+      ? _rangeValues() {
+    final startDate = parseDateKey(_rangeStartDate.text.trim());
+    final endDate = parseDateKey(_rangeEndDate.text.trim());
+    final startMinute = _parseClock(_rangeStartTime.text);
+    final endMinute = _parseClock(_rangeEndTime.text);
+    if (startDate == null ||
+        endDate == null ||
+        startMinute == null ||
+        endMinute == null) {
+      return null;
+    }
+    return (
+      startDate: startDate,
+      startMinute: startMinute,
+      endDate: endDate,
+      endMinute: endMinute,
+    );
+  }
+
+  /// 跨日输入的明确校验：结束必须晚于开始；端点必须在 coverage 内（不静默截断）。
+  String? _rangeValidationError() {
+    final startDate = parseDateKey(_rangeStartDate.text.trim());
+    final startMinute = _parseClock(_rangeStartTime.text);
+    final endDate = parseDateKey(_rangeEndDate.text.trim());
+    final endMinute = _parseClock(_rangeEndTime.text);
+    if (startDate == null) return '起始日期需为 yyyy-MM-dd';
+    if (startMinute == null || startMinute >= kTimetableMinutesPerDay) {
+      return '起始时间需为 00:00–23:59';
+    }
+    if (endDate == null) return '结束日期需为 yyyy-MM-dd';
+    if (endMinute == null) return '结束时间需为 00:00–24:00';
+    final total =
+        _minutesBetween(startDate, startMinute, endDate, endMinute);
+    if (total <= 0) return '结束必须晚于开始（跨日时结束日期要更晚）';
+    final timetable = _draft.timetable;
+    final outside = startDate.compareTo(timetable.dateFrom) < 0 ||
+        startDate.compareTo(timetable.dateTo) > 0 ||
+        endDate.compareTo(timetable.dateFrom) < 0 ||
+        endDate.compareTo(timetable.dateTo) > 0;
+    if (outside) {
+      return '起点/终点不在排程覆盖范围（${timetable.dateFrom} 至 '
+          '${timetable.dateTo}）内：请先在“手动填写”里扩大排程范围，'
+          '或取消本次跨日提交（不会截断写入）';
+    }
+    return null;
+  }
+
+  String _hhmm(int minute) => WallClockRange.formatMinute(minute);
+
+  /// 预览：完整起止日期时间 + 总时长（例如
+  /// `2026-11-09 23:30 → 2026-11-10 00:30，共 60 分钟`）。
+  String? _rangePreviewLabel() {
+    final values = _rangeValues();
+    if (values == null) return null;
+    final total = _minutesBetween(values.startDate, values.startMinute,
+        values.endDate, values.endMinute);
+    final totalLabel = total <= 0 ? '' : '（${_durationLabel(total)}）';
+    return '${values.startDate} ${_hhmm(values.startMinute)} → '
+        '${values.endDate} ${_hhmm(values.endMinute)}，共 $total 分钟$totalLabel';
+  }
+
+  /// 预览：按自然日拆分（数据层就是按自然日写入日期层规则）。
+  String _rangeSplitLabel() {
+    final values = _rangeValues();
+    if (values == null) return '按自然日拆分：（等待有效的起止日期时间）';
+    final total = _minutesBetween(values.startDate, values.startMinute,
+        values.endDate, values.endMinute);
+    if (total <= 0) return '按自然日拆分：（结束必须晚于开始）';
+    final parts = <String>[];
+    var date = values.startDate;
+    var start = values.startMinute;
+    var guard = 0;
+    while (guard++ < 400) {
+      final isLast = date == values.endDate;
+      final end = isLast ? values.endMinute : kTimetableMinutesPerDay;
+      final minutes = end - start;
+      if (minutes > 0) {
+        final endLabel = isLast ? _hhmm(values.endMinute) : '24:00';
+        parts.add('$date ${_hhmm(start)}-$endLabel（$minutes 分钟）');
+      }
+      if (isLast) break;
+      date = addDaysToDateKey(date, 1);
+      start = 0;
+    }
+    return '按自然日拆分：${parts.join('；')}';
+  }
+
+  static String _durationLabel(int minutes) {
+    if (minutes <= 0) return '0 分钟';
+    final h = minutes ~/ 60;
+    final rest = minutes % 60;
+    if (h == 0) return '$rest 分钟';
+    if (rest == 0) return '$h 小时';
+    return '$h 小时 $rest 分';
+  }
+
+  /// 提交跨日时段：预检 → 一次 [Timetable.paintRange] → 一笔事务。
+  void _submitRange() {
+    final error = _rangeValidationError();
+    if (error != null) {
+      setState(() => _rangeStatus = null);
+      return;
+    }
+    final values = _rangeValues()!;
+    final timetable = _draft.timetable;
+    final painted = timetable.paintRange(
+      startDate: values.startDate,
+      startMinute: values.startMinute,
+      endDate: values.endDate,
+      endMinute: values.endMinute,
+      state: _grid.brush,
+      origin: TimetableOrigin.manual,
+      title: _grid.brush == TimetableState.task ? '任务预留' : null,
+      coverageFrom: timetable.dateFrom,
+      coverageTo: timetable.dateTo,
+    );
+    if (painted == null) {
+      setState(() => _rangeStatus = '跨日区间无法写入（可能超出排程覆盖范围），'
+          '草稿保持不变');
+      return;
+    }
+    final label = '跨日时段 ${values.startDate} ${_hhmm(values.startMinute)} → '
+        '${values.endDate} ${_hhmm(values.endMinute)}';
+    final recorded = _draft.recordTransaction(
+      painted,
+      label: label,
+      affectedDates: <String>{values.startDate, values.endDate},
+    );
+    setState(() {
+      _rangeStatus = recorded
+          ? '已提交：$label（一笔事务，可撤销/重做）'
+          : '该区间与现有内容相同，未产生新的撤销记录';
+    });
+  }
+
+  /// 当前可见周里的蓝色块（选择模式、筛选都只作用于这一周）。
+  List<TimetableEntry> _visibleWeekTaskEntries() {
+    final weekEnd = addDaysToDateKey(_weekStart, 6);
+    return _draft.timetable.dates
+        .where((e) =>
+            e.isTask &&
+            e.date != null &&
+            e.date!.compareTo(_weekStart) >= 0 &&
+            e.date!.compareTo(weekEnd) <= 0)
+        .toList(growable: false);
+  }
+
+  List<({String value, String label})> _filterOptions() {
+    final options = <({String value, String label})>[
+      (value: _filterAll, label: '全部蓝块'),
+      (value: _filterUnbound, label: '未绑定'),
+    ];
+    final ids = widget.taskNames.keys.toList()
+      ..sort((a, b) {
+        final byName = (widget.taskNames[a] ?? a)
+            .compareTo(widget.taskNames[b] ?? b);
+        return byName != 0 ? byName : a.compareTo(b);
+      });
+    for (final id in ids) {
+      options.add((value: id, label: widget.taskNames[id] ?? id));
+    }
+    return options;
+  }
+
+  String _effectiveFilter() {
+    final values = _filterOptions().map((o) => o.value).toSet();
+    return values.contains(_selectionFilter) ? _selectionFilter : _filterAll;
+  }
+
+  List<TimetableEntry> _filteredTaskEntries() {
+    final filter = _effectiveFilter();
+    final entries = _visibleWeekTaskEntries();
+    if (filter == _filterAll) return entries;
+    if (filter == _filterUnbound) {
+      return entries
+          .where((e) => e.taskId == null || e.taskId!.isEmpty)
+          .toList(growable: false);
+    }
+    return entries
+        .where((e) => e.taskId == filter)
+        .toList(growable: false);
+  }
+
+  void _selectFiltered() {
+    _grid.setSelectedReservations(
+        _filteredTaskEntries().map((e) => e.reservationId ?? e.id));
+    setState(() {});
+  }
+
+  /// 打开绑定面板，并把“绑定 / 解除绑定 / 释放时段”各落成一笔事务。
+  Future<void> _openBindingPanel() async {
+    final selected = _grid.selectedReservationIds;
+    final entries = _draft.timetable.dates
+        .where((e) => e.isTask && selected.contains(e.reservationId ?? e.id))
+        .toList(growable: false);
+    if (entries.isEmpty) {
+      setState(() => _error = '请先在网格里选择至少一个蓝色块');
+      return;
+    }
+    final result = await showTaskBindingPanel(
+      context,
+      selection: <TaskBindingSelection>[
+        for (final entry in entries)
+          TaskBindingSelection(
+            reservationId: entry.reservationId ?? entry.id,
+            date: entry.date ?? '',
+            start: entry.start,
+            end: entry.end,
+            taskId: entry.taskId,
+            title: entry.title,
+          ),
+      ],
+      taskNames: widget.taskNames,
+      taskEstimatedHours: widget.taskEstimatedHours,
+      reservedMinutesByTask: _draft.timetable.boundMinutesByTask(),
+    );
+    if (result == null || !mounted) return;
+    var next = _draft.timetable;
+    final count = entries.length;
+    // 同一 reservationId 不能给两个不同片段，否则 taskSegments 会撞 id：
+    // 逐段保证写回的预留身份唯一（普通单片段蓝块仍保持原身份）。
+    final usedReservationIds = <String>{};
+    String reservationIdFor(TimetableEntry entry) {
+      final base = entry.reservationId ?? entry.id;
+      if (usedReservationIds.add(base)) return base;
+      var index = 2;
+      while (!usedReservationIds.add('$base#$index')) {
+        index++;
+      }
+      return '$base#$index';
+    }
+
+    late final String label;
+    switch (result.action) {
+      case TaskBindingAction.bind:
+        final taskId = result.taskId;
+        if (taskId == null) return;
+        final name = widget.taskNames[taskId] ?? taskId;
+        for (final entry in entries) {
+          next = next.paint(
+            date: entry.date,
+            start: entry.start,
+            end: entry.end,
+            state: TimetableState.task,
+            origin: TimetableOrigin.manual,
+            title: name,
+            taskId: taskId,
+            reservationId: reservationIdFor(entry),
+          );
+        }
+        label = '绑定 $count 块蓝块到「$name」';
+      case TaskBindingAction.unbind:
+        for (final entry in entries) {
+          next = next.paint(
+            date: entry.date,
+            start: entry.start,
+            end: entry.end,
+            state: TimetableState.task,
+            origin: TimetableOrigin.manual,
+            // 保留原标题（解除绑定只是清任务引用，不丢这条预留的描述）。
+            title: (entry.title == null || entry.title!.isEmpty)
+                ? '任务预留'
+                : entry.title,
+            reservationId: reservationIdFor(entry),
+          );
+        }
+        label = '解除 $count 块蓝块绑定（保留为未绑定预留）';
+      case TaskBindingAction.release:
+        for (final entry in entries) {
+          next = next.erase(
+            date: entry.date,
+            start: entry.start,
+            end: entry.end,
+          );
+        }
+        label = '释放 $count 块蓝块时段';
+    }
+    final recorded = _draft.recordTransaction(next, label: label);
+    setState(() {
+      _error = null;
+      // 无变化是中性结果，不是错误：用底部状态行提示，不占红色错误位。
+      if (!recorded) _applyStatus = '操作没有产生业务变化，未记入撤销历史';
+      // 解除/释放后这些预留已不存在，继续选中没有意义。
+      if (result.action != TaskBindingAction.bind) _grid.clearSelection();
+    });
+  }
+
+  /// 笔画进行中网格每画一格都会回调；只在撤销/重做 enabled 真正变化时重建
+  /// 弹窗，既保证标题行按钮实时可用，又避免拖动时每格 rebuild 整棵弹窗树。
+  void _syncUndoRedoButtons() {
+    final canUndo = _grid.canUndo;
+    final canRedo = _grid.canRedo;
+    if (canUndo == _lastCanUndo && canRedo == _lastCanRedo) return;
+    _lastCanUndo = canUndo;
+    _lastCanRedo = canRedo;
+    if (mounted) setState(() {});
+  }
+
+  /// 打开“复制到…”对话框，确认后把计划作为一笔事务写回草稿。
+  Future<void> _openCopyDialog() async {
+    final timetable = _draft.timetable;
+    final plan = await showTimetableCopyDialog(
+      context,
+      timetable: timetable,
+      sourceDate: _weekStart,
+      coverageFrom: timetable.dateFrom,
+      coverageTo: timetable.dateTo,
+      taskIds: widget.taskNames.keys.toSet(),
+      taskNames: widget.taskNames,
+    );
+    if (plan == null || !mounted) return;
+    if (plan.isEmpty) {
+      // 无修改的复制不产生撤销记录；这是中性提示，不是错误。
+      setState(() => _applyStatus = '复制预览没有实际写入，未产生撤销记录');
+      return;
+    }
+    final recorded = _draft.recordTransaction(
+      plan.result,
+      label: '复制到 ${plan.targetDates.length} 天',
+      affectedDates: plan.targetDates.toSet(),
+    );
+    setState(() {
+      _error = null;
+      if (!recorded) _applyStatus = '复制没有产生业务变化，未记入撤销历史';
+    });
+  }
+
+  // ------------------------------------------------ R2：外部日历（只读）
+
+  /// 当前可见周内、该会话已关联来源的只读外部占用。
+  ///
+  /// 只用于绘制叠加层与悬停提示；**绝不**写进 [TimetableDraft]。
+  List<ExternalBusyInstance> _externalBusyForWeek() {
+    final service = widget.externalCalendar;
+    if (service == null || widget.externalSourceIds.isEmpty) {
+      return const <ExternalBusyInstance>[];
+    }
+    final weekEnd = addDaysToDateKey(_weekStart, 6);
+    try {
+      return service.busyFor(
+        sourceIds: widget.externalSourceIds,
+        dateFrom: _weekStart,
+        dateTo: weekEnd,
+        timezoneId: widget.settings.timezoneId,
+      );
+    } catch (_) {
+      // 服务未加载完成或数据异常时退化为“没有外部占用”，不影响手工编辑。
+      return const <ExternalBusyInstance>[];
+    }
+  }
+
+  /// 外部来源 id → 名称（只用于本地显示，不进入模型请求）。
+  Map<String, String> _externalSourceNames() {
+    final service = widget.externalCalendar;
+    if (service == null) return const <String, String>{};
+    final ids = widget.externalSourceIds;
+    return <String, String>{
+      for (final source in service.sources)
+        if (ids.contains(source.id)) source.id: source.name,
+    };
+  }
+
+  /// 绘制页标题行的「外部日历」入口：打开只读导入向导。
+  ///
+  /// 提交成功后服务会通过 ChangeNotifier 通知（[_onExternalCalendarChanged]），
+  /// 主界面也监听同一个服务，因此不需要额外的回调接线（见报告）。
+  Future<void> _openExternalCalendarImport() async {
+    final service = widget.externalCalendar;
+    if (service == null || _busy) return;
+    final from = _draft.timetable.dateFrom.isEmpty
+        ? _weekStart
+        : _draft.timetable.dateFrom;
+    final to = _draft.timetable.dateTo.isEmpty
+        ? addDaysToDateKey(from, 27)
+        : _draft.timetable.dateTo;
+    setState(() => _busy = true);
+    bool imported = false;
+    try {
+      imported = await showExternalCalendarImportDialog(
+        context,
+        service: service,
+        timezoneId: widget.settings.timezoneId,
+        planningDateFrom: from,
+        planningDateTo: to,
+        pickFiles: widget.externalCalendarPickFiles,
+      );
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+    if (!mounted || !imported) return;
+    setState(() {
+      _error = null;
+      _applyStatus = '外部日历已更新：只读占用已刷新（手工时间表未修改）';
+    });
+    widget.onExternalCalendarChanged?.call();
+  }
+
   // ---------------------------------------------------------------- build
 
   /// 绘制模式的弹窗尺寸：可用客户区约 93% 宽、88–90% 高，四周 24–48 逻辑像素。
@@ -1130,13 +1642,82 @@ class _CalendarSettingsDialogState extends State<_CalendarSettingsDialog> {
   }
 
   Widget _titleRow(BuildContext context) {
+    final drawing = _mode == CalendarEditorMode.drawing;
+    // 标题行压缩到最小并承载绘制动作：网格可写视口必须能容纳 08:00 附近的
+    // 单元格（否则点击/拖到第一节课附近会落在视口边界外，见 regression_0113 F8）。
     return Padding(
-      padding: const EdgeInsets.fromLTRB(20, 14, 12, 4),
+      padding: const EdgeInsets.fromLTRB(20, 4, 8, 2),
       child: Row(
         children: [
           const Expanded(
             child: Text('可用时间与占用时间', style: TextStyle(fontSize: 15)),
           ),
+          if (drawing) ...[
+            _smallToolButton(
+              key: const Key('timetable-undo'),
+              label: '撤销',
+              icon: Icons.undo,
+              onTap: _grid.canUndo
+                  ? () {
+                      _grid.undo();
+                      _syncUndoRedoButtons();
+                    }
+                  : null,
+            ),
+            const SizedBox(width: 4),
+            _smallToolButton(
+              key: const Key('timetable-redo'),
+              label: '重做',
+              icon: Icons.redo,
+              onTap: _grid.canRedo
+                  ? () {
+                      _grid.redo();
+                      _syncUndoRedoButtons();
+                    }
+                  : null,
+            ),
+            const SizedBox(width: 4),
+            _smallToolButton(
+              key: const Key('timetable-clear-week'),
+              label: '清空本周',
+              icon: Icons.layers_clear,
+              onTap: _clearWeek,
+            ),
+            if (!_weeklyMode) ...[
+              const SizedBox(width: 4),
+              _smallToolButton(
+                key: const Key('timetable-select-blocks'),
+                label: _grid.selectionMode ? '退出选择' : '选择蓝块',
+                icon: Icons.check_box_outlined,
+                onTap: () => setState(() {
+                  _grid.setSelectionMode(!_grid.selectionMode);
+                }),
+              ),
+            ],
+            const SizedBox(width: 4),
+            _smallToolButton(
+              key: const Key('timetable-copy-to'),
+              label: '复制到…',
+              icon: Icons.copy_all_outlined,
+              onTap: _busy ? null : _openCopyDialog,
+            ),
+            if (widget.externalCalendar != null) ...[
+              const SizedBox(width: 4),
+              Tooltip(
+                message: '导入本地 ICS 日历：外部占用只读（浅灰斜纹），'
+                    '不写入手工时间表，也不能在此绘制/擦除/绑定',
+                child: _smallToolButton(
+                  key: const Key('external-calendar-open-import'),
+                  label: '外部日历',
+                  icon: Icons.event_available_outlined,
+                  onTap: _busy ? null : _openExternalCalendarImport,
+                ),
+              ),
+            ],
+            const SizedBox(width: 4),
+            _rangeToggleButton(),
+            const SizedBox(width: 4),
+          ],
           IconButton(
             tooltip: '关闭',
             onPressed: _busy ? null : _handlePopRequest,
@@ -1144,6 +1725,35 @@ class _CalendarSettingsDialogState extends State<_CalendarSettingsDialog> {
             icon: const Icon(Icons.close, size: 16),
           ),
         ],
+      ),
+    );
+  }
+
+  /// 跨日时段开关：固定 30 高，和标题行其它动作同高，避免把网格压矮。
+  Widget _rangeToggleButton() {
+    return SizedBox(
+      height: 30,
+      child: TextButton.icon(
+        key: const Key('timetable-range-toggle'),
+        onPressed: () => setState(() {
+          _rangeMode = !_rangeMode;
+          _rangeStatus = null;
+          if (_rangeMode) {
+            // 跨日只用显式输入提交：进入该模式时退出选择模式，避免误操作。
+            _grid.setSelectionMode(false);
+          }
+        }),
+        icon: Icon(
+          _rangeMode ? Icons.check_box_outlined : Icons.check_box_outline_blank,
+          size: 15,
+        ),
+        label: const Text('跨日时段'),
+        style: TsButtons.filled(
+          radius: 7,
+          minimumSize: const Size(0, 30),
+          padding: const EdgeInsets.symmetric(horizontal: 10),
+          fontSize: 11,
+        ),
       ),
     );
   }
@@ -1281,7 +1891,7 @@ class _CalendarSettingsDialogState extends State<_CalendarSettingsDialog> {
 
   Widget _footer(BuildContext context) {
     return Container(
-      padding: const EdgeInsets.fromLTRB(20, 10, 20, 14),
+      padding: const EdgeInsets.fromLTRB(20, 4, 20, 8),
       child: Row(
         children: [
           if (_applyStatus != null)
@@ -1355,11 +1965,46 @@ class _CalendarSettingsDialogState extends State<_CalendarSettingsDialog> {
             child: const Text('本周'),
           ),
           const SizedBox(width: 8),
-          FilterChip(
-            key: const Key('timetable-weekly-mode'),
-            label: const Text('每周重复'),
-            selected: _weeklyMode,
-            onSelected: (value) => setState(() => _weeklyMode = value),
+          Tooltip(
+            message: _weeklyMode
+                ? '正在编辑每周模板：修改会影响其它周；取消勾选后只改本周具体日期'
+                : '只修改本周具体日期（日期层）；勾选“每周重复”改为编辑周模板',
+            child: FilterChip(
+              key: const Key('timetable-weekly-mode'),
+              label: const Text('每周重复'),
+              selected: _weeklyMode,
+              onSelected: (value) => setState(() {
+                _weeklyMode = value;
+                // 选择只对“具体日期”的蓝色块生效：切到每周模板时退出选择。
+                if (value) _grid.setSelectionMode(false);
+              }),
+            ),
+          ),
+          Padding(
+            padding: const EdgeInsets.only(left: 4),
+            child: Text(
+              _weeklyMode ? '周模板' : '具体日期',
+              key: const Key('timetable-weekly-mode-note'),
+              style: TextStyle(fontSize: 10.5, color: TsColors.textFaint),
+            ),
+          ),
+          const SizedBox(width: 8),
+          BezierSegments(
+            key: const Key('timetable-brush'),
+            height: 30,
+            itemWidth: 74,
+            items: const [
+              BezierSegmentItem('占用'),
+              BezierSegmentItem('任务'),
+            ],
+            selected: _grid.brush == TimetableState.occupied ? 0 : 1,
+            onChanged: (index) {
+              setState(() {
+                _grid.setBrush(index == 0
+                    ? TimetableState.occupied
+                    : TimetableState.task);
+              });
+            },
           ),
         ],
       ],
@@ -1400,12 +2045,21 @@ class _CalendarSettingsDialogState extends State<_CalendarSettingsDialog> {
     // 只有网格占据剩余空间并独立滚动。
     final timetable = _draft.timetable;
     final weekEnd = addDaysToDateKey(_weekStart, 6);
+    final externalBusy = _externalBusyForWeek();
+    final externalNames = _externalSourceNames();
     final outsideCoverage = _weekStart.compareTo(timetable.dateFrom) < 0 ||
         weekEnd.compareTo(timetable.dateTo) > 0;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        _drawToolbar(),
+        if (_rangeMode) ...[
+          _rangePanel(),
+          const SizedBox(height: 6),
+        ],
+        if (_grid.selectionMode && !_weeklyMode) ...[
+          _selectionBar(),
+          const SizedBox(height: 6),
+        ],
         if (outsideCoverage)
           Padding(
             padding: const EdgeInsets.only(top: 4),
@@ -1415,6 +2069,18 @@ class _CalendarSettingsDialogState extends State<_CalendarSettingsDialog> {
               '请在“手动填写”里调整排程范围。',
               key: const Key('timetable-outside-coverage'),
               style: TextStyle(fontSize: 10.5, color: TsColors.pending),
+            ),
+          ),
+        if (widget.externalCalendar != null &&
+            widget.externalSourceIds.isNotEmpty)
+          Padding(
+            padding: const EdgeInsets.only(top: 4),
+            child: Text(
+              '外部日历占用为只读：浅灰斜纹 + 「外部」标记，'
+              '${externalBusy.isEmpty ? '本周没有外部占用' : '本周 ${externalBusy.length} 条叠加实例'}；'
+              '不写入手工时间表，不能绘制/擦除/绑定，点选只显示信息。',
+              key: const Key('external-calendar-editor-note'),
+              style: TextStyle(fontSize: 10.5, color: TsColors.textFaint),
             ),
           ),
         const SizedBox(height: 6),
@@ -1433,10 +2099,14 @@ class _CalendarSettingsDialogState extends State<_CalendarSettingsDialog> {
               weeklyMode: _weeklyMode,
               taskNames: widget.taskNames,
               verticalController: _gridScroll,
+              externalBusy: externalBusy,
+              externalSourceNames: externalNames,
               canEditDate: (date) =>
                   date.compareTo(timetable.dateFrom) >= 0 &&
                   date.compareTo(timetable.dateTo) <= 0,
-              onChanged: () {},
+              onSelectionChanged: (_) => setState(() {}),
+              // 笔画/擦除只会改变撤销/重做可用性；按需重建，不再每格 setState。
+              onChanged: _syncUndoRedoButtons,
             ),
           ),
         ),
@@ -1444,46 +2114,265 @@ class _CalendarSettingsDialogState extends State<_CalendarSettingsDialog> {
     );
   }
 
-  Widget _drawToolbar() {
-    return Wrap(
-      spacing: 8,
-      runSpacing: 6,
-      crossAxisAlignment: WrapCrossAlignment.center,
-      children: [
-        BezierSegments(
-          key: const Key('timetable-brush'),
-          height: 30,
-          itemWidth: 74,
-          items: const [
-            BezierSegmentItem('占用'),
-            BezierSegmentItem('任务'),
-          ],
-          selected: _grid.brush == TimetableState.occupied ? 0 : 1,
-          onChanged: (index) => _grid.setBrush(index == 0
-              ? TimetableState.occupied
-              : TimetableState.task),
-        ),
-        _smallToolButton('撤销', Icons.undo, () {
-          _grid.undo();
-          setState(() {});
-        }),
-        _smallToolButton('清空本周', Icons.layers_clear, _clearWeek),
-        _smallToolButton('绑定蓝块', Icons.link, _bindUnbound),
-        Padding(
-          padding: const EdgeInsets.only(left: 4),
-          child: Text(
-            _weeklyMode ? '正在编辑每周模板' : '只修改本周具体日期',
+  /// 跨日时段面板：显式起止日期时间 + 完整日期/总时长/自然日拆分预览。
+  ///
+  /// 只有点“提交跨日时段”才写入，并且一次写入是一笔事务；普通画笔仍在网格上
+  /// 单独生效，因此跨日不会混进普通笔画造成大面积误涂。
+  Widget _rangePanel() {
+    final preview = _rangePreviewLabel();
+    final error = _rangeValidationError();
+    return Container(
+      key: const Key('timetable-range-panel'),
+      padding: const EdgeInsets.fromLTRB(10, 8, 10, 8),
+      decoration: bezierDecoration(
+        color: TsColors.surfaceAlt,
+        radius: 9,
+        border: Border.all(color: TsColors.border),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            '跨日时段：起止是一个连续区间，可跨不同日期/周；'
+            '按当前画笔「${_grid.brush.label}」写入（一次提交 = 一笔事务）。',
+            key: const Key('timetable-range-mode-label'),
+            style: TextStyle(fontSize: 11, color: TsColors.textSecondary),
+          ),
+          const SizedBox(height: 6),
+          Wrap(
+            spacing: 8,
+            runSpacing: 6,
+            crossAxisAlignment: WrapCrossAlignment.center,
+            children: [
+              SizedBox(
+                width: 132,
+                child: TextField(
+                  key: const Key('timetable-range-start-date'),
+                  controller: _rangeStartDate,
+                  style: const TextStyle(fontSize: 12),
+                  decoration: const InputDecoration(
+                    labelText: '起始日期',
+                    isDense: true,
+                  ),
+                  onChanged: (_) => setState(() {}),
+                ),
+              ),
+              SizedBox(
+                width: 88,
+                child: TextField(
+                  key: const Key('timetable-range-start-time'),
+                  controller: _rangeStartTime,
+                  style: const TextStyle(fontSize: 12),
+                  decoration: const InputDecoration(
+                    labelText: '起始时间',
+                    hintText: 'HH:mm',
+                    isDense: true,
+                  ),
+                  onChanged: (_) => setState(() {}),
+                ),
+              ),
+              Text('→',
+                  style: TextStyle(
+                      fontSize: 13, color: TsColors.textSecondary)),
+              SizedBox(
+                width: 132,
+                child: TextField(
+                  key: const Key('timetable-range-end-date'),
+                  controller: _rangeEndDate,
+                  style: const TextStyle(fontSize: 12),
+                  decoration: const InputDecoration(
+                    labelText: '结束日期',
+                    isDense: true,
+                  ),
+                  onChanged: (_) => setState(() {}),
+                ),
+              ),
+              SizedBox(
+                width: 88,
+                child: TextField(
+                  key: const Key('timetable-range-end-time'),
+                  controller: _rangeEndTime,
+                  style: const TextStyle(fontSize: 12),
+                  decoration: const InputDecoration(
+                    labelText: '结束时间',
+                    hintText: 'HH:mm',
+                    isDense: true,
+                  ),
+                  onChanged: (_) => setState(() {}),
+                ),
+              ),
+              SizedBox(
+                height: 32,
+                child: FilledButton(
+                  key: const Key('timetable-range-apply'),
+                  onPressed: _busy ? null : _submitRange,
+                  style: TsButtons.filled(
+                    radius: 8,
+                    minimumSize: const Size(0, 32),
+                    padding: const EdgeInsets.symmetric(horizontal: 12),
+                    fontSize: 11.5,
+                  ),
+                  child: const Text('提交跨日时段'),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 6),
+          Text(
+            preview ?? '预览：请输入起止日期时间（yyyy-MM-dd 与 HH:mm）',
+            key: const Key('timetable-range-preview'),
+            style: TextStyle(fontSize: 11.5, color: TsColors.textPrimary),
+          ),
+          Text(
+            _rangeSplitLabel(),
+            key: const Key('timetable-range-split'),
             style: TextStyle(fontSize: 10.5, color: TsColors.textFaint),
           ),
-        ),
-      ],
+          if (error != null)
+            Padding(
+              padding: const EdgeInsets.only(top: 2),
+              child: Text(
+                error,
+                key: const Key('timetable-range-error'),
+                style: TextStyle(fontSize: 11, color: TsColors.blocked),
+              ),
+            ),
+          if (_rangeStatus != null)
+            Padding(
+              padding: const EdgeInsets.only(top: 2),
+              child: Text(
+                _rangeStatus!,
+                key: const Key('timetable-range-status'),
+                style: TextStyle(fontSize: 11, color: TsColors.ready),
+              ),
+            ),
+          const SizedBox(height: 2),
+          Text(
+            '普通画笔仍在网格上单独生效；跨日区间只在点“提交跨日时段”时写入，'
+            '不会混进普通笔画。',
+            style: TextStyle(fontSize: 10.5, color: TsColors.textFaint),
+          ),
+          Text(
+            _weeklyMode
+                ? '当前是“每周重复”模板模式：跨日时段仍写入具体日期，不会修改周模板。'
+                : '跨日时段总是写入具体日期（不修改周模板）。',
+            key: const Key('timetable-range-weekly-note'),
+            style: TextStyle(fontSize: 10.5, color: TsColors.textFaint),
+          ),
+        ],
+      ),
     );
   }
 
-  Widget _smallToolButton(String label, IconData icon, VoidCallback onTap) {
+  /// 蓝块选择栏：显示选中数量/分钟，按任务或“未绑定”筛选后批量选中。
+  Widget _selectionBar() {
+    final options = _filterOptions();
+    final filter = _effectiveFilter();
+    final matching = _filteredTaskEntries();
+    return Container(
+      key: const Key('timetable-selection-bar'),
+      padding: const EdgeInsets.fromLTRB(10, 6, 10, 6),
+      decoration: bezierDecoration(
+        color: TsColors.accentSoft,
+        radius: 9,
+        border: Border.all(color: TsColors.accent),
+      ),
+      child: Wrap(
+        spacing: 8,
+        runSpacing: 6,
+        crossAxisAlignment: WrapCrossAlignment.center,
+        children: [
+          Text(
+            '已选 ${_grid.selectedBlockCount} 块 · ${_grid.selectedMinutes} 分钟',
+            key: const Key('timetable-selection-summary'),
+            style: TextStyle(fontSize: 11.5, color: TsColors.textPrimary),
+          ),
+          DropdownButton<String>(
+            key: const Key('timetable-selection-filter'),
+            value: filter,
+            isDense: true,
+            underline: const SizedBox.shrink(),
+            style: TextStyle(fontSize: 11.5, color: TsColors.textPrimary),
+            items: <DropdownMenuItem<String>>[
+              for (final option in options)
+                DropdownMenuItem<String>(
+                  value: option.value,
+                  child: Text(option.label,
+                      style: const TextStyle(fontSize: 11.5)),
+                ),
+            ],
+            onChanged: (value) {
+              if (value == null) return;
+              setState(() => _selectionFilter = value);
+            },
+          ),
+          SizedBox(
+            height: 28,
+            child: TextButton(
+              key: const Key('timetable-select-filtered'),
+              onPressed: _selectFiltered,
+              style: TsButtons.filled(
+                radius: 7,
+                minimumSize: const Size(0, 28),
+                padding: const EdgeInsets.symmetric(horizontal: 10),
+                fontSize: 11,
+              ),
+              child: Text('选中筛选结果（${matching.length} 块）'),
+            ),
+          ),
+          SizedBox(
+            height: 28,
+            child: TextButton(
+              key: const Key('timetable-selection-clear'),
+              onPressed: _grid.hasSelection
+                  ? () {
+                      _grid.clearSelection();
+                      setState(() {});
+                    }
+                  : null,
+              style: TsButtons.filled(
+                radius: 7,
+                minimumSize: const Size(0, 28),
+                padding: const EdgeInsets.symmetric(horizontal: 10),
+                fontSize: 11,
+              ),
+              child: const Text('清空选择'),
+            ),
+          ),
+          SizedBox(
+            height: 30,
+            child: FilledButton(
+              key: const Key('timetable-bind-selection'),
+              onPressed: _grid.hasSelection ? _openBindingPanel : null,
+              style: TsButtons.filled(
+                radius: 8,
+                minimumSize: const Size(0, 30),
+                padding: const EdgeInsets.symmetric(horizontal: 12),
+                fontSize: 11.5,
+              ),
+              child: const Text('绑定所选…'),
+            ),
+          ),
+          Text(
+            '选择模式下单击蓝色块逐块选中（多选）；不会绘制/擦除，也不产生撤销记录。',
+            style: TextStyle(fontSize: 10.5, color: TsColors.textFaint),
+          ),
+        ],
+      ),
+    );
+  }
+
+
+  Widget _smallToolButton({
+    required Key key,
+    required String label,
+    required IconData icon,
+    required VoidCallback? onTap,
+  }) {
     return SizedBox(
       height: 30,
       child: TextButton.icon(
+        key: key,
         onPressed: onTap,
         icon: Icon(icon, size: 15),
         label: Text(label),
@@ -1500,70 +2389,24 @@ class _CalendarSettingsDialogState extends State<_CalendarSettingsDialog> {
   void _clearWeek() {
     final base = _baseSettings();
     if (base == null) return;
-    setState(() {
-      // 清空规则但保留用户设定的 coverage（业务范围不因一次清空而缩成一周）。
-      _draft.reset(Timetable.withDefaults(
-        weekStart: _draft.timetable.dateFrom,
-        timezoneId: base.timezoneId,
-        timezoneOffsetMinutes: base.timezoneOffsetMinutes,
-        unavailable: <WallClockRange>[
-          for (final r in widget.defaultUnavailableRanges)
-            WallClockRange(r.start, r.end),
-        ],
-      ).copyWith(
-        dateFrom: _draft.timetable.dateFrom,
-        dateTo: _draft.timetable.dateTo,
-      ));
-    });
-  }
-
-  Future<void> _bindUnbound() async {
-    final base = _baseSettings();
-    if (base == null) return;
-    final unbound = _draft.timetable.dates
-        .where((e) =>
-            e.state == TimetableState.task &&
-            (e.taskId == null || e.taskId!.isEmpty))
-        .toList(growable: false);
-    if (unbound.isEmpty) {
-      setState(() => _error = '本周没有未绑定的蓝色块');
-      return;
-    }
-    if (widget.taskNames.isEmpty) {
-      setState(() => _error = '还没有可绑定的任务');
-      return;
-    }
-    final taskId = await showDialog<String>(
-      context: context,
-      builder: (ctx) => SimpleDialog(
-        title: const Text('把本周未绑定蓝块绑定到任务',
-            style: TextStyle(fontSize: 14)),
-        children: [
-          for (final entry in widget.taskNames.entries)
-            SimpleDialogOption(
-              onPressed: () => Navigator.of(ctx).pop(entry.key),
-              child: Text(entry.value, style: const TextStyle(fontSize: 12)),
-            ),
-        ],
-      ),
+    // 清空规则但保留用户设定的 coverage（业务范围不因一次清空而缩成一周）。
+    final next = Timetable.withDefaults(
+      weekStart: _draft.timetable.dateFrom,
+      timezoneId: base.timezoneId,
+      timezoneOffsetMinutes: base.timezoneOffsetMinutes,
+      unavailable: <WallClockRange>[
+        for (final r in widget.defaultUnavailableRanges)
+          WallClockRange(r.start, r.end),
+      ],
+    ).copyWith(
+      dateFrom: _draft.timetable.dateFrom,
+      dateTo: _draft.timetable.dateTo,
     );
-    if (taskId == null || !mounted) return;
-    var next = _draft.timetable;
-    for (final entry in unbound) {
-      next = next.paint(
-        date: entry.date,
-        start: entry.start,
-        end: entry.end,
-        state: TimetableState.task,
-        origin: TimetableOrigin.manual,
-        title: widget.taskNames[taskId] ?? entry.title,
-        taskId: taskId,
-        reservationId: entry.reservationId ?? entry.id,
-      );
-    }
+    // 与其它编辑一致：一次清空 = 一笔可撤销事务；无变化不入历史。
+    final recorded = _draft.recordTransaction(next, label: '清空本周');
     setState(() {
-      _draft.reset(next);
       _error = null;
+      if (!recorded) _applyStatus = '本周没有可清空的修改';
     });
   }
 
