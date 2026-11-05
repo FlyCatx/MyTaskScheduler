@@ -4,6 +4,8 @@
 // cannot depend on when the suite runs. Expectations are written against wall-clock
 // strings (`at('2026-11-18 08:00')`) which is much easier to audit than epoch numbers.
 
+import 'dart:io';
+
 import 'package:flutter_test/flutter_test.dart';
 import 'package:taskscheduler_flutter/src/model/calendar.dart';
 import 'package:taskscheduler_flutter/src/state/calendar_planner.dart';
@@ -726,6 +728,435 @@ void main() {
         ),
         ConflictSource.userOccupancy,
       );
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // R3+ task 06 B: scheduling quality.
+  // -------------------------------------------------------------------------
+
+  group('auto schedule quality (R3+ task 06 B)', () {
+    /// Every generated plan must satisfy the structural constraints, no matter
+    /// which heuristic/local-search candidate won.
+    void expectFeasiblePlan(CalendarAutoPlan plan, List<SchedulingTask> tasks) {
+      final settings = plan.schedule.settings;
+      final availability = buildAvailability(settings);
+      final segments = List<ScheduleSegment>.from(plan.schedule.segments)
+        ..sort((a, b) => a.start.compareTo(b.start));
+      for (var i = 0; i < segments.length; i++) {
+        final s = segments[i];
+        expect(
+          subtractIntervals([s.interval], availability.open),
+          isEmpty,
+          reason: '${s.taskId} 落在可用时间之外：${wall(s.start)}-${wall(s.end)}',
+        );
+        expect(s.start.isBefore(settings.startInstant), isFalse);
+        expect(s.end.isAfter(settings.endInstant), isFalse);
+        if (i > 0) {
+          expect(
+            segments[i - 1].end.isAfter(s.start),
+            isFalse,
+            reason: '${segments[i - 1].taskId} 与 ${s.taskId} 重叠',
+          );
+        }
+      }
+      // Dependencies are respected; never more minutes than the estimate.
+      for (final task in tasks) {
+        if (task.isDone) continue;
+        final own = plan.schedule.forTask(task.id);
+        final placed = own.fold<int>(0, (sum, s) => sum + s.minutes);
+        expect(placed, lessThanOrEqualTo(task.estimatedMinutes),
+            reason: '${task.id} 被安排了超过预计工时的分钟数');
+        for (final dep in task.dependsOn) {
+          final depSegments = plan.schedule.forTask(dep);
+          if (own.isEmpty || depSegments.isEmpty) continue;
+          expect(
+            own.first.start.isBefore(depSegments.last.end),
+            isFalse,
+            reason: '${task.id} 在前置 $dep 完成前开始',
+          );
+        }
+      }
+    }
+
+    List<int> minutesPerTask(CalendarAutoPlan plan, List<SchedulingTask> tasks) =>
+        [
+          for (final t in tasks) plan.schedule.minutesForTask(t.id),
+        ];
+
+    test('反例：A→B(11:00)→C(13:00) 在 09:00–13:00 内全部按时', () {
+      final settings =
+          settingsWith(const [WallClockRange(9 * 60, 13 * 60)], days: 1);
+      final tasks = [
+        task('A', 1),
+        task('B', 1, dependsOn: ['A'], deadline: '2026-11-18 11:00'),
+        task('C', 2, deadline: '2026-11-18 13:00'),
+      ];
+      final plan = autoSchedule(
+        current: CalendarSchedule(settings: settings),
+        tasks: tasks,
+        now: now,
+        newId: ids(),
+      );
+      expectFeasiblePlan(plan, tasks);
+      final a = plan.schedule.forTask('A');
+      final b = plan.schedule.forTask('B');
+      final c = plan.schedule.forTask('C');
+      // Feasible solution A→B→C; the old order scheduled C first and made B
+      // finish at 13:00 (1 overdue task / 120 overdue minutes).
+      expect([wall(a.single.start), wall(a.single.end)],
+          ['2026-11-18 09:00', '2026-11-18 10:00']);
+      expect([wall(b.single.start), wall(b.single.end)],
+          ['2026-11-18 10:00', '2026-11-18 11:00']);
+      expect([wall(c.single.start), wall(c.single.end)],
+          ['2026-11-18 11:00', '2026-11-18 13:00']);
+      expect(plan.metrics.overdueTaskCount, 0);
+      expect(plan.metrics.overdueMinutes, 0);
+      expect(plan.metrics.unplacedMinutes, 0);
+      expect(
+        detectConflicts(
+          schedule: plan.schedule,
+          tasks: tasks,
+          now: now,
+        ),
+        isEmpty,
+      );
+    });
+
+    test('容量本就不足：不吞工时、不虚构时段，剩余量如实报告', () {
+      final settings =
+          settingsWith(const [WallClockRange(9 * 60, 12 * 60)], days: 1);
+      final tasks = [
+        task('A', 3, deadline: '2026-11-18 11:00'),
+        task('B', 2, deadline: '2026-11-18 12:00'),
+      ];
+      final plan = autoSchedule(
+        current: CalendarSchedule(settings: settings),
+        tasks: tasks,
+        now: now,
+        newId: ids(),
+      );
+      expectFeasiblePlan(plan, tasks);
+      // 180 minutes of capacity exist; demand is 300. The plan must place
+      // exactly the capacity (no invented time) and report the rest.
+      final placed = minutesPerTask(plan, tasks);
+      expect(placed.reduce((a, b) => a + b), 180);
+      expect(plan.metrics.unplacedMinutes, 120);
+      expect(plan.metrics.overdueTaskCount, 1); // A ends after its deadline
+      expect(plan.metrics.overdueMinutes, 60);
+      expect(plan.taskNotes['B'], contains('容量不足'));
+      expect(plan.taskNotes['B'], contains('2 小时'));
+      // The unplaced remainder is visible in the task note and no segment
+      // pretends the missing work happened.
+      expect(plan.schedule.minutesForTask('B'), 0);
+    });
+
+    test('独立任务按截止时间先后安排，全部按时', () {
+      final settings =
+          settingsWith(const [WallClockRange(9 * 60, 12 * 60)], days: 1);
+      final tasks = [
+        task('P', 1, order: 2),
+        task('Q', 1, deadline: '2026-11-18 11:00', order: 0),
+        task('R', 1, deadline: '2026-11-18 12:00', order: 1),
+      ];
+      final plan = autoSchedule(
+        current: CalendarSchedule(settings: settings),
+        tasks: tasks,
+        now: now,
+        newId: ids(),
+      );
+      expectFeasiblePlan(plan, tasks);
+      expect(wall(plan.schedule.forTask('Q').single.start), '2026-11-18 09:00');
+      expect(wall(plan.schedule.forTask('R').single.start), '2026-11-18 10:00');
+      expect(wall(plan.schedule.forTask('P').single.start), '2026-11-18 11:00');
+      expect(plan.metrics.overdueTaskCount, 0);
+      expect(plan.metrics.unplacedMinutes, 0);
+    });
+
+    test('跨日占用：课程时段不可用，容量不足部分如实报告', () {
+      final settings = settingsWith(
+        const [WallClockRange(9 * 60, 12 * 60)],
+        days: 2,
+        occupancies: const [
+          CalendarOccupancy(
+            id: 'occ',
+            title: '课程',
+            kind: 'course',
+            weekday: 3,
+            ranges: [WallClockRange(10 * 60, 11 * 60)],
+          ),
+        ],
+      );
+      final tasks = [
+        task('X', 2),
+        task('Y', 3, deadline: '2026-11-19 11:00'),
+        task('Z', 1),
+      ];
+      final plan = autoSchedule(
+        current: CalendarSchedule(settings: settings),
+        tasks: tasks,
+        now: now,
+        newId: ids(),
+      );
+      expectFeasiblePlan(plan, tasks);
+      // Y must stay inside its deadline; total capacity (300 min) < demand (360).
+      expect(
+        plan.schedule.forTask('Y').last.end.isAfter(at('2026-11-19 11:00')),
+        isFalse,
+      );
+      expect(plan.metrics.overdueTaskCount, 0);
+      expect(plan.metrics.unplacedMinutes, 60);
+      // The course window is never used for work.
+      for (final segment in plan.schedule.segments) {
+        final overlap = TimeInterval(
+          at('2026-11-18 10:00'),
+          at('2026-11-18 11:00'),
+        ).overlaps(segment.interval);
+        expect(overlap, isFalse);
+      }
+    });
+
+    test('部分完成：手工片段保留，剩余工时按新范围安排', () {
+      final settings =
+          settingsWith(const [WallClockRange(9 * 60, 13 * 60)], days: 1);
+      final manual = ScheduleSegment(
+        id: 'manual-1',
+        taskId: 'B',
+        start: at('2026-11-18 09:00'),
+        end: at('2026-11-18 10:00'),
+        source: SegmentSource.manual,
+      );
+      final current = CalendarSchedule(settings: settings, segments: [manual]);
+      final tasks = [
+        task('B', 2, deadline: '2026-11-18 12:00'),
+        task('C', 1),
+      ];
+      final plan = autoSchedule(
+        current: current,
+        tasks: tasks,
+        now: now,
+        keepManual: true,
+        newId: ids(),
+      );
+      expectFeasiblePlan(plan, tasks);
+      final b = plan.schedule.forTask('B');
+      expect(b.any((s) => s.id == 'manual-1'), isTrue, reason: '手工片段必须保留');
+      expect(plan.schedule.minutesForTask('B'), 120);
+      expect(plan.metrics.overdueTaskCount, 0);
+      expect(plan.metrics.unplacedMinutes, 0);
+      // Locked segments are never counted as moved.
+      expect(plan.metrics.movedExistingSegments, 0);
+    });
+
+    test('相同截止时间：稳定平局规则，容量不足时只报未安排', () {
+      final settings =
+          settingsWith(const [WallClockRange(9 * 60, 11 * 60)], days: 1);
+      final tasks = [
+        task('a', 1, deadline: '2026-11-18 11:00', order: 0),
+        task('b', 1, deadline: '2026-11-18 11:00', order: 1),
+        task('c', 1, deadline: '2026-11-18 11:00', order: 2),
+      ];
+      final plan = autoSchedule(
+        current: CalendarSchedule(settings: settings),
+        tasks: tasks,
+        now: now,
+        newId: ids(),
+      );
+      expectFeasiblePlan(plan, tasks);
+      expect(plan.schedule.minutesForTask('a'), 60);
+      expect(plan.schedule.minutesForTask('b'), 60);
+      expect(plan.schedule.minutesForTask('c'), 0);
+      expect(plan.metrics.overdueTaskCount, 0);
+      expect(plan.metrics.unplacedMinutes, 60);
+      expect(plan.taskNotes['c'], contains('容量不足'));
+    });
+
+    test('依赖环：成环任务不安排且报告，独立任务照常安排', () {
+      final settings =
+          settingsWith(const [WallClockRange(9 * 60, 12 * 60)], days: 1);
+      final tasks = [
+        task('x', 1, dependsOn: ['y']),
+        task('y', 1, dependsOn: ['x']),
+        task('z', 1),
+      ];
+      final plan = autoSchedule(
+        current: CalendarSchedule(settings: settings),
+        tasks: tasks,
+        now: now,
+        newId: ids(),
+      );
+      expectFeasiblePlan(plan, tasks);
+      expect(plan.notes.join(), contains('依赖成环'));
+      expect(plan.schedule.forTask('x'), isEmpty);
+      expect(plan.schedule.forTask('y'), isEmpty);
+      expect(plan.schedule.minutesForTask('z'), 60);
+    });
+
+    test('局部搜索：消除可避免逾期，预算为 0 时退回基线并记录', () {
+      // X cannot meet 11:00 (3h of work before 11:00 is impossible), but the
+      // base order delays Y unnecessarily: Y first keeps only X overdue.
+      final settings =
+          settingsWith(const [WallClockRange(9 * 60, 13 * 60)], days: 1);
+      final tasks = [
+        task('X', 3, deadline: '2026-11-18 11:00', order: 0),
+        task('Y', 1, deadline: '2026-11-18 12:00', order: 1),
+      ];
+      final improved = autoSchedule(
+        current: CalendarSchedule(settings: settings),
+        tasks: tasks,
+        now: now,
+        newId: ids(),
+      );
+      final disabled = autoSchedule(
+        current: CalendarSchedule(settings: settings),
+        tasks: tasks,
+        now: now,
+        newId: ids(),
+        localSearchTimeBudget: Duration.zero,
+      );
+      expectFeasiblePlan(improved, tasks);
+      expectFeasiblePlan(disabled, tasks);
+      // Baseline: X first → both tasks overdue.
+      expect(disabled.metrics.overdueTaskCount, 2);
+      expect(disabled.metrics.overdueMinutes, 120);
+      expect(disabled.localSearchCandidates, 0);
+      expect(disabled.localSearchBudgetExhausted, isTrue);
+      // Local search moves Y before X: only X is overdue.
+      expect(improved.metrics.overdueTaskCount, 1);
+      expect(improved.metrics.overdueMinutes, 120);
+      expect(improved.localSearchCandidates, greaterThan(0));
+      expect(improved.localSearchBudgetExhausted, isFalse);
+      expect(
+        improved.metrics.compareTo(disabled.metrics),
+        lessThan(0),
+        reason: '只接受字典序严格更好的候选',
+      );
+      // Y is the task that got moved on time.
+      expect(wall(improved.schedule.forTask('Y').single.start),
+          '2026-11-18 09:00');
+      final yDeadline = at('2026-11-18 12:00');
+      expect(
+        improved.schedule.forTask('Y').last.end.isAfter(yDeadline),
+        isFalse,
+      );
+    });
+
+    test('重排全部：既有自动片段计入移动数，手工片段被重建', () {
+      final settings =
+          settingsWith(const [WallClockRange(8 * 60, 12 * 60)], days: 1);
+      final current = CalendarSchedule(
+        settings: settings,
+        segments: [
+          ScheduleSegment(
+            id: 'manual-1',
+            taskId: 't1',
+            start: at('2026-11-18 08:00'),
+            end: at('2026-11-18 09:00'),
+            source: SegmentSource.manual,
+          ),
+          ScheduleSegment(
+            id: 'auto-1',
+            taskId: 't1',
+            start: at('2026-11-18 10:00'),
+            end: at('2026-11-18 11:00'),
+            source: SegmentSource.auto,
+          ),
+        ],
+      );
+      final tasks = [task('t1', 3)];
+      final keepManualPlan = autoSchedule(
+        current: current,
+        tasks: tasks,
+        now: now,
+        keepManual: true,
+        newId: ids(),
+      );
+      expectFeasiblePlan(keepManualPlan, tasks);
+      expect(keepManualPlan.schedule.segments.any((s) => s.id == 'manual-1'),
+          isTrue);
+      // The old auto segment is rebuilt from scratch → counted as moved.
+      expect(keepManualPlan.metrics.movedExistingSegments, 1);
+
+      final fullRebuild = autoSchedule(
+        current: current,
+        tasks: tasks,
+        now: now,
+        keepManual: false,
+        newId: ids(),
+      );
+      expectFeasiblePlan(fullRebuild, tasks);
+      expect(fullRebuild.schedule.segments.any((s) => s.id == 'manual-1'),
+          isFalse);
+      expect(fullRebuild.schedule.segments.any((s) => s.id == 'auto-1'),
+          isFalse);
+      expect(fullRebuild.metrics.movedExistingSegments, 2);
+    });
+
+    test('大任务集：60 个任务/5 天，约束全部通过且不劣于旧启发式', () {
+      final settings =
+          settingsWith(const [WallClockRange(9 * 60, 17 * 60)], days: 5);
+      // Deterministic pseudo-random set with chains and deadlines (same shape
+      // as the manual comparison run recorded in docs/task06/scheduling.md).
+      var seed = 123456789;
+      int nextInt(int max) {
+        seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+        return seed % max;
+      }
+
+      final tasks = <SchedulingTask>[];
+      for (var i = 0; i < 60; i++) {
+        final hours = [0.5, 1.0, 1.5, 2.0, 3.0][nextInt(5)];
+        final deps = <String>[];
+        if (i > 0 && nextInt(3) == 0) deps.add('t${i - 1}');
+        final hasDeadline = nextInt(3) == 0;
+        final day = 18 + nextInt(5);
+        final hour = 9 + nextInt(9);
+        tasks.add(task(
+          't$i',
+          hours,
+          dependsOn: deps,
+          deadline: hasDeadline
+              ? '2026-11-${day.toString().padLeft(2, '0')} '
+                  '${hour.toString().padLeft(2, '0')}:00'
+              : null,
+          order: i,
+        ));
+      }
+      final plan = autoSchedule(
+        current: CalendarSchedule(settings: settings),
+        tasks: tasks,
+        now: now,
+        newId: ids(),
+      );
+      expectFeasiblePlan(plan, tasks);
+      // No work may be swallowed: placed + reported-unplaced == estimates.
+      final totalEstimate = tasks.fold<int>(
+          0, (sum, task) => sum + task.estimatedMinutes);
+      final placedMinutes = plan.schedule.segments
+          .fold<int>(0, (sum, segment) => sum + segment.minutes);
+      expect(placedMinutes + plan.metrics.unplacedMinutes, totalEstimate);
+
+      // Legacy baseline (the previous heuristic, measured before the
+      // improvement): 10 overdue tasks / 10,500 overdue minutes / 3,690
+      // unplaced minutes / 31 segments. Running with the search disabled must
+      // still reproduce it; the improved plan may not be worse.
+      final baseline = autoSchedule(
+        current: CalendarSchedule(settings: settings),
+        tasks: tasks,
+        now: now,
+        newId: ids(),
+        maxLocalSearchCandidates: 0,
+      );
+      expect(baseline.metrics.overdueTaskCount, 10);
+      expect(baseline.metrics.overdueMinutes, 10500);
+      expect(baseline.metrics.unplacedMinutes, 3690);
+      expect(baseline.metrics.segmentCount, 31);
+      expect(plan.metrics.compareTo(baseline.metrics), lessThanOrEqualTo(0));
+      expect(plan.elapsedMicroseconds, lessThan(5 * 1000 * 1000));
+      stdout.writeln('[scheduling] large set metrics=${plan.metrics} '
+          'baseline=${baseline.metrics} '
+          'candidates=${plan.localSearchCandidates} '
+          'elapsedUs=${plan.elapsedMicroseconds}');
     });
   });
 }

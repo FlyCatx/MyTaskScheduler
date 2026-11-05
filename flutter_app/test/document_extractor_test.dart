@@ -819,5 +819,199 @@ void main() {
       _expectFailure(result, DocumentErrorKind.cancelled);
     });
   });
-}
 
+  // -------------------------------------------------------------------------
+  // R3+ task 06 A: split local budgets.
+  // -------------------------------------------------------------------------
+
+  group('split budgets (R3+ task 06 A)', () {
+    test('default budgets are split and aligned with analysis_budget.dart', () {
+      const limits = DocumentExtractionLimits.defaults;
+      expect(limits.maxSourceFileBytes, 32 * 1024 * 1024);
+      expect(limits.maxExtractedTextUtf8Bytes, 8 * 1024 * 1024);
+      expect(limits.maxZipEntryBytes, 64 * 1024 * 1024);
+      expect(limits.maxTotalUncompressedBytes, 96 * 1024 * 1024);
+      expect(limits.maxPdfPages, 400);
+      expect(limits.isValid, isTrue);
+      expect(limits.isLegacySingleBudget, isFalse);
+      expect(DocumentExtractionLimits.single(4096).isLegacySingleBudget, isTrue);
+      expect(
+        DocumentExtractionLimits.single(4096).maxSourceFileBytes,
+        4096,
+      );
+      expect(
+        DocumentExtractionLimits.single(4096).maxExtractedTextUtf8Bytes,
+        4096,
+      );
+    });
+
+    test('text over the extracted-text budget fails explicitly, not truncated',
+        () async {
+      final dir = _tempDir();
+      final long = '文' * 200; // 600 UTF-8 bytes
+      final file = _write(
+        dir,
+        'text_budget.docx',
+        _docxZip(_docxXml('<w:p><w:r><w:t>$long</w:t></w:r></w:p>')),
+      );
+      final result = await extractDocument(
+        file,
+        limits: const DocumentExtractionLimits(
+          maxSourceFileBytes: 1024 * 1024,
+          maxExtractedTextUtf8Bytes: 100,
+        ),
+      );
+      _expectFailure(result, DocumentErrorKind.tooLarge);
+      expect(result.error!.message, contains('抽取文本上限'));
+      expect(result.error!.message, contains('未截断'));
+      expect(result.error!.message, contains('分块分析'));
+      // A failed extraction never returns the (truncated) text.
+      expect(result.document, isNull);
+    });
+
+    test('a container over the source-file budget is rejected before reading',
+        () async {
+      final dir = _tempDir();
+      final file = _write(dir, 'source_budget.txt', utf8.encode('x' * 300));
+      final result = await extractDocument(
+        file,
+        limits: const DocumentExtractionLimits(
+          maxSourceFileBytes: 200,
+          maxExtractedTextUtf8Bytes: 8 * 1024 * 1024,
+        ),
+      );
+      _expectFailure(result, DocumentErrorKind.tooLarge);
+      expect(result.error!.message, contains('源文件'));
+      expect(result.error!.message, contains('下一步'));
+      expect(result.document, isNull);
+    });
+
+    test('a container much larger than its text is accepted (image-heavy DOCX)',
+        () async {
+      final dir = _tempDir();
+      const tail = '图片很多的申报表末段-OK';
+      // ~1 MB of stored (never decompressed) media + a few hundred bytes of text.
+      final media = List<int>.generate(1024 * 1024, (i) => (i * 31 + 7) & 0xFF);
+      final archive = Archive()
+        ..addFile(ArchiveFile.bytes(
+          '[Content_Types].xml',
+          utf8.encode(_contentTypes),
+        ))
+        ..addFile(ArchiveFile.bytes(
+          'word/document.xml',
+          utf8.encode(_docxXml('<w:p><w:r><w:t>$tail</w:t></w:r></w:p>')),
+        ))
+        ..addFile(ArchiveFile.noCompress(
+          'word/media/image1.png',
+          media.length,
+          media,
+        ));
+      final bytes = ZipEncoder().encodeBytes(archive);
+      final file = _write(dir, 'images.docx', bytes);
+
+      final result = await extractDocument(
+        file,
+        limits: DocumentExtractionLimits.defaults,
+      );
+      expect(result.ok, isTrue, reason: result.error?.message);
+      final doc = result.document!;
+      expect(doc.sourceFileBytes, bytes.length);
+      expect(doc.sourceFileBytes, greaterThan(1024 * 1024));
+      expect(doc.textUtf8Bytes, lessThan(1024));
+      expect(doc.text, contains(tail));
+      expect(result.requiresChunking(262144), isFalse);
+    });
+
+    test('invalid limits are rejected with a structured error', () async {
+      final dir = _tempDir();
+      final file = _write(dir, 'a.txt', utf8.encode('hello'));
+      final result = await extractDocument(
+        file,
+        limits: const DocumentExtractionLimits(
+          maxSourceFileBytes: 0,
+          maxExtractedTextUtf8Bytes: 0,
+        ),
+      );
+      _expectFailure(result, DocumentErrorKind.tooLarge);
+      expect(result.error!.message, contains('预算配置无效'));
+    });
+
+    test('the total decompressed-size guard rejects a bomb-like container',
+        () async {
+      final dir = _tempDir();
+      final archive = Archive()
+        ..addFile(ArchiveFile.bytes(
+          '[Content_Types].xml',
+          utf8.encode(_contentTypes),
+        ))
+        ..addFile(ArchiveFile.bytes(
+          'word/document.xml',
+          utf8.encode(_docxXml('<w:p><w:r><w:t>正文</w:t></w:r></w:p>')),
+        ))
+        ..addFile(ArchiveFile.bytes(
+          'word/media/pad.bin',
+          List<int>.filled(5000, 0),
+        ));
+      final file = _write(dir, 'bomb.docx', ZipEncoder().encodeBytes(archive));
+      final result = await extractDocument(
+        file,
+        limits: const DocumentExtractionLimits(
+          maxSourceFileBytes: 1024 * 1024,
+          maxExtractedTextUtf8Bytes: 1024 * 1024,
+          maxZipEntryBytes: 1024 * 1024,
+          maxTotalUncompressedBytes: 1000,
+        ),
+      );
+      _expectFailure(result, DocumentErrorKind.tooLarge);
+      expect(result.error!.message, contains('解压上限'));
+      expect(result.error!.message, contains('下一步'));
+    });
+
+    test('the PDF page guard uses the local page limit', () async {
+      final dir = _tempDir();
+      final file = _write(
+        dir,
+        'pages.pdf',
+        _textPdf([
+          'BT /F1 12 Tf 72 712 Td (Page one) Tj ET',
+          'BT /F1 12 Tf 72 700 Td (Page two) Tj ET',
+          'BT /F1 12 Tf 72 688 Td (Page three) Tj ET',
+        ]),
+      );
+      final result = await extractDocument(
+        file,
+        limits: const DocumentExtractionLimits(
+          maxSourceFileBytes: 1024 * 1024,
+          maxExtractedTextUtf8Bytes: 1024 * 1024,
+          maxPdfPages: 2,
+        ),
+      );
+      _expectFailure(result, DocumentErrorKind.tooLarge);
+      expect(result.error!.message, contains('3 页'));
+      expect(result.error!.message, contains('拆分 PDF'));
+    });
+
+    test('explicit limits take precedence over the legacy maxBytes argument',
+        () async {
+      final dir = _tempDir();
+      final file = _write(dir, 'hello.txt', utf8.encode('hello'));
+      final result = await extractDocument(
+        file,
+        maxBytes: 1,
+        limits: const DocumentExtractionLimits(
+          maxSourceFileBytes: 1024,
+          maxExtractedTextUtf8Bytes: 1024,
+        ),
+      );
+      expect(result.ok, isTrue, reason: result.error?.message);
+      expect(result.document!.text, 'hello');
+      expect(result.document!.textUtf8Bytes, 5);
+      expect(result.requiresChunking(5), isFalse);
+      expect(result.requiresChunking(4), isTrue);
+      expect(exceedsSingleRequestBudget('hello', 5), isFalse);
+      expect(exceedsSingleRequestBudget('hello', 4), isTrue);
+      expect(exceedsSingleRequestBudget('', 0), isFalse);
+      expect(exceedsSingleRequestBudget('x', 0), isTrue);
+    });
+  });
+}
