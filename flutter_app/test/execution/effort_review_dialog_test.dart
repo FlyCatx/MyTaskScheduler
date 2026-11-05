@@ -2,6 +2,7 @@
 // CSV 导出钩子（含 BOM 与时区口径），以及未注入导出钩子时不伪造导出。
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:taskscheduler_flutter/src/model/plan.dart' show Completion;
 import 'package:taskscheduler_flutter/src/state/execution/effort_review_service.dart';
@@ -94,6 +95,23 @@ Future<void> _openDialog(
   await tester.pumpAndSettle();
 }
 
+/// 标题栏几何：关闭按钮锚定卡片右内缘（主题内边距 8），日期在按钮左侧。
+/// 只断言 find.byKey 成功无法发现“关闭离右边缘太远”或“日期被裁”。
+void _expectTitleAnchored(WidgetTester tester) {
+  final card = tester.getRect(find.byKey(const Key('effort-review-card')));
+  final close =
+      tester.getRect(find.byKey(const Key('effort-review-close-icon')));
+  final range = tester.getRect(find.byKey(const Key('effort-review-range')));
+  final title = tester.getRect(find.byKey(const Key('effort-review-title')));
+  expect(close.width, closeTo(28, 1));
+  expect(card.right - close.right, closeTo(8, 1.5),
+      reason: '关闭按钮必须贴卡片右内缘');
+  expect(range.right, lessThanOrEqualTo(close.left + 0.5),
+      reason: '日期范围在关闭按钮左侧');
+  expect(title.left, greaterThanOrEqualTo(card.left + 20 - 0.5));
+  expect(range.left, greaterThanOrEqualTo(title.left - 0.5));
+}
+
 void main() {
   testWidgets('展示已确认投入、未知/待校正、完成数、延期与建议剩余', (tester) async {
     final f = _fixture();
@@ -134,6 +152,8 @@ void main() {
     );
     // “已完成但未记录”的任务在任务行显示“实际 未知”。
     expect(find.textContaining('实际 未知'), findsWidgets);
+    // 标题栏几何（R4-A）：关闭锚定右内缘、日期在其左侧。
+    _expectTitleAnchored(tester);
   });
 
   testWidgets('任务可展开到原始执行记录', (tester) async {
@@ -161,6 +181,22 @@ void main() {
     expect(rangeText, contains('自定义'));
     expect(rangeText, contains('2026-10-30'));
     expect(rangeText, contains('2026-11-04'));
+    // 自定义（更长）的日期范围仍在关闭按钮左侧，标题行几何不变。
+    _expectTitleAnchored(tester);
+  });
+
+  testWidgets('标题/日期/关闭热区独立，Esc 可关闭', (tester) async {
+    final f = _fixture();
+    await _openDialog(tester, service: f.service, tasks: f.tasks);
+    _expectTitleAnchored(tester);
+    // 三个热区互不重叠：点日期不应关闭弹窗。
+    await tester.tap(find.byKey(const Key('effort-review-range')));
+    await tester.pumpAndSettle();
+    expect(find.byKey(const Key('effort-review-dialog')), findsOneWidget);
+    // Esc 关闭（保留原有键盘行为）。
+    await tester.sendKeyEvent(LogicalKeyboardKey.escape);
+    await tester.pumpAndSettle();
+    expect(find.byKey(const Key('effort-review-dialog')), findsNothing);
   });
 
   testWidgets('导出钩子收到 CSVBOM/时区/口径，成功后显示已导出', (tester) async {

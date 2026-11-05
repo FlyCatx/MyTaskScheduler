@@ -8,6 +8,7 @@ import 'package:taskscheduler_flutter/src/ui/execution/execution_actions.dart';
 import 'package:taskscheduler_flutter/src/ui/execution/execution_status_strip.dart';
 import 'package:taskscheduler_flutter/src/ui/execution/manual_entry_dialog.dart';
 import 'package:taskscheduler_flutter/src/ui/theme.dart';
+import 'package:taskscheduler_flutter/src/ui/widgets/bezier_ui.dart';
 
 import 'execution_test_support.dart';
 
@@ -156,6 +157,42 @@ void main() {
       return holder;
     }
 
+    testWidgets('标题栏右上角关闭；模式切换改主题分段控件且校验保留', (tester) async {
+      final fixture = await TimerFixture.create(memory: true);
+      addTearDown(fixture.close);
+      final holder = await openDialog(tester, fixture);
+
+      expect(find.byKey(const Key('manual-entry-dialog')), findsOneWidget);
+      // 与执行回顾一致的右上角关闭入口。
+      expect(find.byKey(const Key('manual-close')), findsOneWidget);
+      // 起止时间/仅时长不再是 Material SegmentedButton。
+      expect(find.byType(BezierSegments), findsOneWidget);
+      expect(
+        find.byType(SegmentedButton<ManualEntryMode>),
+        findsNothing,
+        reason: '统一主题分段控件',
+      );
+      expect(find.byKey(const Key('manual-mode')), findsOneWidget);
+
+      // 切换模式后字段与校验仍生效。
+      await tester.tap(find.byKey(const Key('manual-mode-duration')));
+      await tester.pumpAndSettle();
+      expect(find.byKey(const Key('manual-minutes')), findsOneWidget);
+      expect(find.byKey(const Key('manual-start')), findsNothing);
+      await tester.enterText(find.byKey(const Key('manual-minutes')), 'abc');
+      await tester.tap(find.byKey(const Key('manual-save')));
+      await tester.pumpAndSettle();
+      expect(find.byKey(const Key('manual-error')), findsOneWidget);
+      expect(find.byKey(const Key('manual-entry-dialog')), findsOneWidget);
+
+      // 关闭按钮返回 null，不写入记录。
+      await tester.tap(find.byKey(const Key('manual-close')));
+      await tester.pumpAndSettle();
+      expect(find.byKey(const Key('manual-entry-dialog')), findsNothing);
+      expect(holder[0], isNull);
+      expect(fixture.timer.ledger.records, isEmpty);
+    });
+
     testWidgets('未来时间被拒绝，对话框保持打开并显示原因', (tester) async {
       final fixture = await TimerFixture.create(memory: true);
       addTearDown(fixture.close);
@@ -193,8 +230,7 @@ void main() {
       expect(outcome.entry!.durationSeconds, 25 * 60);
     });
 
-    testWidgets('重叠时先展示区间，默认不计入；明确保留后计入并标注', (tester) async {
-      final fixture = await TimerFixture.create(memory: true);
+    testWidgets('重叠时先展示区间，默认不计入；明确保留后计入并标注', (tester) async {      final fixture = await TimerFixture.create(memory: true);
       addTearDown(fixture.close);
       final now = fixture.clock.nowUtc;
       fixture.store.ledger.addRecord(recordWithInterval(
