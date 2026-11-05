@@ -187,8 +187,9 @@ void _rejectNonZipContainer(
 }
 
 Archive _openZip(ExtractionContext context, Uint8List bytes) {
+  final Archive archive;
   try {
-    return ZipDecoder().decodeBytes(bytes);
+    archive = ZipDecoder().decodeBytes(bytes);
   } catch (error) {
     final text = '$error'.toLowerCase();
     if (text.contains('encrypt') || text.contains('password')) {
@@ -204,6 +205,30 @@ Archive _openZip(ExtractionContext context, Uint8List bytes) {
       detail: '$error',
     );
   }
+  _checkTotalUncompressed(context, archive);
+  return archive;
+}
+
+/// Zip-bomb guard: the sum of the *declared* uncompressed sizes must stay
+/// inside the local limit. Each part that is actually read is additionally
+/// capped by [ExtractionContext.maxPartBytes] in `_readPart`.
+void _checkTotalUncompressed(ExtractionContext context, Archive archive) {
+  var total = 0;
+  for (final file in archive.files) {
+    if (!file.isFile) continue;
+    final size = file.size;
+    if (size > 0) total += size;
+    if (total > context.maxTotalUncompressedBytes) break;
+  }
+  if (total <= context.maxTotalUncompressedBytes) return;
+  final limit = context.maxTotalUncompressedBytes;
+  context.fail(
+    DocumentErrorKind.tooLarge,
+    '文档解压后总大小约 ${formatByteSize(total)}，超过本地解压上限 '
+    '${formatByteSize(limit)}（$limit 字节，未做截断）。'
+    '下一步：移除文档里的内嵌图片/附件，或拆分成多个文件后重试。',
+    detail: 'total_uncompressed_bytes=$total, max_total_uncompressed_bytes=$limit',
+  );
 }
 
 /// Returns `null` only when the part is absent; structural failures throw.
@@ -217,8 +242,9 @@ Uint8List? _readPart(
   if (file.size > context.maxPartBytes) {
     context.fail(
       DocumentErrorKind.tooLarge,
-      '文档内部文件 $name 解压后约 ${file.size} 字节，超过安全上限 '
-      '${context.maxPartBytes} 字节，已拒绝读取。',
+      '文档内部文件 $name 解压后约 ${file.size} 字节，超过单个解压条目安全上限 '
+      '${context.maxPartBytes} 字节，已拒绝读取。'
+      '下一步：移除或拆分该内嵌内容后重试。',
       detail: 'zip part too large',
     );
   }
@@ -468,4 +494,3 @@ String _resolvePartTarget(String target) {
   }
   return out.join('/');
 }
-

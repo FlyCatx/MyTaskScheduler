@@ -46,6 +46,18 @@ ExtractionResult extractPdf(ExtractionContext context, Uint8List bytes) {
   final pages = document.collectPages();
   context.checkCancelled();
 
+  // Local resource guard (mirrors LocalProcessingLimits.maxPdfPages): the
+  // minimal parser walks every page, so a pathological PDF is rejected
+  // explicitly instead of running for minutes.
+  if (pages.length > context.maxPdfPages) {
+    context.fail(
+      DocumentErrorKind.tooLarge,
+      '该 PDF 共 ${pages.length} 页，超过本地处理上限 ${context.maxPdfPages} 页（未做截断）。'
+      '下一步：按页拆分 PDF 后重试。',
+      detail: 'pdf_pages=${pages.length}, max_pdf_pages=${context.maxPdfPages}',
+    );
+  }
+
   final segments = <DocumentSegment>[];
   final pageTexts = <String>[];
   final emptyPages = <int>[];
@@ -1431,4 +1443,3 @@ class _ContentInterpreter {
   if (value == null) return null;
   return (value: value, next: i);
 }
-
