@@ -86,7 +86,11 @@ class TsButtons {
       minimumSize: WidgetStatePropertyAll(
           minimumSize ?? const Size(0, TsSizes.buttonHeight)),
       textStyle: WidgetStatePropertyAll(
-          TextStyle(fontSize: fontSize ?? TsSizes.buttonFontSize)),
+          TextStyle(
+                fontSize: fontSize ?? TsSizes.buttonFontSize,
+                fontFamily: kUiFontFamily,
+                fontFamilyFallback: kUiFontFallback,
+              )),
       tapTargetSize: MaterialTapTargetSize.shrinkWrap,
     );
   }
@@ -130,7 +134,11 @@ class TsButtons {
             EdgeInsets.symmetric(horizontal: TsSizes.buttonPaddingH)),
         minimumSize: WidgetStatePropertyAll(Size(0, height)),
         textStyle: WidgetStatePropertyAll(
-            TextStyle(fontSize: fontSize ?? TsSizes.buttonFontSize)),
+            TextStyle(
+                fontSize: fontSize ?? TsSizes.buttonFontSize,
+                fontFamily: kUiFontFamily,
+                fontFamilyFallback: kUiFontFallback,
+              )),
         tapTargetSize: MaterialTapTargetSize.shrinkWrap,
       );
 
@@ -159,7 +167,11 @@ class TsButtons {
             const WidgetStatePropertyAll(EdgeInsets.symmetric(horizontal: 4)),
         minimumSize: const WidgetStatePropertyAll(Size(0, TsSizes.inlineHeight)),
         tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-        textStyle: WidgetStatePropertyAll(TextStyle(fontSize: fontSize)),
+        textStyle: WidgetStatePropertyAll(TextStyle(
+            fontSize: fontSize,
+            fontFamily: kUiFontFamily,
+            fontFamilyFallback: kUiFontFallback,
+          )),
         shape: const WidgetStatePropertyAll<OutlinedBorder>(
           BezierRoundedRectangleBorder(radius: 6),
         ),
@@ -189,7 +201,11 @@ class TsButtons {
         minimumSize: WidgetStatePropertyAll(
             Size(0, height ?? TsSizes.inlineHeight)),
         tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-        textStyle: WidgetStatePropertyAll(TextStyle(fontSize: fontSize)),
+        textStyle: WidgetStatePropertyAll(TextStyle(
+            fontSize: fontSize,
+            fontFamily: kUiFontFamily,
+            fontFamilyFallback: kUiFontFallback,
+          )),
         shape: const WidgetStatePropertyAll<OutlinedBorder>(
           BezierRoundedRectangleBorder(radius: 6),
         ),
@@ -298,4 +314,3 @@ class TsButtons {
         circular: circular,
       );
 }
-
