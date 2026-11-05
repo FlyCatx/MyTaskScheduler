@@ -266,7 +266,8 @@ void main() {
     _service.dispose();
   });
 
-  testWidgets('空状态显示说明，并可新建导入', (tester) async {
+  testWidgets('零来源时只显示来源计数与新建导入，三组说明不再出现', (tester) async {
+    final semantics = tester.ensureSemantics();
     var changed = 0;
     await _pumpPage(
       tester,
@@ -274,9 +275,30 @@ void main() {
       pick: () async => <String>['C:/fixtures/valid.ics'],
     );
 
+    // 三组常驻说明必须从控件树移除：不是透明字体、同色字体或空白占位。
+    expect(find.byKey(const Key('external-calendar-page-intro')), findsNothing);
     expect(
-        find.byKey(const Key('external-calendar-sources-empty')), findsOneWidget);
-    expect(find.textContaining('还没有导入任何外部日历'), findsOneWidget);
+        find.byKey(const Key('external-calendar-sources-empty')), findsNothing);
+    expect(find.byKey(const Key('external-calendar-page-note')), findsNothing);
+    expect(find.text('外部日历（本地 ICS，只读）'), findsNothing);
+    expect(find.textContaining('还没有导入任何外部日历'), findsNothing);
+    expect(find.textContaining('外部占用以浅灰斜纹叠加'), findsNothing);
+    // 语义树同样不得残留这三段（没有隐藏占位）。
+    expect(find.bySemanticsLabel(RegExp('本地 ICS，只读')), findsNothing);
+    expect(find.bySemanticsLabel(RegExp('还没有导入任何外部日历')), findsNothing);
+    expect(find.bySemanticsLabel(RegExp('浅灰斜纹')), findsNothing);
+
+    // 零来源只保留“来源 0 个”+“新建导入”，并保持紧凑（没有空段落占高）。
+    expect(find.text('来源 0 个'), findsOneWidget);
+    expect(
+        find.byKey(const Key('external-calendar-new-import')), findsOneWidget);
+    expect(
+      tester
+          .getSize(find.byKey(const Key('settings-external-calendar-page')))
+          .height,
+      lessThan(120),
+      reason: '零来源不应保留说明段落或该组专用间距',
+    );
 
     await tester.tap(find.byKey(const Key('external-calendar-new-import')));
     await tester.pumpAndSettle();
@@ -297,9 +319,13 @@ void main() {
         findsOneWidget);
     expect(find.byKey(Key('external-calendar-source-name-${source.id}')),
         findsOneWidget);
+    // 有来源后说明仍然不存在。
+    expect(find.byKey(const Key('external-calendar-page-intro')), findsNothing);
+    expect(find.byKey(const Key('external-calendar-page-note')), findsNothing);
+    semantics.dispose();
   });
 
-  testWidgets('来源列表显示范围/事件实例数/hash/导入时间/诊断与启用开关', (tester) async {
+  testWidgets('来源列表显示范围/事件实例数/hash/导入时间/诊断与启用开关，且说明不出现', (tester) async {
     final source = _source();
     _service.seed(source, <ExternalEventRecord>[
       _nightEvent(),
@@ -308,6 +334,19 @@ void main() {
     await _pumpPage(tester);
 
     expect(find.text('来源 1 个'), findsOneWidget);
+    // 非空时也不再有分组标题/说明/底部提示。
+    expect(find.byKey(const Key('external-calendar-page-intro')), findsNothing);
+    expect(find.byKey(const Key('external-calendar-page-note')), findsNothing);
+    expect(find.text('外部日历（本地 ICS，只读）'), findsNothing);
+    // 非空来源的全部操作入口都可用。
+    expect(find.byKey(Key('external-calendar-source-toggle-${source.id}')),
+        findsOneWidget);
+    expect(find.byKey(Key('external-calendar-source-update-${source.id}')),
+        findsOneWidget);
+    expect(find.byKey(Key('external-calendar-source-rename-${source.id}')),
+        findsOneWidget);
+    expect(find.byKey(Key('external-calendar-source-delete-${source.id}')),
+        findsOneWidget);
     expect(
         find.byKey(Key('external-calendar-source-${source.id}')), findsOneWidget);
     expect(
@@ -362,6 +401,9 @@ void main() {
     await tester.pumpAndSettle();
     expect(find.byKey(const Key('external-calendar-rename-field')),
         findsOneWidget);
+    // 标签已缩为“来源名称”，不再附带“不影响模型请求”的常驻解释。
+    expect(find.text('来源名称'), findsOneWidget);
+    expect(find.textContaining('只影响本地显示'), findsNothing);
 
     // 空名称：确认按钮不提交（对话框保持打开）。
     await tester.enterText(
@@ -435,8 +477,23 @@ void main() {
     await tester.pumpAndSettle();
     expect(_service.sources, isEmpty);
     expect(changed, 1);
+    // 删到零后恢复紧凑空态：只有“来源 0 个”+“新建导入”，没有多余空卡片。
+    expect(find.byKey(Key('external-calendar-source-${source.id}')),
+        findsNothing);
+    expect(find.text('来源 0 个'), findsOneWidget);
     expect(
-        find.byKey(const Key('external-calendar-sources-empty')), findsOneWidget);
+        find.byKey(const Key('external-calendar-new-import')), findsOneWidget);
+    expect(
+        find.byKey(const Key('external-calendar-sources-empty')), findsNothing);
+    expect(find.textContaining('还没有导入任何外部日历'), findsNothing);
+    expect(find.byKey(const Key('external-calendar-page-note')), findsNothing);
+    expect(
+      tester
+          .getSize(find.byKey(const Key('settings-external-calendar-page')))
+          .height,
+      lessThan(120),
+      reason: '最后一个来源删除后不应留下空卡片或说明占位',
+    );
   });
 
   testWidgets('服务端变化会刷新页面（例如其它入口导入/启停）', (tester) async {

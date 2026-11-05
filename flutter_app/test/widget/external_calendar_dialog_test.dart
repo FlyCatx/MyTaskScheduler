@@ -17,6 +17,7 @@ import 'package:taskscheduler_flutter/src/model/external_calendar.dart';
 import 'package:taskscheduler_flutter/src/state/external_calendar_service.dart';
 import 'package:taskscheduler_flutter/src/ui/external_calendar_dialog.dart';
 import 'package:taskscheduler_flutter/src/ui/theme.dart';
+import 'package:taskscheduler_flutter/src/ui/widgets/bezier_ui.dart';
 
 const String _tz = 'Asia/Shanghai';
 const String _from = '2026-11-09';
@@ -214,11 +215,12 @@ Future<void> _openDialog(
   Future<List<String>> Function()? pick,
   ExternalCalendarSource? existing,
   bool replaceDefault = false,
+  Size surface = const Size(1100, 900),
 }) async {
   tester.view.devicePixelRatio = 1.0;
-  tester.view.physicalSize = const Size(1100, 900);
+  tester.view.physicalSize = surface;
   addTearDown(tester.view.reset);
-  await tester.binding.setSurfaceSize(const Size(1100, 900));
+  await tester.binding.setSurfaceSize(surface);
   addTearDown(() => tester.binding.setSurfaceSize(null));
   TsColors.apply(Brightness.light);
   addTearDown(() => TsColors.apply(Brightness.light));
@@ -303,7 +305,151 @@ void main() {
     expect(_confirmEnabled(tester), isTrue);
   });
 
+  testWidgets('首次导入标题精确为“导入外部日历”，常驻说明与模式说明均被移除',
+      (tester) async {
+    final semantics = tester.ensureSemantics();
+    await _openDialog(tester, pick: () async => <String>['C:/fixtures/valid.ics']);
+
+    // 标题：精确“导入外部日历”，不再带括号与“本地 ICS，只读”。
+    expect(find.text('导入外部日历'), findsOneWidget);
+    expect(find.textContaining('（本地 ICS，只读）'), findsNothing);
+    expect(find.textContaining('导入外部日历（'), findsNothing);
+
+    // _intro() 已删除：控件树与语义树都不得残留。
+    expect(find.byKey(const Key('external-calendar-import-intro')), findsNothing);
+    expect(find.textContaining('事件标题与文件路径也不会进入模型请求'), findsNothing);
+    expect(find.bySemanticsLabel(RegExp('事件标题与文件路径')), findsNothing);
+    // 正文第一项直接是“选择 ICS 文件…”与文件状态。
+    expect(find.byKey(const Key('external-calendar-pick-file')), findsOneWidget);
+    expect(find.byKey(const Key('external-calendar-file-name')), findsOneWidget);
+    // 首次导入没有合并/替换模式选择（两者等价），也未选文件时提交禁用。
+    expect(find.byKey(const Key('external-calendar-mode-segments')), findsNothing);
+    expect(_confirmEnabled(tester), isFalse);
+
+    await _pick(tester);
+    expect(_confirmEnabled(tester), isTrue);
+
+    // 动作组显式右对齐：提交按钮贴近卡片右下角，取消在它左侧同一行。
+    final cardRect =
+        tester.getRect(find.byKey(const Key('external-calendar-import-card')));
+    final confirmRect = tester.getRect(_confirmButton);
+    final cancelRect = tester
+        .getRect(find.byKey(const Key('external-calendar-import-cancel')));
+    expect((cardRect.right - 20 - confirmRect.right).abs(), lessThan(2.5),
+        reason: '提交按钮应固定在弹窗右下角');
+    expect((cardRect.bottom - 10 - confirmRect.bottom).abs(), lessThan(2.5),
+        reason: '动作组应贴在弹窗底部');
+    expect(cancelRect.right, lessThanOrEqualTo(confirmRect.left));
+    expect((cancelRect.center.dy - confirmRect.center.dy).abs(), lessThan(2.5));
+
+    // _footer() 的模式说明两个分支都不存在。
+    expect(find.textContaining('合并导入：保留现有事件，按 UID 更新'), findsNothing);
+    expect(find.textContaining('完整替换：新文件里没有的事件会被移除'), findsNothing);
+    expect(find.bySemanticsLabel(RegExp('保留现有事件')), findsNothing);
+    semantics.dispose();
+  });
+
+  testWidgets('重新导入切换合并/完整替换会刷新预览，模式选择来自主题分段组件', (tester) async {
+    final existing = await _seedExisting();
+    final callsAfterSeed = _service.previewCalls;
+    await _openDialog(
+      tester,
+      pick: () async => <String>['C:/fixtures/replace.ics'],
+      existing: existing,
+    );
+    await _pick(tester);
+    final segments = find.byKey(const Key('external-calendar-mode-segments'));
+    expect(segments, findsOneWidget);
+    expect(tester.widget<BezierSegments>(segments).selected, 0,
+        reason: '未指定 replaceModeDefault 时默认合并');
+    expect(_service.previewCalls, callsAfterSeed + 1);
+
+    await tester.tap(find.byKey(const Key('external-calendar-mode-replace')));
+    await tester.pumpAndSettle();
+    expect(tester.widget<BezierSegments>(segments).selected, 1);
+    expect(_service.previewCalls, callsAfterSeed + 2,
+        reason: '切换模式必须按当前模式刷新预览');
+    expect(
+        find.descendant(
+            of: _confirmButton, matching: find.text('完整替换导入')),
+        findsOneWidget);
+
+    await tester.tap(find.byKey(const Key('external-calendar-mode-merge')));
+    await tester.pumpAndSettle();
+    expect(tester.widget<BezierSegments>(segments).selected, 0);
+    expect(_service.previewCalls, callsAfterSeed + 3);
+  });
+
+  testWidgets('长来源名重新导入标题完整可读，关闭按钮固定在右端', (tester) async {
+    const longName = '一个非常长的外部日历来源名称用于验证标题换行也不会把关闭按钮挤走';
+    const existing = ExternalCalendarSource(
+      id: 'ext-long-name',
+      name: longName,
+      filePath: 'C:/fixtures/valid.ics',
+      contentHash: _hash,
+      importedAt: '2026-11-04T00:00:00.000Z',
+      revision: 1,
+      dateFrom: _from,
+      dateTo: _to,
+      timezoneId: _tz,
+      stats: _stats,
+    );
+    await _service.commit(_previewOf(
+      events: <ExternalEventRecord>[_nightEvent()],
+      existing: existing,
+      diff: const ExternalImportDiff(added: 1),
+    ));
+    await _openDialog(
+      tester,
+      pick: () async => <String>['C:/fixtures/valid.ics'],
+      existing: _service.sources.single,
+    );
+
+    // 重新导入保留来源名，完整值仍在标题上（换行而不是截断成“…”）。
+    expect(find.text('重新导入「$longName」'), findsOneWidget);
+    final cardRect =
+        tester.getRect(find.byKey(const Key('external-calendar-import-card')));
+    final closeRect = tester
+        .getRect(find.byKey(const Key('external-calendar-import-close')));
+    expect((cardRect.right - 8 - closeRect.right).abs(), lessThan(2.5),
+        reason: '关闭按钮必须固定在弹窗右端');
+    expect(closeRect.bottom, lessThan(cardRect.top + 60),
+        reason: '关闭按钮位于标题行');
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('窄窗时模式分段整组换行，提交按钮仍在卡片内可点击', (tester) async {
+    final existing = await _seedExisting();
+    await _openDialog(
+      tester,
+      pick: () async => <String>['C:/fixtures/replace.ics'],
+      existing: existing,
+      surface: const Size(380, 640),
+    );
+    await _pick(tester);
+
+    final cardRect =
+        tester.getRect(find.byKey(const Key('external-calendar-import-card')));
+    final segments = find.byKey(const Key('external-calendar-mode-segments'));
+    expect(segments, findsOneWidget, reason: '窄窗也必须保留模式选择');
+    final segmentsRect = tester.getRect(segments);
+    final confirmRect = tester.getRect(_confirmButton);
+    // 内容区右界 = 卡片右 - 20（footer 内边距）。
+    expect(segmentsRect.right, lessThanOrEqualTo(cardRect.right - 20 + 0.5));
+    expect(segmentsRect.left, greaterThanOrEqualTo(cardRect.left + 20 - 0.5));
+    expect(confirmRect.right, lessThanOrEqualTo(cardRect.right - 20 + 0.5));
+    expect(confirmRect.bottom, lessThanOrEqualTo(cardRect.bottom - 10 + 0.5));
+    expect(tester.takeException(), isNull);
+
+    // 分段控件在窄窗仍可切换，且刷新预览。
+    await tester.tap(find.byKey(const Key('external-calendar-mode-replace')));
+    await tester.pumpAndSettle();
+    expect(
+        tester.widget<BezierSegments>(segments).selected, 1);
+  });
+
   testWidgets('取消不改任何数据（不写来源、不写快照）', (tester) async {
+
     await _openDialog(tester, pick: () async => <String>['C:/fixtures/valid.ics']);
     await _pick(tester);
     await tester.tap(find.byKey(const Key('external-calendar-import-cancel')));
@@ -434,7 +580,14 @@ void main() {
       replaceDefault: true,
     );
     await _pick(tester);
-    expect(find.byKey(const Key('external-calendar-mode-note')), findsOneWidget);
+    // 常驻模式说明已删除：模式改由主题分段控件表达（当前默认完整替换）。
+    expect(find.byKey(const Key('external-calendar-mode-note')), findsNothing);
+    expect(find.textContaining('完整替换：新文件里没有的事件会被移除'), findsNothing);
+    expect(find.byKey(const Key('external-calendar-mode-segments')), findsOneWidget);
+    final replaceSegments = tester.widget<BezierSegments>(
+        find.byKey(const Key('external-calendar-mode-segments')));
+    expect(replaceSegments.selected, 1, reason: '重新导入默认进入完整替换');
+    expect(find.byKey(const Key('external-calendar-mode-replace')), findsOneWidget);
     expect(find.textContaining('完整替换'), findsWidgets);
 
     // 第一次确认 → 弹出二次确认（显示将移除的数量与新旧范围）。

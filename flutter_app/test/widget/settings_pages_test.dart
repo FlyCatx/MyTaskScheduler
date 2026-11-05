@@ -218,7 +218,7 @@ void main() {
   });
 
   group('关于', () {
-    testWidgets('显示真实版本与未配置的更新服务', (tester) async {
+    testWidgets('显示真实版本与禁用检查更新的原因', (tester) async {
       await tester.binding.setSurfaceSize(const Size(1000, 1000));
       addTearDown(() => tester.binding.setSurfaceSize(null));
 
@@ -228,7 +228,9 @@ void main() {
       await tester.pumpAndSettle();
 
       expect(find.textContaining(kAppVersion), findsWidgets);
-      expect(find.textContaining('更新服务未配置'), findsOneWidget);
+      // 0.3.0：常驻“更新服务未配置”卡片已删除，禁用原因只在按钮 Tooltip 中。
+      expect(find.textContaining('更新服务未配置'), findsNothing);
+      expect(find.byTooltip('更新服务尚未接入'), findsOneWidget);
       expect(find.text('检查更新'), findsOneWidget);
       expect(find.text('查看帮助'), findsOneWidget);
       expect(find.text('复制诊断'), findsOneWidget);
@@ -248,7 +250,8 @@ void main() {
       final updateButton = tester.widget<OutlinedButton>(
           find.widgetWithText(OutlinedButton, '检查更新'));
       expect(updateButton.onPressed, isNull);
-      expect(find.textContaining('更新服务'), findsWidgets);
+      expect(find.textContaining('更新服务'), findsNothing,
+          reason: '禁用原因不再以常驻文案重复，只在 Tooltip 中');
     });
 
     testWidgets('脱敏诊断可复制且不含密钥', (tester) async {

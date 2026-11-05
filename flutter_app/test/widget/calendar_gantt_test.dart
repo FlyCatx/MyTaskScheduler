@@ -488,4 +488,287 @@ void main() {
     await tester.pumpAndSettle();
     expect(tester.takeException(), isNull);
   });
+
+  // ---------------------------------------------------------------- 0.3.0 新增
+
+  Future<void> resizeTo(WidgetTester tester, Size size) async {
+    await tester.binding.setSurfaceSize(size);
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+  }
+
+  /// 用生产里的 [GanttPanel] 打开展示（模式选择器由它注入日历工具带）。
+  Future<List<String>> pumpPanel(
+    WidgetTester tester, {
+    String initialMode = 'calendar',
+    Size size = const Size(1200, 700),
+    CalendarSchedule? schedule,
+    bool canEdit = true,
+    double textScale = 1.0,
+  }) async {
+    await resizeTo(tester, size);
+    final modes = <String>[];
+    await tester.pumpWidget(MaterialApp(
+      theme: buildAppTheme(Brightness.light),
+      builder: (context, child) => MediaQuery(
+        data: MediaQuery.of(context)
+            .copyWith(textScaler: TextScaler.linear(textScale)),
+        child: child!,
+      ),
+      home: Scaffold(
+        body: GanttPanel(
+          snapshot: snapshot,
+          interaction: TaskInteraction(),
+          version: version,
+          calendar: schedule ?? version.calendar,
+          actions: actions(Recorded(), canEdit: canEdit),
+          initialMode: initialMode,
+          onModeChanged: modes.add,
+          clock: at('2026-11-17 23:00'),
+        ),
+      ),
+    ));
+    await tester.pumpAndSettle();
+    return modes;
+  }
+
+  Finder horizontalScrollable() => find.byWidgetPredicate(
+      (w) => w is Scrollable && w.axisDirection == AxisDirection.right);
+
+  ScrollPosition horizontalPosition(WidgetTester tester) =>
+      tester.state<ScrollableState>(horizontalScrollable()).position;
+
+  Future<void> scrollTo(WidgetTester tester, double target) async {
+    horizontalPosition(tester).jumpTo(target);
+    await tester.pumpAndSettle();
+  }
+
+  String zoomPercent(WidgetTester tester) =>
+      tester.widget<Text>(find.byKey(const Key('calendar-zoom-percent'))).data!;
+
+  /// 表头文字左边缘（只考虑落在 [nearX] 附近 220 px 内的同一条标签）。
+  double? headerLabelNear(WidgetTester tester, String label, double nearX) {
+    for (final element in find.text(label).evaluate()) {
+      final box = element.renderObject as RenderBox?;
+      if (box == null || !box.hasSize) continue;
+      final left = box.localToGlobal(Offset.zero).dx;
+      if ((left - nearX).abs() < 220) return left;
+    }
+    return null;
+  }
+
+  /// 唯一表头标签的左边缘（不要求当前滚动位置可见）。
+  double labelLeft(WidgetTester tester, String label) {
+    final elements = find.text(label).evaluate().toList(growable: false);
+    expect(elements, hasLength(1), reason: '表头应只有一个“$label”');
+    final box = elements.single.renderObject as RenderBox?;
+    expect(box, isNotNull);
+    return box!.localToGlobal(Offset.zero).dx;
+  }
+
+  testWidgets('模式选择并入日历工具带：与日/周/今天同一行，没有独立空行', (tester) async {
+    await pumpPanel(tester);
+    expect(find.byKey(const Key('gantt-submode')), findsOneWidget);
+    expect(find.byKey(const Key('calendar-scale')), findsOneWidget);
+    // 模式选择（日历排程/相对工时）与日/周、今天在同一条工具带里。
+    final modeY = tester.getCenter(find.text('日历排程')).dy;
+    for (final label in <String>['周', '今天', '可用时间', '自动安排', '重排全部']) {
+      expect((tester.getCenter(find.text(label)).dy - modeY).abs(),
+          lessThanOrEqualTo(1.0),
+          reason: '“$label”必须与模式选择同处一条工具带（宽度足够时同处一行）');
+    }
+    // 视图顶部就是工具带：父级不再单独保留一行“日历视图 …”的空行。
+    final viewTop = tester.getTopLeft(find.byType(CalendarGanttView)).dy;
+    final modeTop = tester.getTopLeft(find.byKey(const Key('gantt-submode'))).dy;
+    expect(modeTop - viewTop, lessThanOrEqualTo(1.0),
+        reason: '工具带之后不能再有下面那样的独立模式行（0.3.0 去掉了红框空行）');
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('相对工时只保留模式选择 + 返回日历，切回仍写回 setGanttMode',
+      (tester) async {
+    final modes = await pumpPanel(tester, initialMode: 'relative');
+    expect(find.byType(GanttChartView), findsOneWidget);
+    expect(find.byKey(const Key('gantt-back-to-calendar')), findsOneWidget);
+    // 仅对日历有效的操作在相对工时视图里不出现。
+    expect(find.text('自动安排'), findsNothing);
+    expect(find.text('重排全部'), findsNothing);
+    expect(find.text('可用时间'), findsNothing);
+    expect(find.text('周'), findsNothing);
+
+    await tester.tap(find.byKey(const Key('gantt-back-to-calendar')));
+    await tester.pumpAndSettle();
+    expect(modes, <String>['calendar'], reason: '模式切换必须经 onModeChanged 写回');
+    expect(find.byType(CalendarGanttView), findsOneWidget);
+    // 日历模式下选择器已在工具带里，日/周等操作也回来了。
+    expect(find.text('日历排程'), findsOneWidget);
+    expect(find.text('自动安排'), findsOneWidget);
+
+    await tester.tap(find.text('相对工时'));
+    await tester.pumpAndSettle();
+    expect(modes, <String>['calendar', 'relative']);
+    expect(find.byType(GanttChartView), findsOneWidget);
+  });
+
+  testWidgets('窄窗只整组换行、不溢出，工具仍然可达', (tester) async {
+    await pumpPanel(tester, size: const Size(560, 620));
+    expect(tester.takeException(), isNull);
+    for (final key in <Key>[
+      const Key('gantt-submode'),
+      const Key('calendar-scale'),
+      const Key('calendar-zoom-in'),
+      const Key('calendar-zoom-out'),
+    ]) {
+      expect(find.byKey(key), findsOneWidget);
+    }
+    expect(find.text('自动安排'), findsOneWidget);
+    // 换行后工具带更高；关键是控件彼此不重叠、都仍在视口内。
+    final rects = <Rect>[
+      tester.getRect(find.byKey(const Key('gantt-submode'))),
+      tester.getRect(find.byKey(const Key('calendar-scale'))),
+      tester.getRect(find.text('今天')),
+      tester.getRect(find.text('可用时间')),
+      tester.getRect(find.text('自动安排')),
+      tester.getRect(find.text('重排全部')),
+    ];
+    for (var i = 0; i < rects.length; i++) {
+      for (var j = i + 1; j < rects.length; j++) {
+        expect(rects[i].overlaps(rects[j]), isFalse,
+            reason: '窄窗下工具带控件不得互相覆盖（$i vs $j）');
+      }
+    }
+  });
+
+  testWidgets('右下角缩放条：百分比、上下限禁用、锚点时刻不跳', (tester) async {
+    await pumpPanel(tester);
+    expect(zoomPercent(tester), '100%');
+    // 缩放条浮在图表视口右下角：不压住底部水平滚动条，也不在左侧任务名列上。
+    final percentRect = tester.getRect(find.byKey(const Key('calendar-zoom-percent')));
+    final viewRect = tester.getRect(find.byType(CalendarGanttView));
+    expect(percentRect.right, lessThan(viewRect.right));
+    expect(percentRect.bottom, lessThan(viewRect.bottom));
+    expect(percentRect.left, greaterThan(viewRect.left + 300));
+
+    await scrollTo(tester, 600);
+    final position = horizontalPosition(tester);
+    final viewport = position.viewportDimension;
+    final beforeOffset = position.pixels;
+    final centerMinutes = (beforeOffset + viewport / 2) / 0.8; // 日视图 48 px/小时
+    await tester.tap(find.byKey(const Key('calendar-zoom-in')));
+    await tester.pumpAndSettle();
+    expect(zoomPercent(tester), '125%');
+    expect(position.pixels,
+        closeTo(centerMinutes * (0.8 * 1.25) - viewport / 2, 2.0),
+        reason: '缩放后视口中心代表的时刻必须保持不变（用日历自己的滚动控制器换算）');
+
+    await tester.tap(find.byKey(const Key('calendar-zoom-out')));
+    await tester.pumpAndSettle();
+    expect(zoomPercent(tester), '100%');
+
+    // 一直放大到上限：按钮禁用，百分比停在 400%。
+    for (var i = 0; i < 12; i++) {
+      final button = tester.widget<InkWell>(find.descendant(
+        of: find.byKey(const Key('calendar-zoom-in')),
+        matching: find.byType(InkWell),
+      ));
+      if (button.onTap == null) break;
+      await tester.tap(find.byKey(const Key('calendar-zoom-in')));
+      await tester.pumpAndSettle();
+    }
+    expect(zoomPercent(tester), '400%');
+    expect(
+      tester
+          .widget<InkWell>(find.descendant(
+            of: find.byKey(const Key('calendar-zoom-in')),
+            matching: find.byType(InkWell),
+          ))
+          .onTap,
+      isNull,
+      reason: '到上限必须禁用放大',
+    );
+    // 下限同理（400% → 50% 需要 8 次 −25%…这里只验证能到下限并禁用）。
+    for (var i = 0; i < 20; i++) {
+      final button = tester.widget<InkWell>(find.descendant(
+        of: find.byKey(const Key('calendar-zoom-out')),
+        matching: find.byType(InkWell),
+      ));
+      if (button.onTap == null) break;
+      await tester.tap(find.byKey(const Key('calendar-zoom-out')));
+      await tester.pumpAndSettle();
+    }
+    expect(zoomPercent(tester), '50%');
+    expect(
+      tester
+          .widget<InkWell>(find.descendant(
+            of: find.byKey(const Key('calendar-zoom-out')),
+            matching: find.byType(InkWell),
+          ))
+          .onTap,
+      isNull,
+      reason: '到下限必须禁用缩小',
+    );
+  });
+
+  testWidgets('缩放后同一时刻的表头与任务块仍然对齐（日/周两种刻度）', (tester) async {
+    await pumpPanel(tester);
+    await scrollTo(tester, 300);
+
+    double dayAlignmentDelta() {
+      final seg = tester.getTopLeft(find.byKey(const Key('calendar-segment-s1'))).dx;
+      final tick = headerLabelNear(tester, '08:00', seg);
+      expect(tick, isNotNull, reason: '日视图应能看到 08:00 时刻刻度');
+      // 表头小时文字左侧有 4 px 内边距，任务块从精确时刻开始。
+      return tick! - seg;
+    }
+
+    for (var i = 0; i < 2; i++) {
+      final delta = dayAlignmentDelta();
+      expect(delta, inInclusiveRange(2.5, 6.0),
+          reason: '表头 08:00 与 08:00 开始的任务块必须对在同一时刻（第 $i 次）');
+      if (i == 0) {
+        await tester.tap(find.byKey(const Key('calendar-zoom-in')));
+      } else {
+        await tester.tap(find.byKey(const Key('calendar-zoom-out')));
+      }
+      await tester.pumpAndSettle();
+    }
+
+    // 周视图：用两天表头实测“每天宽度”，再验证同一时刻的偏移比例不变。
+    await tester.tap(find.text('周'));
+    await tester.pumpAndSettle();
+    await scrollTo(tester, 200);
+    final day0 = labelLeft(tester, '11月18日 周三');
+    final day1 = labelLeft(tester, '11月19日 周四');
+    final dayWidth = day1 - day0;
+    expect(dayWidth, greaterThan(100));
+    // s3 = 2026-11-19 08:00 → 距范围起点 32 小时（1 天 + 8 小时）。
+    final s3 = tester.getTopLeft(find.byKey(const Key('calendar-segment-s3'))).dx;
+    final expected = day0 + dayWidth + dayWidth / 24 * 8 - 5;
+    expect(s3, closeTo(expected, 2.5),
+        reason: '周视图表头日期与任务块必须用同一套每小时宽度');
+
+    await tester.tap(find.byKey(const Key('calendar-zoom-in')));
+    await tester.pumpAndSettle();
+    final day0b = labelLeft(tester, '11月18日 周三');
+    final day1b = labelLeft(tester, '11月19日 周四');
+    final dayWidthB = day1b - day0b;
+    final s3b = tester.getTopLeft(find.byKey(const Key('calendar-segment-s3'))).dx;
+    expect(s3b, closeTo(day0b + dayWidthB + dayWidthB / 24 * 8 - 5, 2.5),
+        reason: '缩放后表头与任务块仍对齐');
+  });
+
+  testWidgets('只读历史版本仍可缩放，编辑禁用逻辑不变', (tester) async {
+    await pumpPanel(tester, canEdit: false);
+    expect(find.text('历史版本只读'), findsOneWidget);
+    expect(zoomPercent(tester), '100%');
+    await tester.tap(find.byKey(const Key('calendar-zoom-in')));
+    await tester.pumpAndSettle();
+    expect(zoomPercent(tester), '125%');
+    expect(tester.takeException(), isNull);
+    // 日历工具带里的编辑动作仍禁用（仅有日历有效的动作按原条件显示）。
+    final auto = tester.widget<FilledButton>(find.ancestor(
+      of: find.text('自动安排'),
+      matching: find.byType(FilledButton),
+    ));
+    expect(auto.onPressed, isNull);
+  });
 }

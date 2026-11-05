@@ -276,11 +276,16 @@ void main() {
 
     expect(
         find.byKey(const Key('external-calendar-open-import')), findsOneWidget);
-    final note = tester
-        .widget<Text>(find.byKey(const Key('external-calendar-editor-note')))
+    // 网格上方教程句已删除：控件树上不再有该说明，只保留超短动态数量。
+    expect(find.byKey(const Key('external-calendar-editor-note')), findsNothing);
+    expect(find.textContaining('不写入手工时间表'), findsNothing);
+    final count = tester
+        .widget<Text>(find.byKey(const Key('external-calendar-week-count')))
         .data!;
-    expect(note, contains('只读'));
-    expect(note, contains('1 条'), reason: '本周应显示 1 条叠加实例');
+    expect(count, contains('1 条'), reason: '本周应显示 1 条外部占用');
+    expect(count.length, lessThan(20), reason: '只保留超短动态数量');
+    // 工具提示缩为“导入外部日历”。
+    expect(find.byTooltip('导入外部日历'), findsOneWidget);
 
     // 悬停外部占用：可见信息含「外部日历」，证明服务数据已接到网格。
     final mouse = await tester.createGesture(kind: PointerDeviceKind.mouse);
