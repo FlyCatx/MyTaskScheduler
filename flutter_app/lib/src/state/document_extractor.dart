@@ -12,6 +12,13 @@
 // macros/scripts/external links (never executed or followed), and any format
 // not listed above.
 //
+// Budgets (R3+ task 06 A): container bytes, extracted-text bytes and
+// decompression guards are *separate* limits ([DocumentExtractionLimits]).
+// A file that is larger than one model request is never rejected here: it is
+// extracted locally and the caller routes it to chunked analysis via
+// [ExtractionResult.requiresChunking]. Everything is processed locally and
+// only after the user asks for it; selecting a file never calls the network.
+//
 // The API never throws: every failure is an [ExtractionResult] whose
 // [DocumentError] carries a structured [DocumentErrorKind].
 
@@ -28,9 +35,26 @@ export 'document_extraction_types.dart';
 /// Extracts plain text from [file] without network access and without
 /// executing any document content.
 ///
-/// [maxBytes] is enforced twice:
-/// 1. the source file must not exceed it, and
-/// 2. the extracted UTF-8 text must not exceed it (no silent truncation).
+/// Budgets, in order:
+/// 1. the source file must not exceed
+///    [DocumentExtractionLimits.maxSourceFileBytes] (checked before reading);
+/// 2. every decompressed OOXML part / PDF stream and the total uncompressed
+///    ZIP size must stay inside the local guards;
+/// 3. the extracted UTF-8 text must not exceed
+///    [DocumentExtractionLimits.maxExtractedTextUtf8Bytes] — no silent
+///    truncation ever.
+///
+/// [limits] and [maxBytes] are both optional:
+/// * [limits] — the split budgets (defaults: 32 MB container / 8 MB text);
+/// * [maxBytes] — **legacy** compatibility shorthand: the same number limits
+///   both the source file and the text, keeping the original
+///   `max_input_bytes` wording. If both are supplied, [limits] wins.
+///
+/// Over the *local* budgets the result is [DocumentErrorKind.tooLarge] with a
+/// message naming the concrete limit and the next step. A result that is
+/// within the local budgets but larger than one model request is a **success**;
+/// use [ExtractionResult.textUtf8Bytes] / [ExtractionResult.requiresChunking]
+/// to decide between the normal flow and the chunked-analysis entry.
 ///
 /// The returned future never completes with an exception for an expected
 /// failure (unsupported format, scan, encryption, corruption, empty file,
@@ -38,18 +62,27 @@ export 'document_extraction_types.dart';
 /// [DocumentErrorKind.corrupt] with a short detail string.
 Future<ExtractionResult> extractDocument(
   File file, {
-  required int maxBytes,
+  DocumentExtractionLimits? limits,
+  int? maxBytes,
   ExtractionCancellation? cancellation,
 }) async {
+  final effectiveLimits =
+      limits ?? (maxBytes != null ? DocumentExtractionLimits.single(maxBytes) : DocumentExtractionLimits.defaults);
   final context = ExtractionContext(
-    maxBytes: maxBytes,
+    limits: effectiveLimits,
     cancellation: cancellation,
   );
   try {
-    if (maxBytes <= 0) {
+    if (!effectiveLimits.isValid) {
+      if (effectiveLimits.isLegacySingleBudget) {
+        context.fail(
+          DocumentErrorKind.tooLarge,
+          '输入上限 maxBytes 必须大于 0（当前为 ${effectiveLimits.maxSourceFileBytes}）。',
+        );
+      }
       context.fail(
         DocumentErrorKind.tooLarge,
-        '输入上限 maxBytes 必须大于 0（当前为 $maxBytes）。',
+        '本地文档处理预算配置无效：所有上限都必须大于 0（当前 ${effectiveLimits.summary}）。',
       );
     }
     context.checkCancelled();
@@ -69,25 +102,21 @@ Future<ExtractionResult> extractDocument(
         detail: 'zero-length file',
       );
     }
-    if (length > maxBytes) {
-      context.fail(
-        DocumentErrorKind.tooLarge,
-        '文件 $length 字节，超过输入上限 $maxBytes 字节（未做截断）。'
-        '请拆分后重试，或调大配置里的 max_input_bytes。',
-        detail: 'file_bytes=$length, max_bytes=$maxBytes',
-      );
-    }
+    _checkSourceBudget(context, length);
     context.checkCancelled();
 
     final bytes = await file.readAsBytes();
     context.checkCancelled();
     // The file may have grown between length() and readAsBytes().
-    if (bytes.length > maxBytes) {
+    if (bytes.length > effectiveLimits.maxSourceFileBytes) {
       context.fail(
         DocumentErrorKind.tooLarge,
-        '文件 ${bytes.length} 字节，超过输入上限 $maxBytes 字节（未做截断）。',
+        _sourceBudgetMessage(context, bytes.length),
+        detail: 'file_bytes=${bytes.length}, '
+            'max_source_file_bytes=${effectiveLimits.maxSourceFileBytes}',
       );
     }
+    context.sourceFileBytes = bytes.length;
 
     final extension = _extensionOf(file.path);
     switch (extension) {
@@ -138,10 +167,31 @@ Future<ExtractionResult> extractDocument(
   }
 }
 
+void _checkSourceBudget(ExtractionContext context, int length) {
+  final limit = context.limits.maxSourceFileBytes;
+  if (length > limit) {
+    context.fail(
+      DocumentErrorKind.tooLarge,
+      _sourceBudgetMessage(context, length),
+      detail: 'file_bytes=$length, max_source_file_bytes=$limit',
+    );
+  }
+}
+
+String _sourceBudgetMessage(ExtractionContext context, int length) {
+  final limit = context.limits.maxSourceFileBytes;
+  if (context.legacySingleBudget) {
+    return '文件 $length 字节，超过输入上限 $limit 字节（未做截断）。'
+        '请拆分后重试，或调大配置里的 max_input_bytes。';
+  }
+  return '文件 $length 字节，超过本地导入上限：单个源文件最大 '
+      '${formatByteSize(limit)}（$limit 字节，未做截断，未读取内容）。'
+      '下一步：拆分或压缩该文件后重试，或改用“分块分析”入口。';
+}
+
 String _extensionOf(String path) {
   final name = path.split(RegExp(r'[\\/]')).last;
   final dot = name.lastIndexOf('.');
   if (dot < 0 || dot == name.length - 1) return '';
   return name.substring(dot + 1).toLowerCase();
 }
-

@@ -1,7 +1,5 @@
 // Shared helpers for the extractors. Not exported from document_extractor.dart.
 
-import 'dart:convert';
-
 import 'document_extraction_types.dart';
 
 /// Thrown inside an extractor and converted to an [ExtractionResult] at the
@@ -16,30 +14,34 @@ class ExtractionFailure implements Exception {
 }
 
 /// Limits + cancellation shared by every format extractor.
+///
+/// The budgets are split on purpose (R3+ task 06 A): the container bytes, the
+/// extracted text bytes and the decompression guards are independent numbers.
 class ExtractionContext {
-  const ExtractionContext({
-    required this.maxBytes,
+  ExtractionContext({
+    required this.limits,
     this.cancellation,
+    this.sourceFileBytes = 0,
   });
 
-  /// Maximum accepted source-file size **and** maximum accepted extracted-text
-  /// size. Consistent with the existing controller behaviour: never truncate
-  /// silently, report the over-limit condition instead.
-  final int maxBytes;
-
+  final DocumentExtractionLimits limits;
   final ExtractionCancellation? cancellation;
 
-  /// Upper bound for one decompressed OOXML part / PDF stream. This protects
-  /// against zip bombs and runaway streams. It is deliberately independent of
-  /// [maxBytes] (a small .docx may legitimately contain a larger XML part).
-  int get maxPartBytes {
-    var limit = maxBytes * 8;
-    const floor = 8 * 1024 * 1024;
-    const ceiling = 64 * 1024 * 1024;
-    if (limit < floor) limit = floor;
-    if (limit > ceiling) limit = ceiling;
-    return limit;
-  }
+  /// Measured source-file bytes (set by the public API after the length check).
+  int sourceFileBytes;
+
+  /// True when the caller used the legacy single `maxBytes` shorthand; error
+  /// messages keep the old `max_input_bytes` wording in that mode.
+  bool get legacySingleBudget => limits.isLegacySingleBudget;
+
+  /// Upper bound for one decompressed OOXML part / PDF stream.
+  int get maxPartBytes => limits.maxZipEntryBytes;
+
+  /// Upper bound for the sum of all decompressed ZIP entry sizes.
+  int get maxTotalUncompressedBytes => limits.maxTotalUncompressedBytes;
+
+  /// Upper bound for the number of pages the minimal PDF parser walks.
+  int get maxPdfPages => limits.maxPdfPages;
 
   void checkCancelled() {
     if (cancellation?.isCancelled ?? false) {
@@ -60,8 +62,13 @@ class ExtractionContext {
     throw ExtractionFailure(DocumentError(kind, message, detail: detail));
   }
 
-  /// Builds a successful result after applying the shared empty/too-large
+  /// Builds a successful result after applying the shared empty/text-budget
   /// checks. Extractors call this as their final step.
+  ///
+  /// Text above [DocumentExtractionLimits.maxExtractedTextUtf8Bytes] is an
+  /// explicit failure: the extracted text is **never** truncated. Text above
+  /// the *single request* budget is not an error here — the caller decides
+  /// whether to route the material to chunked analysis.
   ExtractionResult succeed({
     required String text,
     required String kind,
@@ -77,14 +84,24 @@ class ExtractionContext {
         ),
       );
     }
-    final textBytes = utf8.encode(text).length;
-    if (textBytes > maxBytes) {
+    final textBytes = utf8BytesOfText(text);
+    final textLimit = limits.maxExtractedTextUtf8Bytes;
+    if (textBytes > textLimit) {
+      final String message;
+      if (legacySingleBudget) {
+        message = '提取出的文字约 $textBytes 字节，超过输入上限 $textLimit 字节（未截断）。'
+            '请拆分文档后重试，或调大配置里的 max_input_bytes。';
+      } else {
+        message = '提取出的文字约 $textBytes 字节，超过本地抽取文本上限 '
+            '${formatByteSize(textLimit)}（$textLimit 字节，未截断）。'
+            '下一步：拆分文档后重试，或改用“分块分析”入口把材料分批发送。';
+      }
       return ExtractionResult.failure(
         DocumentError(
           DocumentErrorKind.tooLarge,
-          '提取出的文字约 $textBytes 字节，超过输入上限 $maxBytes 字节（未截断）。'
-          '请拆分文档后重试，或调大配置里的 max_input_bytes。',
-          detail: 'extracted_text_bytes=$textBytes, max_bytes=$maxBytes',
+          message,
+          detail: 'extracted_text_bytes=$textBytes, '
+              'max_extracted_text_utf8_bytes=$textLimit',
         ),
       );
     }
@@ -95,6 +112,8 @@ class ExtractionContext {
         pages: pages,
         segments: List<DocumentSegment>.unmodifiable(segments),
         warning: warning,
+        sourceFileBytes: sourceFileBytes,
+        textUtf8Bytes: textBytes,
       ),
     );
   }
@@ -143,4 +162,3 @@ String normaliseExtractedText(String input) {
   }
   return out.join('\n').trim();
 }
-

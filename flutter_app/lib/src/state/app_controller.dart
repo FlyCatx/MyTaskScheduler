@@ -119,6 +119,39 @@ class RunState {
   }
 }
 
+/// 附件导入的一次性反馈（0.3.0，提示词 02）。
+///
+/// 只描述“本次批量导入发生了什么”，由 UI 在侧栏通知区展示；不再是底部浮动
+/// SnackBar。失败项保留文件名与短原因；`note` 用于“已成功但需要分块分析”等附加说明。
+class AttachmentFeedback {
+  const AttachmentFeedback({
+    required this.conversationId,
+    required this.added,
+    required this.failed,
+    this.failures = const <String>[],
+    this.note,
+    required this.at,
+  });
+
+  final String conversationId;
+  final int added;
+  final int failed;
+
+  /// 每条形如 `文件名：原因`，可直接展示（长文本允许换行）。
+  final List<String> failures;
+  final String? note;
+  final DateTime at;
+
+  bool get isEmpty =>
+      added == 0 && failed == 0 && (note == null || note!.trim().isEmpty);
+  bool get hasFailures => failed > 0;
+  String get summary {
+    if (added > 0 && failed > 0) return '已添加 $added 个文件，$failed 个失败';
+    if (failed > 0) return '$failed 个文件未能添加';
+    return '已添加 $added 个文件';
+  }
+}
+
 class AppController extends ChangeNotifier {
   final ScheduleEngine engine;
   final SessionRepository store;
@@ -200,9 +233,73 @@ class AppController extends ChangeNotifier {
   String? _lastDocumentErrorCode;
   bool _busy = false;
 
+  /// 0.3.0（提示词 02）：附件导入反馈。不再用底部浮动 SnackBar，而是交给
+  /// 侧栏/工作区的紧凑通知区显示。按会话隔离，避免切会话后看到上一会话的回执。
+  AttachmentFeedback? _attachmentFeedback;
+
   /// 最近一次添加文件的结构化失败码（如 `unsupported_ocr`）；成功/无关时为 null。
   /// UI 用它决定是否提供“本地 OCR 导入”，不靠匹配中文错误文案。
   String? get lastDocumentErrorCode => _lastDocumentErrorCode;
+
+  // ------------------------------------------------ attachment feedback (0.3.0)
+
+  /// 当前会话的附件导入反馈；没有或属于别的会话时为 null（切会话不串回执）。
+  AttachmentFeedback? get attachmentFeedback {
+    final feedback = _attachmentFeedback;
+    if (feedback == null) return null;
+    if (feedback.conversationId != _conversation?.id) return null;
+    return feedback;
+  }
+
+  /// 记录一次批量导入结果（成功/失败合并为一条，不弹 SnackBar）。
+  void reportAttachmentFeedback({
+    required int added,
+    required int failed,
+    List<String> failures = const <String>[],
+    String? note,
+  }) {
+    final conversationId = _conversation?.id ?? '';
+    if (added == 0 && failed == 0 && (note == null || note.trim().isEmpty)) {
+      return;
+    }
+    _attachmentFeedback = AttachmentFeedback(
+      conversationId: conversationId,
+      added: added,
+      failed: failed,
+      failures: List<String>.unmodifiable(failures),
+      note: (note == null || note.trim().isEmpty) ? null : note.trim(),
+      at: DateTime.now(),
+    );
+    _notify();
+  }
+
+  void dismissAttachmentFeedback() {
+    if (_attachmentFeedback == null) return;
+    _attachmentFeedback = null;
+    _notify();
+  }
+
+  // ------------------------------------------- material size / request budget
+
+  /// 当前会话会随请求发送的材料文本总字节数（草稿 + 附件提取文本，UTF-8）。
+  int get materialUtf8Bytes {
+    final c = _conversation;
+    if (c == null) return 0;
+    var total = utf8.encode(c.draftText).length;
+    for (final attachment in c.attachments) {
+      total += attachment.byteLength > 0
+          ? attachment.byteLength
+          : utf8.encode(attachment.text).length;
+    }
+    return total;
+  }
+
+  /// 单次模型请求允许的输入字节上限（来自内核配置）。
+  int get singleRequestInputBytes => engine.info.maxInputBytes;
+
+  /// 材料是否超过单次请求预算 → 应走「分块分析」而不是普通发送。
+  bool get materialExceedsSingleRequest =>
+      materialUtf8Bytes > singleRequestInputBytes;
 
   List<ConversationSummary> get summaries => List.unmodifiable(_summaries);
   Conversation? get conversation => _conversation;
@@ -540,9 +637,12 @@ class AppController extends ChangeNotifier {
       return false;
     }
     try {
+      // 0.3.0（提示词 06A）：本地抽取使用分开的预算（容器 32MB / 文本 8MB），
+      // 不再拿单次请求上限 262144 字节同时卡文件大小和文本长度。文件可抽取但
+      // 超单次请求时保留材料，由 UI 引导到分块分析（见 AppShell._handleSend）。
       final result = await extractDocument(
         file,
-        maxBytes: engine.info.maxInputBytes,
+        limits: DocumentExtractionLimits.defaults,
       );
       if (result.error != null) {
         _lastDocumentErrorCode = result.error!.code;
@@ -554,12 +654,9 @@ class AppController extends ChangeNotifier {
       final text = doc.segments
           .map((s) => s.location == null ? s.text : '【${s.location}】\n${s.text}')
           .join('\n\n');
-      if (utf8.encode(text).length > engine.info.maxInputBytes) {
-        _errorMessage =
-            '提取出的文本超过输入上限 ${engine.info.maxInputBytes} 字节（未截断）；请拆分文件。';
-        _notify();
-        return false;
-      }
+      // 抽取结果一律不截断；超出单次请求预算不算导入失败（提示词 06A）：
+      // 材料保留在本地，发送时由 UI 提供分块估算/确认入口。
+      final textBytes = result.textUtf8Bytes ?? utf8.encode(text).length;
       // 提取是异步的：完成后必须合并到“最近”的会话，不能用提取前的旧快照覆盖。
       final latest = targetId == null
           ? _conversation
@@ -584,7 +681,7 @@ class AppController extends ChangeNotifier {
         kind: doc.kind,
         originalPath: path,
         text: text,
-        byteLength: utf8.encode(text).length,
+        byteLength: textBytes,
       );
       await store.saveAttachment(attachment);
       // 合并最新状态，保留提取期间用户新加的附件、改过的草稿和切换过的版本。
@@ -1858,6 +1955,14 @@ class AppController extends ChangeNotifier {
       _notify();
       return;
     }
+    // 0.3.0（提示词 06）：材料超过单次请求预算时不能硬发（C 侧会拒绝），
+    // 保留本地材料并明确引导到分块分析；不截断材料。
+    if (materialExceedsSingleRequest) {
+      _errorMessage = '材料约 $materialUtf8Bytes 字节，超过单次请求上限 '
+          '$singleRequestInputBytes 字节；本地材料已保留，请使用「分块分析」发送';
+      _notify();
+      return;
+    }
 
     // 非法时间表明确失败：不能把“带了非法约束”当成“没有约束”继续排程。
     // 这里的快照是运行时合成的（手工时间表 + 外部忙碌），请求里的
@@ -2848,7 +2953,8 @@ class AppController extends ChangeNotifier {
         _conversation = updated;
         _cache[updated.id] = updated;
         await store.saveConversation(updated);
-        _statusMessage = '时间表已保存；发送时会随请求一起提交';
+        // 提示词 02：保存成功回执不在主区顶部显示（也不留占位）；数据已落盘，
+        // 失败仍走 _errorMessage。撤销/历史不依赖这条文案。
         _notify();
         return true;
       }
@@ -2881,7 +2987,7 @@ class AppController extends ChangeNotifier {
         _calendarTaskNotes = plan.taskNotes;
         schedule = plan.schedule.copyWith(settings: derived);
       }
-      return await applyCalendarEdit(
+      final ok = await applyCalendarEdit(
         CalendarEditOutcome(
           schedule: schedule,
           tasks: v.tasks,
@@ -2890,6 +2996,13 @@ class AppController extends ChangeNotifier {
         ),
         timetable: nextTimetable,
       );
+      if (ok) {
+        // 提示词 02：时间表保存成功回执不在主区顶部显示，也不留占位。底层操作名
+        // /撤销数据仍保留在 `_rememberTaskUndo` 与版本数据里；失败与存储警告不受影响。
+        _statusMessage = null;
+        _notify();
+      }
+      return ok;
     } finally {
       _applyingTimetable = false;
     }

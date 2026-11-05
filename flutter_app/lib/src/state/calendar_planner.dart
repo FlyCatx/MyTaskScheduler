@@ -720,20 +720,117 @@ String _weekdayShort(int weekday) => switch (weekday) {
 
 // ---------------------------------------------------------- auto scheduling
 
+/// Quality metrics of one automatic plan.
+///
+/// Comparison is **lexicographic**, lower is better:
+/// 1. number of tasks whose last segment ends after their deadline,
+/// 2. total overdue minutes,
+/// 3. minutes that could not be placed at all (capacity shortage),
+/// 4. number of segments (fewer splits are easier to follow),
+/// 5. number of pre-existing segments that had to be dropped/moved.
+///
+/// Overdue work comes first on purpose: keeping more work inside its deadline
+/// wins over splitting the remaining work into fewer pieces. Work that is
+/// already fixed by hand ([SegmentSource.manual] with `keepManual`) is never
+/// broken to improve a number.
+class SchedulePlanMetrics {
+  const SchedulePlanMetrics({
+    this.overdueTaskCount = 0,
+    this.overdueMinutes = 0,
+    this.unplacedMinutes = 0,
+    this.segmentCount = 0,
+    this.movedExistingSegments = 0,
+  });
+
+  static const SchedulePlanMetrics empty = SchedulePlanMetrics();
+
+  final int overdueTaskCount;
+  final int overdueMinutes;
+  final int unplacedMinutes;
+  final int segmentCount;
+  final int movedExistingSegments;
+
+  bool get isPerfect => overdueTaskCount == 0 && unplacedMinutes == 0;
+
+  /// Negative when [this] is strictly better than [other].
+  int compareTo(SchedulePlanMetrics other) {
+    var c = overdueTaskCount.compareTo(other.overdueTaskCount);
+    if (c != 0) return c;
+    c = overdueMinutes.compareTo(other.overdueMinutes);
+    if (c != 0) return c;
+    c = unplacedMinutes.compareTo(other.unplacedMinutes);
+    if (c != 0) return c;
+    c = segmentCount.compareTo(other.segmentCount);
+    if (c != 0) return c;
+    return movedExistingSegments.compareTo(other.movedExistingSegments);
+  }
+
+  Map<String, Object> toJson() => <String, Object>{
+        'overdueTaskCount': overdueTaskCount,
+        'overdueMinutes': overdueMinutes,
+        'unplacedMinutes': unplacedMinutes,
+        'segmentCount': segmentCount,
+        'movedExistingSegments': movedExistingSegments,
+      };
+
+  @override
+  String toString() => 'SchedulePlanMetrics(overdueTasks=$overdueTaskCount, '
+      'overdueMinutes=$overdueMinutes, unplacedMinutes=$unplacedMinutes, '
+      'segments=$segmentCount, movedExisting=$movedExistingSegments)';
+}
+
 /// Outcome of an automatic pass. Segments are the *complete* new set.
 class CalendarAutoPlan {
   final CalendarSchedule schedule;
   final List<String> notes;
   final Map<String, String> taskNotes;
 
+  /// Quality of the returned plan (see [SchedulePlanMetrics]). The zero value
+  /// is used by the "cannot schedule at all" early exits.
+  final SchedulePlanMetrics metrics;
+
+  /// Wall-clock time the whole pass took (ordering + placement + local search).
+  final int elapsedMicroseconds;
+
+  /// How many alternative orders the bounded local search actually evaluated.
+  final int localSearchCandidates;
+
+  /// True when the bounded search stopped on its candidate cap or time budget;
+  /// the returned plan is then the best feasible one found so far.
+  final bool localSearchBudgetExhausted;
+
   const CalendarAutoPlan({
     required this.schedule,
     this.notes = const <String>[],
     this.taskNotes = const <String, String>{},
+    this.metrics = SchedulePlanMetrics.empty,
+    this.elapsedMicroseconds = 0,
+    this.localSearchCandidates = 0,
+    this.localSearchBudgetExhausted = false,
   });
 }
 
 /// Deterministic heuristic auto-scheduler. See the file header for the rules.
+///
+/// R3+ task 06 B improvements:
+/// * **Dependency-aware latest start**: the latest start of a task is
+///   `min(own deadline, every successor's latest start) − own remaining work`,
+///   propagated backwards through the dependency graph. Executable tasks are
+///   ordered by that value, so a predecessor of an urgent successor is not
+///   delayed behind an independent task with a later deadline (the 09:00–13:00
+///   counterexample with A → B(11:00) and C(13:00)).
+/// * **Slack comparison**: among executable tasks the free minutes before the
+///   effective deadline minus the remaining work breaks ties (a task with no
+///   room to breathe goes first).
+/// * **Bounded local search**: if an avoidable overdue/leftover remains, tasks
+///   near the conflict are moved earlier and the plan is rebuilt. Every
+///   candidate is checked against the existing constraints (availability,
+///   manual segments, dependencies, no double-booking, never more than the
+///   estimate) and only strictly better candidates (lexicographic
+///   [SchedulePlanMetrics]) replace the current plan.
+/// * The search has a candidate cap and a time budget; on exhaustion the best
+///   feasible plan found so far is returned and
+///   [CalendarAutoPlan.localSearchBudgetExhausted] is set.
 CalendarAutoPlan autoSchedule({
   required CalendarSchedule current,
   required List<SchedulingTask> tasks,
@@ -741,10 +838,10 @@ CalendarAutoPlan autoSchedule({
   required DateTime now,
   bool keepManual = true,
   String Function()? newId,
+  Duration localSearchTimeBudget = const Duration(milliseconds: 150),
+  int maxLocalSearchCandidates = 32,
 }) {
   final settings = current.settings;
-  final notes = <String>[];
-  final taskNotes = <String, String>{};
   final generator = newId ?? () => IdGenerator.next('seg');
 
   if (!settings.hasValidStart) {
@@ -764,208 +861,645 @@ CalendarAutoPlan autoSchedule({
     );
   }
 
-  final kept = keepManual
-      ? current.segments
-          .where((s) => s.source == SegmentSource.manual)
-          .toList(growable: false)
-      : const <ScheduleSegment>[];
-  final out = <ScheduleSegment>[...kept];
-  final busy = <TimeInterval>[for (final s in kept) s.interval];
-  final keptMinutes = <String, int>{};
-  for (final s in kept) {
-    keptMinutes[s.taskId] = (keptMinutes[s.taskId] ?? 0) + math.max(0, s.minutes);
-  }
-
-  final taskById = <String, SchedulingTask>{for (final t in tasks) t.id: t};
-  final doneIds = <String>{
-    for (final t in tasks)
-      if (t.isDone) t.id,
-  };
-  final candidates = tasks
-      .where((t) => !t.isDone)
-      .toList(growable: false);
-
-  for (final t in candidates) {
-    if (!t.hoursKnown) {
-      taskNotes[t.id] = '预计工时未知，无法自动安排（请在任务详情补充工时）';
-    }
-  }
-
-  final ordered = _orderTasks(
-    candidates.where((t) => t.hoursKnown).toList(growable: false),
-    suggestedOrder,
-    notes,
+  final scheduler = _AutoScheduler(
+    settings: settings,
+    availability: availability,
+    current: current,
+    tasks: tasks,
+    suggestedOrder: suggestedOrder,
     now: now,
-    offsetMinutes: settings.timezoneOffsetMinutes,
+    keepManual: keepManual,
+    newId: generator,
+    timeBudget: localSearchTimeBudget,
+    maxCandidates: maxLocalSearchCandidates,
   );
-
-  for (final task in ordered) {
-    var remaining = task.estimatedMinutes - (keptMinutes[task.id] ?? 0);
-    if (remaining <= 0) continue;
-
-    // Never start before now, nor before every predecessor's last scheduled segment.
-    var notBefore = now;
-    final unresolved = <String>[];
-    for (final depId in task.dependsOn) {
-      final own = out.where((s) => s.taskId == depId).toList(growable: false);
-      if (own.isEmpty) {
-        if (!doneIds.contains(depId) && taskById.containsKey(depId)) {
-          unresolved.add(depId);
-        }
-        continue;
-      }
-      final depEnd = own
-          .map((s) => s.end)
-          .reduce((a, b) => a.isAfter(b) ? a : b);
-      if (depEnd.isAfter(notBefore)) notBefore = depEnd;
-    }
-    if (unresolved.isNotEmpty) {
-      taskNotes[task.id] =
-          '前置 ${unresolved.map((id) => taskById[id]?.name ?? id).join('、')} '
-          '还没有安排，这里只是暂定时间';
-    }
-
-    final tentative = task.needsTentative;
-    final deadline = parseDeadlineText(
-      task.deadline,
-      now: now,
-      offsetMinutes: settings.timezoneOffsetMinutes,
-    );
-    final deadlineAt = deadline.at;
-    final cursor = notBefore;
-
-    // Pass 1: fit as much as possible before the deadline.
-    if (deadlineAt != null && deadlineAt.isAfter(cursor)) {
-      final placed = _place(
-        availability: availability,
-        busy: busy,
-        out: out,
-        taskId: task.id,
-        from: cursor,
-        until: deadlineAt,
-        minutes: remaining,
-        chunkMinutes: settings.chunkMinutes,
-        tentative: tentative,
-        newId: generator,
-      );
-      remaining -= placed;
-    }
-    // Pass 2: whatever is left continues after the deadline and is flagged as overdue
-    // by the conflict detector — the deadline itself is never modified.
-    if (remaining > 0) {
-      final from = out
-              .where((s) => s.taskId == task.id)
-              .fold<DateTime?>(null, (latest, s) {
-            final e = s.end;
-            if (latest == null || e.isAfter(latest)) return e;
-            return latest;
-          }) ??
-          cursor;
-      final startFrom = from.isAfter(cursor) ? from : cursor;
-      _place(
-        availability: availability,
-        busy: busy,
-        out: out,
-        taskId: task.id,
-        from: startFrom,
-        until: null,
-        minutes: remaining,
-        chunkMinutes: settings.chunkMinutes,
-        tentative: tentative,
-        newId: generator,
-      );
-    }
-
-    final placedMinutes =
-        out.where((s) => s.taskId == task.id).fold<int>(0, (sum, s) => sum + s.minutes);
-    final needed = math.max(0, task.estimatedMinutes - placedMinutes);
-    if (needed > 0) {
-      taskNotes[task.id] =
-          '容量不足：已安排 ${formatDurationMinutes(placedMinutes)}，'
-          '仍需 ${formatDurationMinutes(needed)}（规划范围内没有更多可用时段）';
-    }
-  }
-
-  _mergeContiguous(out);
-
-  return CalendarAutoPlan(
-    schedule: current.copyWith(
-      segments: List<ScheduleSegment>.unmodifiable(out),
-      autoGenerated: true,
-      note: notes.isEmpty ? null : notes.join(' '),
-    ),
-    notes: notes,
-    taskNotes: taskNotes,
-  );
+  return scheduler.run();
 }
 
-/// Kahn topological order with a deterministic priority: earliest deadline, then the
-/// C core's suggested order, then the stable id. Nodes left over form a cycle; they are
-/// reported and skipped instead of being scheduled in an arbitrary order.
-List<SchedulingTask> _orderTasks(
-  List<SchedulingTask> candidates,
-  List<String> suggestedOrder,
-  List<String> notes, {
-  required DateTime now,
-  required int offsetMinutes,
-}) {
-  final byId = <String, SchedulingTask>{for (final t in candidates) t.id: t};
-  final orderIndex = <String, int>{
-    for (var i = 0; i < suggestedOrder.length; i++) suggestedOrder[i]: i,
-  };
-  int deadlineRank(SchedulingTask t) {
-    final at = parseDeadlineText(
-      t.deadline,
-      now: now,
-      offsetMinutes: offsetMinutes,
-    ).at;
-    // No deadline sorts last, but deterministically.
-    if (at == null) return 1 << 40;
-    return at.millisecondsSinceEpoch ~/ 60000;
-  }
+// ---------------------------------------------------------- planner internals
 
-  final indegree = <String, int>{for (final t in byId.keys) t: 0};
-  final children = <String, List<String>>{};
-  for (final t in candidates) {
-    for (final dep in t.dependsOn) {
-      if (!byId.containsKey(dep)) continue; // done or not a candidate
-      indegree[t.id] = (indegree[t.id] ?? 0) + 1;
-      children.putIfAbsent(dep, () => <String>[]).add(t.id);
+/// One built plan: segments + the per-task explanations for this order.
+class _PlanBuild {
+  const _PlanBuild(this.segments, this.taskNotes);
+
+  final List<ScheduleSegment> segments;
+  final Map<String, String> taskNotes;
+}
+
+/// Holds every input of one automatic pass and the reusable builder.
+///
+/// A "build" is a pure function of the task order: the same order always
+/// produces the same segments, so the local search can compare alternatives
+/// without touching the stored schedule.
+class _AutoScheduler {
+  _AutoScheduler({
+    required this.settings,
+    required this.availability,
+    required this.current,
+    required List<SchedulingTask> tasks,
+    required this.suggestedOrder,
+    required this.now,
+    required this.keepManual,
+    required String Function() newId,
+    required this.timeBudget,
+    required this.maxCandidates,
+  })  : _newId = newId,
+        _watch = Stopwatch()..start() {
+    _taskById = <String, SchedulingTask>{for (final t in tasks) t.id: t};
+    _doneIds = <String>{
+      for (final t in tasks)
+        if (t.isDone) t.id,
+    };
+    _candidates = tasks.where((t) => !t.isDone).toList(growable: false);
+    _known = _candidates.where((t) => t.hoursKnown).toList(growable: false);
+    _deadlines = <String, ParsedDeadline>{
+      for (final t in _known)
+        t.id: parseDeadlineText(
+          t.deadline,
+          now: now,
+          offsetMinutes: settings.timezoneOffsetMinutes,
+        ),
+    };
+    _kept = keepManual
+        ? current.segments
+            .where((s) => s.source == SegmentSource.manual)
+            .toList(growable: false)
+        : const <ScheduleSegment>[];
+    _keptMinutes = <String, int>{};
+    for (final s in _kept) {
+      _keptMinutes[s.taskId] =
+          (_keptMinutes[s.taskId] ?? 0) + math.max(0, s.minutes);
     }
-  }
-  int compare(SchedulingTask a, SchedulingTask b) {
-    final da = deadlineRank(a);
-    final db = deadlineRank(b);
-    if (da != db) return da.compareTo(db);
-    final oa = orderIndex[a.id] ?? 1 << 30;
-    final ob = orderIndex[b.id] ?? 1 << 30;
-    if (oa != ob) return oa.compareTo(ob);
-    return a.id.compareTo(b.id);
-  }
-
-  final ready = candidates.where((t) => (indegree[t.id] ?? 0) == 0).toList()
-    ..sort(compare);
-  final scheduled = <String>{};
-  final out = <SchedulingTask>[];
-  while (ready.isNotEmpty) {
-    final t = ready.removeAt(0);
-    out.add(t);
-    scheduled.add(t.id);
-    for (final child in children[t.id] ?? const <String>[]) {
-      indegree[child] = (indegree[child] ?? 1) - 1;
-      if (indegree[child] == 0) {
-        ready.add(byId[child]!);
-        ready.sort(compare);
+    _remainingMinutes = <String, int>{
+      for (final t in _known)
+        t.id: math.max(0, t.estimatedMinutes - (_keptMinutes[t.id] ?? 0)),
+    };
+    for (final t in _candidates) {
+      if (!t.hoursKnown) {
+        _unknownHoursNotes[t.id] =
+            '预计工时未知，无法自动安排（请在任务详情补充工时）';
       }
     }
   }
-  final leftover =
-      candidates.where((t) => !scheduled.contains(t.id)).toList();
-  if (leftover.isNotEmpty) {
-    notes.add('以下任务依赖成环，未自动安排：'
-        '${leftover.map((t) => t.name).join('、')}');
+
+  final CalendarSettings settings;
+  final AvailabilityCalendar availability;
+  final CalendarSchedule current;
+  final List<String> suggestedOrder;
+  final DateTime now;
+  final bool keepManual;
+  final Duration timeBudget;
+  final int maxCandidates;
+
+  final String Function() _newId;
+  final Stopwatch _watch;
+  final Map<String, String> _unknownHoursNotes = <String, String>{};
+
+  late final Map<String, SchedulingTask> _taskById;
+  late final Set<String> _doneIds;
+  late final List<SchedulingTask> _candidates;
+  late final List<SchedulingTask> _known;
+  late final Map<String, ParsedDeadline> _deadlines;
+  late final List<ScheduleSegment> _kept;
+  late final Map<String, int> _keptMinutes;
+  late final Map<String, int> _remainingMinutes;
+
+  CalendarAutoPlan run() {
+    final notes = <String>[];
+    final baseOrders = _baseOrders(notes);
+
+    // Pick the best of the three deterministic baseline orders first. The
+    // legacy order is one of them, so the returned plan is never worse than
+    // the previous heuristic under [SchedulePlanMetrics].
+    var bestOrder = baseOrders.first;
+    var best = _build(bestOrder);
+    var bestMetrics = _metricsOf(best);
+    final seenOrders = <String>{for (final order in baseOrders) _orderKey(order)};
+    for (final order in baseOrders.skip(1)) {
+      final build = _build(order);
+      final metrics = _metricsOf(build);
+      if (metrics.compareTo(bestMetrics) < 0) {
+        best = build;
+        bestMetrics = metrics;
+        bestOrder = order;
+      }
+    }
+
+    var evaluated = 0;
+    var budgetExhausted = false;
+
+    // Local search is only about *avoidable* losses: an overdue task, or work
+    // that had to be left out although the plan may fit it elsewhere. A plan
+    // that already meets every deadline and places everything is final.
+    if (!bestMetrics.isPerfect && _isFeasible(best)) {
+      final search = Stopwatch()..start();
+      final conflictIds = _conflictTaskIds(best, bestOrder);
+      for (final candidateOrder in _candidateOrders(bestOrder, conflictIds)) {
+        if (evaluated >= maxCandidates || search.elapsed >= timeBudget) {
+          budgetExhausted = true;
+          break;
+        }
+        if (!seenOrders.add(_orderKey(candidateOrder))) continue;
+        evaluated++;
+        final candidate = _build(candidateOrder);
+        if (!_isFeasible(candidate)) continue;
+        final metrics = _metricsOf(candidate);
+        if (metrics.compareTo(bestMetrics) < 0) {
+          best = candidate;
+          bestMetrics = metrics;
+          bestOrder = candidateOrder;
+          if (bestMetrics.isPerfect) break;
+        }
+      }
+      search.stop();
+    }
+
+    _watch.stop();
+    return CalendarAutoPlan(
+      schedule: current.copyWith(
+        segments: List<ScheduleSegment>.unmodifiable(best.segments),
+        autoGenerated: true,
+        note: notes.isEmpty ? null : notes.join(' '),
+      ),
+      notes: notes,
+      taskNotes: best.taskNotes,
+      metrics: bestMetrics,
+      elapsedMicroseconds: _watch.elapsedMicroseconds,
+      localSearchCandidates: evaluated,
+      localSearchBudgetExhausted: budgetExhausted,
+    );
   }
-  return out;
+
+  // ---------------------------------------------------------------- ordering
+
+  /// Baseline orders considered before the bounded local search.
+  ///
+  /// Three deterministic topological orders are built from the same graph:
+  /// 1. **effective-deadline order** — EDF with the deadline propagated
+  ///    backwards through dependencies (a predecessor inherits its successors'
+  ///    deadline). The 09:00–13:00 counterexample (A → B@11:00, C@13:00) is
+  ///    fixed by this order.
+  /// 2. **latest-start order** — least laxity: `latestStart = effective
+  ///    deadline − remaining work`, then slack, then the actual deadline.
+  /// 3. **legacy order** — the previous "own deadline, suggested order, id"
+  ///    heuristic, kept as an explicit quality baseline: the returned plan is
+  ///    never worse than it under [SchedulePlanMetrics].
+  ///
+  /// The best of the three (deterministic tie-break: earlier in this list)
+  /// starts the local search. Dependency cycles are reported once and skipped
+  /// instead of being scheduled in an arbitrary order.
+  List<List<SchedulingTask>> _baseOrders(List<String> notes) {
+    final byId = <String, SchedulingTask>{
+      for (final t in _known) t.id: t,
+    };
+    final orderIndex = <String, int>{
+      for (var i = 0; i < suggestedOrder.length; i++) suggestedOrder[i]: i,
+    };
+    final children = <String, List<String>>{};
+    for (final task in _known) {
+      for (final dep in task.dependsOn) {
+        if (!byId.containsKey(dep)) continue; // done or not a candidate
+        children.putIfAbsent(dep, () => <String>[]).add(task.id);
+      }
+    }
+    final indegree = <String, int>{
+      for (final task in _known)
+        task.id: task.dependsOn.where(byId.containsKey).length,
+    };
+
+    // Backwards propagation of "latest start": a task must start early enough
+    // that every successor can still start on time.
+    final latestStartMs = <String, int?>{};
+    final visiting = <String>{};
+    int? latestStartOf(SchedulingTask task) {
+      if (latestStartMs.containsKey(task.id)) return latestStartMs[task.id];
+      if (!visiting.add(task.id)) return null; // dependency cycle: unknown
+      int? best;
+      void consider(int? value) {
+        if (value == null) return;
+        if (best == null || value < best!) best = value;
+      }
+
+      final remaining = _remainingMinutes[task.id] ?? 0;
+      final deadlineAt = _deadlines[task.id]?.at;
+      if (deadlineAt != null) {
+        consider(deadlineAt.millisecondsSinceEpoch - remaining * 60000);
+      }
+      for (final childId in children[task.id] ?? const <String>[]) {
+        final child = byId[childId];
+        if (child == null) continue;
+        final childLatest = latestStartOf(child);
+        if (childLatest != null) consider(childLatest - remaining * 60000);
+      }
+      visiting.remove(task.id);
+      latestStartMs[task.id] = best;
+      return best;
+    }
+
+    for (final task in _known) {
+      latestStartOf(task);
+    }
+
+    // Effective deadline = latest start + remaining work (bounded by the own
+    // deadline and by every successor). Used by the EDF order below.
+    final effectiveDeadlineMs = <String, int?>{};
+    for (final task in _known) {
+      final latest = latestStartMs[task.id];
+      effectiveDeadlineMs[task.id] = latest == null
+          ? null
+          : latest + (_remainingMinutes[task.id] ?? 0) * 60000;
+    }
+
+    // Slack: usable minutes before the effective deadline minus the work that
+    // still has to fit there. Static (availability snapshot), enough to rank
+    // candidates; actual placement decides the rest.
+    final slack = <String, int?>{};
+    for (final task in _known) {
+      final latest = latestStartMs[task.id];
+      final remaining = _remainingMinutes[task.id] ?? 0;
+      if (latest == null) {
+        slack[task.id] = null;
+        continue;
+      }
+      final effectiveDeadline = DateTime.fromMillisecondsSinceEpoch(
+        latest + remaining * 60000,
+        isUtc: true,
+      );
+      final free = availability
+          .freeFrom(
+            <TimeInterval>[for (final s in _kept) s.interval],
+            notBefore: now,
+            notAfter: effectiveDeadline,
+          )
+          .fold<int>(0, (sum, interval) => sum + math.max(0, interval.minutes));
+      slack[task.id] = free - remaining;
+    }
+
+    const unavailable = 1 << 62;
+    int effectiveRank(SchedulingTask t) =>
+        effectiveDeadlineMs[t.id] ?? unavailable;
+    int latestRank(SchedulingTask t) => latestStartMs[t.id] ?? unavailable;
+    int slackRank(SchedulingTask t) => slack[t.id] ?? unavailable;
+    int deadlineRank(SchedulingTask t) =>
+        _deadlines[t.id]?.at?.millisecondsSinceEpoch ?? unavailable;
+    int suggestedRank(SchedulingTask t) => orderIndex[t.id] ?? (1 << 30);
+
+    int byEffectiveDeadline(SchedulingTask a, SchedulingTask b) {
+      var c = effectiveRank(a).compareTo(effectiveRank(b));
+      if (c != 0) return c;
+      c = deadlineRank(a).compareTo(deadlineRank(b));
+      if (c != 0) return c;
+      c = suggestedRank(a).compareTo(suggestedRank(b));
+      if (c != 0) return c;
+      return a.id.compareTo(b.id);
+    }
+
+    int byLatestStart(SchedulingTask a, SchedulingTask b) {
+      var c = latestRank(a).compareTo(latestRank(b));
+      if (c != 0) return c;
+      c = slackRank(a).compareTo(slackRank(b));
+      if (c != 0) return c;
+      c = deadlineRank(a).compareTo(deadlineRank(b));
+      if (c != 0) return c;
+      c = suggestedRank(a).compareTo(suggestedRank(b));
+      if (c != 0) return c;
+      return a.id.compareTo(b.id);
+    }
+
+    int byLegacy(SchedulingTask a, SchedulingTask b) {
+      var c = deadlineRank(a).compareTo(deadlineRank(b));
+      if (c != 0) return c;
+      c = suggestedRank(a).compareTo(suggestedRank(b));
+      if (c != 0) return c;
+      return a.id.compareTo(b.id);
+    }
+
+    List<SchedulingTask> kahn(
+      int Function(SchedulingTask, SchedulingTask) compare,
+    ) {
+      final pending = Map<String, int>.from(indegree);
+      final ready = _known.where((t) => (pending[t.id] ?? 0) == 0).toList()
+        ..sort(compare);
+      final ordered = <SchedulingTask>[];
+      while (ready.isNotEmpty) {
+        final task = ready.removeAt(0);
+        ordered.add(task);
+        for (final childId in children[task.id] ?? const <String>[]) {
+          final left = (pending[childId] ?? 1) - 1;
+          pending[childId] = left;
+          if (left == 0) {
+            ready.add(byId[childId]!);
+            ready.sort(compare);
+          }
+        }
+      }
+      return ordered;
+    }
+
+    final orders = <List<SchedulingTask>>[];
+    final keys = <String>{};
+    for (final compare in <int Function(SchedulingTask, SchedulingTask)>[
+      byEffectiveDeadline,
+      byLatestStart,
+      byLegacy,
+    ]) {
+      final order = kahn(compare);
+      if (keys.add(_orderKey(order))) orders.add(order);
+    }
+
+    final scheduledIds = <String>{
+      for (final order in orders)
+        for (final task in order) task.id,
+    };
+    final leftover =
+        _known.where((t) => !scheduledIds.contains(t.id)).toList();
+    if (leftover.isNotEmpty) {
+      notes.add(
+        '以下任务依赖成环，未自动安排：${leftover.map((t) => t.name).join('、')}',
+      );
+    }
+    return orders;
+  }
+
+  // ----------------------------------------------------------------- placing
+
+  /// Builds the complete segment set for [ordered].
+  _PlanBuild _build(List<SchedulingTask> ordered) {
+    final out = <ScheduleSegment>[..._kept];
+    final busy = <TimeInterval>[for (final s in _kept) s.interval];
+    final taskNotes = <String, String>{..._unknownHoursNotes};
+
+    for (final task in ordered) {
+      final remaining = _remainingMinutes[task.id] ?? 0;
+      if (remaining <= 0) continue;
+
+      // Never start before now, nor before every predecessor's last segment.
+      var notBefore = now;
+      final unresolved = <String>[];
+      for (final depId in task.dependsOn) {
+        final own = out.where((s) => s.taskId == depId).toList(growable: false);
+        if (own.isEmpty) {
+          if (!_doneIds.contains(depId) && _taskById.containsKey(depId)) {
+            unresolved.add(depId);
+          }
+          continue;
+        }
+        final depEnd =
+            own.map((s) => s.end).reduce((a, b) => a.isAfter(b) ? a : b);
+        if (depEnd.isAfter(notBefore)) notBefore = depEnd;
+      }
+      if (unresolved.isNotEmpty) {
+        taskNotes[task.id] =
+            '前置 ${unresolved.map((id) => _taskById[id]?.name ?? id).join('、')} '
+            '还没有安排，这里只是暂定时间';
+      }
+
+      final tentative = task.needsTentative;
+      final deadlineAt = _deadlines[task.id]?.at;
+      final cursor = notBefore;
+      var left = remaining;
+
+      // Pass 1: fit as much as possible before the deadline.
+      if (deadlineAt != null && deadlineAt.isAfter(cursor)) {
+        left -= _place(
+          availability: availability,
+          busy: busy,
+          out: out,
+          taskId: task.id,
+          from: cursor,
+          until: deadlineAt,
+          minutes: left,
+          chunkMinutes: settings.chunkMinutes,
+          tentative: tentative,
+          newId: _newId,
+        );
+      }
+      // Pass 2: whatever is left continues after the deadline and is flagged as
+      // overdue by the conflict detector — the deadline itself is never modified.
+      if (left > 0) {
+        final from = out.where((s) => s.taskId == task.id).fold<DateTime?>(
+              null,
+              (latest, segment) {
+                final end = segment.end;
+                if (latest == null || end.isAfter(latest)) return end;
+                return latest;
+              },
+            ) ??
+            cursor;
+        final startFrom = from.isAfter(cursor) ? from : cursor;
+        _place(
+          availability: availability,
+          busy: busy,
+          out: out,
+          taskId: task.id,
+          from: startFrom,
+          until: null,
+          minutes: left,
+          chunkMinutes: settings.chunkMinutes,
+          tentative: tentative,
+          newId: _newId,
+        );
+      }
+
+      final placedMinutes = out
+          .where((s) => s.taskId == task.id)
+          .fold<int>(0, (sum, s) => sum + s.minutes);
+      final needed = math.max(0, task.estimatedMinutes - placedMinutes);
+      if (needed > 0) {
+        taskNotes[task.id] = '容量不足：已安排 ${formatDurationMinutes(placedMinutes)}，'
+            '仍需 ${formatDurationMinutes(needed)}（规划范围内没有更多可用时段）';
+      }
+    }
+
+    _mergeContiguous(out);
+    return _PlanBuild(out, taskNotes);
+  }
+
+  // ---------------------------------------------------------------- quality
+
+  String _segmentKey(ScheduleSegment s) =>
+      '${s.taskId}|${s.start.toIso8601String()}|${s.end.toIso8601String()}';
+
+  SchedulePlanMetrics _metricsOf(_PlanBuild build) {
+    final byTask = <String, List<ScheduleSegment>>{};
+    for (final s in build.segments) {
+      byTask.putIfAbsent(s.taskId, () => <ScheduleSegment>[]).add(s);
+    }
+    var overdueTasks = 0;
+    var overdueMinutes = 0;
+    var unplaced = 0;
+    for (final task in _known) {
+      final segments = byTask[task.id] ?? const <ScheduleSegment>[];
+      final placed =
+          segments.fold<int>(0, (sum, s) => sum + math.max(0, s.minutes));
+      final left = task.estimatedMinutes - placed;
+      if (left > 0) unplaced += left;
+      // A task fully covered by hand-locked manual segments cannot be improved
+      // by the automatic pass, so it does not count towards "avoidable" quality.
+      if ((_remainingMinutes[task.id] ?? 0) <= 0) continue;
+      if (segments.isEmpty) continue;
+      final deadlineAt = _deadlines[task.id]?.at;
+      if (deadlineAt == null) continue;
+      final last =
+          segments.map((s) => s.end).reduce((a, b) => a.isAfter(b) ? a : b);
+      if (last.isAfter(deadlineAt)) {
+        overdueTasks++;
+        overdueMinutes += last.difference(deadlineAt).inMinutes;
+      }
+    }
+    final keys = <String>{for (final s in build.segments) _segmentKey(s)};
+    var moved = 0;
+    for (final s in current.segments) {
+      if (!keys.contains(_segmentKey(s))) moved++;
+    }
+    return SchedulePlanMetrics(
+      overdueTaskCount: overdueTasks,
+      overdueMinutes: overdueMinutes,
+      unplacedMinutes: unplaced,
+      segmentCount: build.segments.length,
+      movedExistingSegments: moved,
+    );
+  }
+
+  /// Structural check every candidate must pass before it may replace a plan:
+  /// generated segments stay inside the open windows, never overlap manual
+  /// segments or each other, respect dependency order and never invent more
+  /// minutes than the estimate.
+  bool _isFeasible(_PlanBuild build) {
+    final segments = build.segments;
+    final generated = <ScheduleSegment>[
+      for (final s in segments)
+        if (s.source == SegmentSource.auto) s,
+    ];
+    for (final s in generated) {
+      if (subtractIntervals(<TimeInterval>[s.interval], availability.open)
+          .isNotEmpty) {
+        return false;
+      }
+    }
+    if (generated.isEmpty) return true;
+    for (var i = 0; i < segments.length; i++) {
+      final a = segments[i];
+      final aAuto = a.source == SegmentSource.auto;
+      for (var j = i + 1; j < segments.length; j++) {
+        final b = segments[j];
+        if (!aAuto && b.source != SegmentSource.auto) continue;
+        if (a.interval.overlaps(b.interval)) return false;
+      }
+    }
+    final byTask = <String, List<ScheduleSegment>>{};
+    for (final s in segments) {
+      byTask.putIfAbsent(s.taskId, () => <ScheduleSegment>[]).add(s);
+    }
+    for (final task in _known) {
+      final own = byTask[task.id];
+      if (own == null || own.isEmpty) continue;
+      final placed =
+          own.fold<int>(0, (sum, s) => sum + math.max(0, s.minutes));
+      if (placed > task.estimatedMinutes) return false; // never swallow work
+      final autoOwn =
+          own.where((s) => s.source == SegmentSource.auto).toList(growable: false);
+      if (autoOwn.isEmpty) continue;
+      final firstAuto =
+          autoOwn.map((s) => s.start).reduce((a, b) => a.isBefore(b) ? a : b);
+      for (final dep in task.dependsOn) {
+        final depSegments = byTask[dep];
+        if (depSegments == null || depSegments.isEmpty) continue;
+        final depEnd = depSegments
+            .map((s) => s.end)
+            .reduce((a, b) => a.isAfter(b) ? a : b);
+        if (firstAuto.isBefore(depEnd)) return false;
+      }
+    }
+    return true;
+  }
+
+  // ------------------------------------------------------------ local search
+
+  String _orderKey(List<SchedulingTask> order) =>
+      order.map((t) => t.id).join('|');
+
+  /// Tasks worth moving: overdue ones, tasks with unplaced work, and their
+  /// direct neighbours in the current order (a neighbour is often the task
+  /// that blocked them). The neighbourhood is capped so the search stays
+  /// bounded even for large plans.
+  Set<String> _conflictTaskIds(
+    _PlanBuild build,
+    List<SchedulingTask> order,
+  ) {
+    final byTask = <String, List<ScheduleSegment>>{};
+    for (final s in build.segments) {
+      byTask.putIfAbsent(s.taskId, () => <ScheduleSegment>[]).add(s);
+    }
+    final attention = <String>[];
+    for (final task in order) {
+      final segments = byTask[task.id] ?? const <ScheduleSegment>[];
+      final placed =
+          segments.fold<int>(0, (sum, s) => sum + math.max(0, s.minutes));
+      if (placed < task.estimatedMinutes) {
+        attention.add(task.id);
+        continue;
+      }
+      final deadlineAt = _deadlines[task.id]?.at;
+      if (deadlineAt == null) continue;
+      final last =
+          segments.map((s) => s.end).reduce((a, b) => a.isAfter(b) ? a : b);
+      if (last.isAfter(deadlineAt)) attention.add(task.id);
+    }
+    final index = <String, int>{
+      for (var i = 0; i < order.length; i++) order[i].id: i,
+    };
+    final selected = <String>{};
+    for (final id in attention) {
+      final at = index[id];
+      if (at == null) continue;
+      if (at > 0) selected.add(order[at - 1].id);
+      selected.add(id);
+      if (at + 1 < order.length) selected.add(order[at + 1].id);
+      if (selected.length >= 8) break;
+    }
+    // Re-project on the plan order so candidate generation is deterministic.
+    return <String>{
+      for (final task in order)
+        if (selected.contains(task.id)) task.id,
+    };
+  }
+
+  /// Alternative orders obtained by moving a conflict-neighbourhood task
+  /// earlier. Only topologically valid moves are generated: a task is never
+  /// moved in front of one of its direct predecessors.
+  Iterable<List<SchedulingTask>> _candidateOrders(
+    List<SchedulingTask> base,
+    Set<String> conflictIds,
+  ) sync* {
+    final index = <String, int>{
+      for (var i = 0; i < base.length; i++) base[i].id: i,
+    };
+    final earliest = <String, int>{};
+    for (final task in _known) {
+      var min = -1;
+      for (final dep in task.dependsOn) {
+        final depIndex = index[dep];
+        if (depIndex == null) continue; // not scheduled (done / cycle)
+        if (depIndex > min) min = depIndex;
+      }
+      earliest[task.id] = min + 1;
+    }
+    for (final task in _known) {
+      if (!conflictIds.contains(task.id)) continue;
+      final from = index[task.id];
+      if (from == null) continue;
+      final first = earliest[task.id] ?? 0;
+      for (var target = first; target < from; target++) {
+        yield <SchedulingTask>[
+          ...base.sublist(0, target),
+          task,
+          ...base.sublist(target, from),
+          ...base.sublist(from + 1),
+        ];
+      }
+    }
+  }
 }
 
 /// Places up to [minutes] of work, returns how many minutes were placed.

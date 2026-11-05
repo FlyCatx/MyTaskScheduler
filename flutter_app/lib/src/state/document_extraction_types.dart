@@ -5,6 +5,110 @@
 // available" apart from "the file is too large" or "the file is corrupt".
 // Nothing in this library touches the network, executes macros/scripts or
 // opens external links.
+//
+// Budgets are deliberately *split* (R3+ / task 06 A):
+//   * [DocumentExtractionLimits.maxSourceFileBytes]     — container bytes;
+//   * [DocumentExtractionLimits.maxExtractedTextUtf8Bytes] — extracted text;
+//   * [DocumentExtractionLimits.maxZipEntryBytes] / [DocumentExtractionLimits.maxTotalUncompressedBytes]
+//     — decompression guards for OOXML/PDF streams;
+//   * the *single model request* budget is a different number again. A file may
+//     be perfectly extractable locally and still not fit one request; callers
+//     use [exceedsSingleRequestBudget] / [ExtractionResult.requiresChunking]
+//     to route it to the existing chunked-analysis entry instead of rejecting
+//     the file. Extraction never truncates text to make it fit.
+
+import 'dart:convert';
+
+/// Local budgets for turning a file into text.
+///
+/// The defaults mirror `analysis/analysis_budget.dart` (`AnalysisLimits` /
+/// `LocalProcessingLimits`) but are *independent* numbers, so a container may
+/// be much larger than the text inside it (a DOCX with many images is the
+/// motivating example: 5,824,157 bytes of container, a few KB of text).
+///
+/// [DocumentExtractionLimits] does **not** contain the single-request byte
+/// budget: "extractable locally" and "fits one model request" are separate
+/// decisions (see [exceedsSingleRequestBudget]).
+class DocumentExtractionLimits {
+  const DocumentExtractionLimits({
+    this.maxSourceFileBytes = 32 * 1024 * 1024,
+    this.maxExtractedTextUtf8Bytes = 8 * 1024 * 1024,
+    this.maxZipEntryBytes = 64 * 1024 * 1024,
+    this.maxTotalUncompressedBytes = 96 * 1024 * 1024,
+    this.maxPdfPages = 400,
+  }) : _legacySingleBudget = false;
+
+  /// Backwards-compatible single-budget mode used by the legacy
+  /// `extractDocument(file, maxBytes: ...)` call: the same number caps the
+  /// source file **and** the extracted text, and the decompression guards are
+  /// derived from it exactly as before.
+  factory DocumentExtractionLimits.single(int maxBytes) {
+    var part = maxBytes * 8;
+    const floor = 8 * 1024 * 1024;
+    const ceiling = 64 * 1024 * 1024;
+    if (part < floor) part = floor;
+    if (part > ceiling) part = ceiling;
+    return DocumentExtractionLimits._legacy(
+      maxSourceFileBytes: maxBytes,
+      maxExtractedTextUtf8Bytes: maxBytes,
+      maxZipEntryBytes: part,
+    );
+  }
+
+  const DocumentExtractionLimits._legacy({
+    required this.maxSourceFileBytes,
+    required this.maxExtractedTextUtf8Bytes,
+    required this.maxZipEntryBytes,
+  })  : maxTotalUncompressedBytes = 96 * 1024 * 1024,
+        maxPdfPages = 400,
+        _legacySingleBudget = true;
+
+  /// The shared default budget (32 MB container / 8 MB extracted text).
+  static const DocumentExtractionLimits defaults = DocumentExtractionLimits();
+
+  /// Maximum accepted source-file (container) bytes. Above this the file is
+  /// rejected **before it is read**; the message names the limit and the next
+  /// step. Compression ratios never matter here.
+  final int maxSourceFileBytes;
+
+  /// Maximum accepted **extracted text** UTF-8 bytes. Above this extraction
+  /// fails explicitly with this limit in the message; the text is never
+  /// truncated. This is a local-material budget, not a request budget.
+  final int maxExtractedTextUtf8Bytes;
+
+  /// Upper bound for one decompressed OOXML part / PDF stream.
+  final int maxZipEntryBytes;
+
+  /// Upper bound for the sum of all declared decompressed ZIP entry sizes
+  /// (zip-bomb guard).
+  final int maxTotalUncompressedBytes;
+
+  /// Upper bound for the number of pages the minimal PDF parser walks.
+  final int maxPdfPages;
+
+  final bool _legacySingleBudget;
+
+  /// True when this budget came from the legacy `maxBytes` shorthand.
+  bool get isLegacySingleBudget => _legacySingleBudget;
+
+  /// True when every limit is positive.
+  bool get isValid =>
+      maxSourceFileBytes > 0 &&
+      maxExtractedTextUtf8Bytes > 0 &&
+      maxZipEntryBytes > 0 &&
+      maxTotalUncompressedBytes > 0 &&
+      maxPdfPages > 0;
+
+  /// Human-readable summary used in local-limit error messages / diagnostics.
+  String get summary => '源文件 ≤ ${formatByteSize(maxSourceFileBytes)}；'
+      '抽取文本 ≤ ${formatByteSize(maxExtractedTextUtf8Bytes)}；'
+      '单个解压条目 ≤ ${formatByteSize(maxZipEntryBytes)}；'
+      '解压总量 ≤ ${formatByteSize(maxTotalUncompressedBytes)}；'
+      'PDF 页数 ≤ $maxPdfPages';
+
+  @override
+  String toString() => 'DocumentExtractionLimits($summary)';
+}
 
 /// Why a document could not be turned into text.
 enum DocumentErrorKind {
@@ -84,10 +188,12 @@ class ExtractedDocument {
     required this.pages,
     required this.segments,
     this.warning,
-  });
+    this.sourceFileBytes = 0,
+    int? textUtf8Bytes,
+  }) : _textUtf8Bytes = textUtf8Bytes;
 
   /// Normalised, non-empty text (UTF-16 string; callers should measure
-  /// `utf8.encode(text).length` against their own context limit).
+  /// [textUtf8Bytes] against their own context/request limit).
   final String text;
 
   /// `txt`, `md`, `pdf`, `docx` or `pptx`.
@@ -104,8 +210,25 @@ class ExtractedDocument {
   /// inside an otherwise textual PDF), or `null` when everything was clean.
   final String? warning;
 
+  /// Measured container bytes (0 when unknown). For diagnostics and for the
+  /// chunked-material `SourceDocument.sourceFileBytes` field.
+  final int sourceFileBytes;
+
+  final int? _textUtf8Bytes;
+
   bool get hasWarning => warning != null;
   int get characterCount => text.length;
+
+  /// UTF-8 byte length of [text] — the exact number the analysis budgets use.
+  /// Computed once by the extractor and cached here.
+  int get textUtf8Bytes => _textUtf8Bytes ?? utf8BytesOfText(text);
+
+  /// True when this text fits one model request of [maxInputBytes] UTF-8 bytes.
+  ///
+  /// This is *not* a reason to reject the file: callers should keep the local
+  /// material and use the chunked-analysis estimate/confirmation entry.
+  bool canFitSingleRequest(int maxInputBytes) =>
+      !exceedsSingleRequestBudget(text, maxInputBytes);
 }
 
 /// The result of the public extraction API. Exactly one of [document] /
@@ -127,11 +250,53 @@ class ExtractionResult {
   /// The error code (`unsupported_ocr`, `too_large`, ...) or `null` on success.
   String? get errorCode => error?.code;
 
+  /// UTF-8 bytes of the extracted text, or `null` on failure.
+  int? get textUtf8Bytes => document?.textUtf8Bytes;
+
+  /// Measured container bytes, or 0 when the extraction failed before reading.
+  int get sourceFileBytes => document?.sourceFileBytes ?? 0;
+
+  /// True when the file was extracted locally **but** its text exceeds one
+  /// model request of [maxInputBytes]. The caller should keep the material and
+  /// route it to the existing chunked analysis; the text must not be truncated.
+  bool requiresChunking(int maxInputBytes) =>
+      document != null && !document!.canFitSingleRequest(maxInputBytes);
+
   @override
   String toString() => ok
       ? 'ExtractionResult(ok, kind=${document!.kind}, '
-          'pages=${document!.pages}, chars=${document!.characterCount})'
+          'pages=${document!.pages}, chars=${document!.characterCount}, '
+          'textUtf8Bytes=${document!.textUtf8Bytes}, '
+          'sourceFileBytes=${document!.sourceFileBytes})'
       : 'ExtractionResult(failure, ${error!.code}: ${error!.message})';
+}
+
+/// UTF-8 byte length of [text] (same measure the analysis budgets use).
+int utf8BytesOfText(String text) => utf8.encode(text).length;
+
+/// True when [text] cannot be sent as one request body of [maxInputBytes].
+///
+/// Returns `true` for a non-empty text when [maxInputBytes] is not positive
+/// (no request can carry it); an empty text never "exceeds".
+bool exceedsSingleRequestBudget(String text, int maxInputBytes) {
+  if (text.isEmpty) return false;
+  if (maxInputBytes <= 0) return true;
+  return utf8BytesOfText(text) > maxInputBytes;
+}
+
+/// Short human-readable byte size for user-facing limit messages.
+String formatByteSize(int bytes) {
+  if (bytes < 1024) return '$bytes 字节';
+  if (bytes < 1024 * 1024) {
+    final kb = (bytes / 1024);
+    return kb == kb.roundToDouble()
+        ? '${kb.round()} KB'
+        : '${kb.toStringAsFixed(1)} KB';
+  }
+  final mb = bytes / (1024 * 1024);
+  return mb == mb.roundToDouble()
+      ? '${mb.round()} MB'
+      : '${mb.toStringAsFixed(1)} MB';
 }
 
 /// Cooperative cancellation token for [extractDocument].
@@ -146,4 +311,3 @@ class ExtractionCancellation {
 
   void cancel() => _cancelled = true;
 }
-
