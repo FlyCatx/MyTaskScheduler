@@ -155,5 +155,37 @@ void main() {
         identity,
       );
     });
+
+    test('engine identity includes the post-processing pipeline version', () {
+      const oldPipe = OcrAvailability(
+        available: true,
+        hostVersion: '1.1.0',
+        engine: 'Windows.Media.Ocr',
+        engineVersion: 'Windows.Media.Ocr/10.0.19045.0',
+        pipelineVersion: 'heuristic-1',
+      );
+      const newPipe = OcrAvailability(
+        available: true,
+        hostVersion: '1.1.0',
+        engine: 'Windows.Media.Ocr',
+        engineVersion: 'Windows.Media.Ocr/10.0.19045.0',
+        pipelineVersion: 'heuristic-2+rows-1+enhance-1',
+      );
+      final oldIdentity = ocrEngineIdentity(availability: oldPipe);
+      final newIdentity = ocrEngineIdentity(availability: newPipe);
+      expect(oldIdentity, contains('pipelineheuristic-1'));
+      expect(newIdentity, contains('pipelineheuristic-2+rows-1+enhance-1'));
+      // A pipeline change must produce a different cache identity even when the
+      // engine version and host version are identical.
+      expect(oldIdentity, isNot(newIdentity));
+      // A host that predates pipelineVersion stays compatible (shorter identity).
+      const legacy = OcrAvailability(
+        available: true,
+        hostVersion: '1.0.0',
+        engine: 'Windows.Media.Ocr',
+        engineVersion: 'Windows.Media.Ocr/10.0.19045.0',
+      );
+      expect(ocrEngineIdentity(availability: legacy), isNot(contains('pipeline')));
+    });
   });
 }

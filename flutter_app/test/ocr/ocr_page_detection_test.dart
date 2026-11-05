@@ -65,6 +65,103 @@ void main() {
       expect(plan.detail, contains('6 个字符'));
     });
 
+    test('header-only text layer is not "sufficient" when the body is scanned', () {
+      // The exact regression the prompt describes: a page whose text layer has
+      // >24 normal header characters but whose body is a scanned image. The old
+      // character-count rule called it "text layer sufficient" and silently
+      // skipped the whole body.
+      const header1 = '2026年度教师研修优秀成果申报表 第 1 页 / 共 4 页';
+      const header2 = '2026年度教师研修优秀成果申报表 第 4 页 / 共 4 页';
+      expect(header1.length, greaterThanOrEqualTo(24));
+      final detection = detectOcrPagesFromTexts(
+        kind: OcrSourceKind.pdf,
+        pageCount: 4,
+        pageTexts: const <int, String>{
+          1: header1,
+          2: goodText,
+          3: '第 3 页',
+          4: header2,
+        },
+      );
+      expect(detection.pagesToOcr, containsAll(<int>[1, 3, 4]));
+      final headerPlan = detection.pages[0];
+      expect(headerPlan.reason, OcrPageReason.headerOnlyText);
+      expect(headerPlan.needsOcr, isTrue);
+      expect(headerPlan.bodyTextLength, 0);
+      expect(headerPlan.nativeLines, isNotEmpty);
+      expect(headerPlan.explanation, contains('页眉'));
+      expect(detection.pages[1].reason, OcrPageReason.textLayerSufficient);
+      // The scanned-body decision is mixed-document aware and does not hide the
+      // header: it is kept for de-duplication when text and OCR are merged.
+      expect(detection.nativeLinesFor(1), isNotEmpty);
+    });
+
+    test('repeated header with a real body still counts as sufficient text', () {
+      final body = '这是一页完整正文，包含足够多的字符用于判断是否需要 OCR。'
+          '日期：2026年11月4日，工时：2.5小时，共四行说明。';
+      final detection = detectOcrPagesFromTexts(
+        kind: OcrSourceKind.pdf,
+        pageCount: 2,
+        pageTexts: <int, String>{
+          1: '2026年度考核表\n$body',
+          2: '2026年度考核表\n$body',
+        },
+      );
+      expect(detection.pagesToOcr, isEmpty);
+      final plan = detection.pages.first;
+      expect(plan.reason, OcrPageReason.textLayerSufficient);
+      expect(plan.nativeLines, isNotEmpty);
+      expect(plan.bodyTextLength, greaterThanOrEqualTo(24));
+    });
+
+    test('forced and excluded pages keep the native header lines', () {
+      const header = '2026年度教师研修优秀成果申报表 第 1 页 / 共 2 页';
+      final detection = detectOcrPagesFromTexts(
+        kind: OcrSourceKind.pdf,
+        pageCount: 2,
+        pageTexts: const <int, String>{1: header, 2: goodText},
+        forcedPages: const <int>[2],
+      );
+      expect(detection.pages[0].reason, OcrPageReason.headerOnlyText);
+      expect(detection.pages[1].reason, OcrPageReason.userForced);
+      expect(detection.pages[0].nativeLines, isNotEmpty);
+      expect(detection.pages[1].nativeLines, isEmpty);
+    });
+
+    test('mergeOcrTextWithNativeLines drops the duplicate native header', () {
+      const header = '2026年度教师研修优秀成果申报表 第 1 页 / 共 2 页';
+      final merged = mergeOcrTextWithNativeLines(
+        ocrText: '2026年度教师研修优秀成果申报表 第 1 页 / 共 2 页\n日期：2026年11月4日\n'
+            '工时：2.5小时',
+        nativeLines: const <String>[header],
+      );
+      expect(merged, isNot(contains('教师研修')));
+      expect(merged, isNot(contains('第 1 页')));
+      expect(merged, contains('2026年11月4日'));
+      // A different header number must be kept (never silently merged).
+      final kept = mergeOcrTextWithNativeLines(
+        ocrText: '2026年度考核表 第 2 页 / 共 2 页\n正文',
+        nativeLines: const <String>[header],
+      );
+      expect(kept, contains('第 2 页'));
+      // Empty native lines: OCR text is returned unchanged.
+      expect(
+        mergeOcrTextWithNativeLines(
+            ocrText: '正文', nativeLines: const <String>[]),
+        '正文',
+      );
+    });
+
+    test('page-number-only lines are still reported as too short', () {
+      final detection = detectOcrPagesFromTexts(
+        kind: OcrSourceKind.pdf,
+        pageCount: 2,
+        pageTexts: const <int, String>{1: goodText, 2: 'Page 2'},
+      );
+      expect(detection.pages[1].reason, OcrPageReason.textTooShort);
+      expect(detection.pages[1].needsOcr, isTrue);
+    });
+
     test('garbled text is flagged with the anomaly ratio', () {
       final garbled = '\uFFFD\uFFFD\uFFFD\uFFFD\uFFFD\uFFFD\uFFFD\uFFFD\uFFFD\uFFFD'
           '\uFFFD\uFFFD\uFFFD\uFFFD\uFFFD\uFFFD\uFFFD\uFFFD\uFFFD\uFFFD';
