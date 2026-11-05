@@ -24,6 +24,7 @@ import '../ui/app_shell.dart';
 import '../ui/desktop_window.dart';
 import '../ui/external_calendar_dialog.dart';
 import '../ui/theme.dart';
+import '../ui/widgets/app_notice.dart';
 import '../ui/window_surface.dart';
 import 'startup_screens.dart';
 
@@ -399,11 +400,19 @@ class _TsBootstrapState extends State<TsBootstrap> {
   /// 因此标题栏、主区、弹窗遮罩与菜单都被裁到同一条三次贝塞尔路径内，灰色描边也
   /// 画在它们之上（全屏遮罩盖不住）。原生侧用同一路径生成窗口 Region。
   ///
-  /// 圆角半径来自 [DesktopWindow.shape]（真实窗口状态）：普通 18 DIP，最大化/Snap 直角。
+  /// 0.3.0（提示词 02）：应用级通知宿主也挂在这里——位于 Navigator 之上，弹窗打开
+  /// 时通知仍可见可点；宿主只挂一次，AppShell 通过 [AppNoticeMountScope] 识别到
+  /// 已挂载后不再自行渲染，避免“同一通知两份”。
   Widget _withWindowSurface(BuildContext context, Widget? child) {
     return WindowSurface(
       shape: windowPort.shape,
-      child: child ?? const SizedBox.shrink(),
+      child: AppNoticeHost(
+        controller: AppNotices.instance,
+        child: AppNoticeMountScope(
+          mounted: true,
+          child: child ?? const SizedBox.shrink(),
+        ),
+      ),
     );
   }
 
