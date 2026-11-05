@@ -472,6 +472,7 @@ class OcrHostClient {
         hostVersion: hello.hostVersion,
         engine: hello.engine,
         engineVersion: hello.engineVersion,
+        pipelineVersion: hello.pipelineVersion,
         languages: languages,
         problem: '本机没有安装任何 OCR 识别语言组件。'
             '请在 Windows 设置 → 时间和语言 → 语言 中安装语言包'
@@ -486,6 +487,7 @@ class OcrHostClient {
       hostVersion: hello.hostVersion,
       engine: hello.engine,
       engineVersion: hello.engineVersion,
+      pipelineVersion: hello.pipelineVersion,
       languages: languages,
       checkedAt: DateTime.now(),
     );

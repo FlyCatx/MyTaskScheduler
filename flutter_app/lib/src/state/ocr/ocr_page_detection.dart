@@ -33,6 +33,12 @@ enum OcrPageReason {
   /// PDF text layer decodes to garbage (wrong font encoding, broken CMap).
   garbledText,
 
+  /// The page has enough characters overall, but they are only a running
+  /// header/footer/page number; the body is a scanned image. This is the
+  /// "25 normal header characters hide a scanned table" case: the old
+  /// character-count-only rule called such a page "text layer sufficient".
+  headerOnlyText,
+
   /// Mixed document: this page has no text while other pages do.
   mixedMissingText,
 
@@ -52,6 +58,7 @@ extension OcrPageReasonInfo on OcrPageReason {
         OcrPageReason.noTextLayer => 'no_text_layer',
         OcrPageReason.textTooShort => 'text_too_short',
         OcrPageReason.garbledText => 'garbled_text',
+        OcrPageReason.headerOnlyText => 'header_only_text',
         OcrPageReason.mixedMissingText => 'mixed_missing_text',
         OcrPageReason.textLayerSufficient => 'text_layer_sufficient',
         OcrPageReason.userForced => 'user_forced',
@@ -63,6 +70,7 @@ extension OcrPageReasonInfo on OcrPageReason {
         OcrPageReason.noTextLayer => '无文字层',
         OcrPageReason.textTooShort => '文字层过少',
         OcrPageReason.garbledText => '文字层疑似乱码',
+        OcrPageReason.headerOnlyText => '仅页眉/页码文字',
         OcrPageReason.mixedMissingText => '混合文档中的扫描页',
         OcrPageReason.textLayerSufficient => '文字层充足',
         OcrPageReason.userForced => '用户强制识别',
@@ -76,6 +84,8 @@ extension OcrPageReasonInfo on OcrPageReason {
           '这一页文字层只有很少内容（可能只有页码/标题），建议 OCR 后校对。',
         OcrPageReason.garbledText =>
           '这一页文字层解码后包含大量异常字符（可能是字体编码问题），建议用 OCR 覆盖并校对。',
+        OcrPageReason.headerOnlyText =>
+          '这一页只有页眉/页码等版式文字，正文很可能是扫描图；仅凭字符数会误判“文字层充足”，建议 OCR 并核对。',
         OcrPageReason.mixedMissingText =>
           '同一文档其它页有文字层，而这一页没有；为避免漏掉扫描正文，已默认选中。',
         OcrPageReason.textLayerSufficient =>
@@ -92,6 +102,8 @@ class OcrPagePlan {
     required this.needsOcr,
     required this.reason,
     this.textLength = 0,
+    this.bodyTextLength = 0,
+    this.nativeLines = const <String>[],
     this.detail,
   });
 
@@ -101,6 +113,15 @@ class OcrPagePlan {
 
   /// Characters found in the existing text layer (0 when there is none).
   final int textLength;
+
+  /// Characters that are *not* running headers/footers/page numbers. This is
+  /// the structural evidence used to spot a scanned body behind a text header.
+  final int bodyTextLength;
+
+  /// Text-layer lines classified as running header/footer/page number. They are
+  /// preserved so a later merge can keep the native text and drop the duplicate
+  /// OCR line instead of writing the header twice.
+  final List<String> nativeLines;
 
   /// Optional technical context (garbage ratio, segment location, ...).
   final String? detail;
@@ -114,6 +135,8 @@ class OcrPagePlan {
         'needsOcr': needsOcr,
         'reason': reason.wire,
         'textLength': textLength,
+        'bodyTextLength': bodyTextLength,
+        if (nativeLines.isNotEmpty) 'nativeLines': nativeLines,
         if (detail != null) 'detail': detail,
       };
 }
@@ -305,6 +328,29 @@ OcrPageDetection detectOcrPagesFromTexts({
       if (entry.key >= 1 && entry.key <= pageCount) entry.key: entry.value,
   };
   final anyText = texts.values.any((text) => text.trim().isNotEmpty);
+
+  // Structural evidence available from the existing extractor: per-page text
+  // lines only (it exposes no glyph/image boxes). We therefore classify lines
+  // as running header/footer/page-number and keep the remaining "body" text:
+  //   * a page-number-only line,
+  //   * a digit-normalised template that repeats on >= 2 pages and sits in the
+  //     first/last line (running header/footer),
+  //   * on a page whose whole text layer is <= 2 lines, a line that names a
+  //     page/form ("Page 1 of 4", "第 3 页", "考核表", "台账").
+  final pageLines = <int, List<String>>{};
+  for (var page = 1; page <= pageCount; page++) {
+    pageLines[page] = <String>[
+      for (final line in (texts[page] ?? '').split('\n'))
+        if (line.trim().isNotEmpty) line.trim(),
+    ];
+  }
+  final templateCounts = <String, int>{};
+  for (final lines in pageLines.values) {
+    for (final line in lines) {
+      final template = ocrHeaderTemplate(line);
+      templateCounts[template] = (templateCounts[template] ?? 0) + 1;
+    }
+  }
   final plans = <OcrPagePlan>[];
 
   for (var page = 1; page <= pageCount; page++) {
@@ -312,6 +358,34 @@ OcrPageDetection detectOcrPagesFromTexts({
     final text = raw.trim();
     final textLength = text.length;
     final garbageRatio = ocrGarbageRatio(text);
+    final lines = pageLines[page] ?? const <String>[];
+    final headerLines = <String>[];
+    final bodyLines = <String>[];
+    for (var i = 0; i < lines.length; i++) {
+      final line = lines[i];
+      final positional = i == 0 || i == lines.length - 1;
+      if (ocrIsPageNumberLine(line)) {
+        headerLines.add(line);
+        continue;
+      }
+      final template = ocrHeaderTemplate(line);
+      final repeats = (templateCounts[template] ?? 0) >= 2;
+      final singleLineHeader =
+          lines.length <= 2 && positional && ocrLooksLikeHeaderLine(line);
+      // A repeated template on a multi-line page (first/last line) is a running
+      // header. On a single-line page the whole "body" would be classified as
+      // header, so require an explicit page/form marker before doing that;
+      // otherwise two pages with identical body text would both become "header".
+      final repeatedHeader =
+          repeats && positional && (lines.length > 2 || ocrLooksLikeHeaderLine(line));
+      if (repeatedHeader || singleLineHeader) {
+        headerLines.add(line);
+        continue;
+      }
+      bodyLines.add(line);
+    }
+    final bodyTextLength =
+        bodyLines.join('\n').replaceAll(RegExp(r'\s+'), '').length;
 
     if (excluded.contains(page)) {
       plans.add(OcrPagePlan(
@@ -319,6 +393,8 @@ OcrPageDetection detectOcrPagesFromTexts({
         needsOcr: false,
         reason: OcrPageReason.userExcluded,
         textLength: textLength,
+        bodyTextLength: bodyTextLength,
+        nativeLines: headerLines,
       ));
       continue;
     }
@@ -328,6 +404,8 @@ OcrPageDetection detectOcrPagesFromTexts({
         needsOcr: true,
         reason: OcrPageReason.userForced,
         textLength: textLength,
+        bodyTextLength: bodyTextLength,
+        nativeLines: headerLines,
       ));
       continue;
     }
@@ -348,7 +426,26 @@ OcrPageDetection detectOcrPagesFromTexts({
         needsOcr: true,
         reason: OcrPageReason.garbledText,
         textLength: textLength,
+        bodyTextLength: bodyTextLength,
+        nativeLines: headerLines,
         detail: '异常字符比例 ${(garbageRatio * 100).toStringAsFixed(1)}%',
+      ));
+      continue;
+    }
+    // The actual "25 header characters, scanned body" case: the page passed the
+    // character threshold, but everything it contains is running header/footer.
+    if (textLength >= minTextChars &&
+        bodyTextLength < minTextChars &&
+        headerLines.isNotEmpty) {
+      plans.add(OcrPagePlan(
+        page: page,
+        needsOcr: true,
+        reason: OcrPageReason.headerOnlyText,
+        textLength: textLength,
+        bodyTextLength: bodyTextLength,
+        nativeLines: headerLines,
+        detail: '页眉/页码 ${headerLines.length} 行，正文仅 $bodyTextLength 字符'
+            '（文字层共 $textLength 字符）',
       ));
       continue;
     }
@@ -358,6 +455,8 @@ OcrPageDetection detectOcrPagesFromTexts({
         needsOcr: true,
         reason: OcrPageReason.textTooShort,
         textLength: textLength,
+        bodyTextLength: bodyTextLength,
+        nativeLines: headerLines,
         detail: '仅 $textLength 个字符',
       ));
       continue;
@@ -367,6 +466,8 @@ OcrPageDetection detectOcrPagesFromTexts({
       needsOcr: false,
       reason: OcrPageReason.textLayerSufficient,
       textLength: textLength,
+      bodyTextLength: bodyTextLength,
+      nativeLines: headerLines,
     ));
   }
 
@@ -377,6 +478,81 @@ OcrPageDetection detectOcrPagesFromTexts({
     warning: warning,
     encrypted: encrypted,
   );
+}
+
+/// True for a line that is only a page number ("12", "第 12 页", "Page 3",
+/// "3 / 16", "- 3 -").
+bool ocrIsPageNumberLine(String line) {
+  final compact = line.replaceAll(RegExp(r'\s+'), '');
+  if (compact.isEmpty) return false;
+  final patterns = <RegExp>[
+    RegExp(r'^第?\d+页?$'),
+    RegExp(r'^page\d+$', caseSensitive: false),
+    RegExp(r'^\d+/\d+$'),
+    RegExp(r'^-?\d+-?$'),
+    RegExp(r'^第?\d+页共\d+页$'),
+  ];
+  for (final pattern in patterns) {
+    if (pattern.hasMatch(compact)) return true;
+  }
+  return false;
+}
+
+/// Normalised template of a line: whitespace collapsed, lower-cased, each run
+/// of digits replaced by '#'. Two occurrences of the same template on different
+/// pages identify a running header/footer ("... Page 1 of 4" / "... Page 4 of 4").
+String ocrHeaderTemplate(String line) {
+  return line
+      .toLowerCase()
+      .replaceAll(RegExp(r'\s+'), ' ')
+      .replaceAll(RegExp(r'\d+'), '#')
+      .trim();
+}
+
+/// A form/table/page label; only applied to pages whose whole text layer is at
+/// most two lines, so a normal body line is never reclassified.
+bool ocrLooksLikeHeaderLine(String line) {
+  final lower = line.toLowerCase();
+  if (RegExp(r'第\s*\d+\s*页').hasMatch(lower)) return true;
+  if (RegExp(r'page\s*\d+').hasMatch(lower)) return true;
+  if (RegExp(r'\d+\s*/\s*\d+').hasMatch(lower)) return true;
+  if (RegExp(r'(form|申请[表单]|审批[表单]|考核[表单]|台账|报名[表单]|记录[表单])')
+      .hasMatch(lower)) {
+    return true;
+  }
+  return false;
+}
+
+/// Removes OCR lines that duplicate a native header/footer line kept from the
+/// PDF text layer. Used when a page is OCRed for its scanned body while the
+/// header already exists as text: the header must be written once, in its
+/// native form. Comparison ignores whitespace/case but keeps digits (a wrong
+/// header number must not be silently merged).
+String mergeOcrTextWithNativeLines({
+  required String ocrText,
+  required List<String> nativeLines,
+}) {
+  if (nativeLines.isEmpty) return ocrText;
+  final keys = <String>{
+    for (final line in nativeLines)
+      if (ocrLineKey(line).isNotEmpty) ocrLineKey(line),
+  };
+  final kept = <String>[];
+  for (final line in ocrText.split('\n')) {
+    final key = ocrLineKey(line);
+    if (key.isNotEmpty && keys.contains(key)) continue;
+    kept.add(line);
+  }
+  return kept.join('\n').trim();
+}
+
+/// Comparison key for header de-duplication.
+String ocrLineKey(String line) =>
+    line.replaceAll(RegExp(r'\s+'), '').toLowerCase();
+
+/// Lines classified as native header/footer for [page] (empty when unknown).
+extension OcrPageDetectionNativeLines on OcrPageDetection {
+  List<String> nativeLinesFor(int page) => planFor(page)?.nativeLines ?? const <String>[];
 }
 
 /// Ratio of characters that almost certainly indicate a broken text layer.

@@ -80,7 +80,13 @@ class OcrCacheKey {
 }
 
 /// JSON schema version of cache entries; bump to invalidate old layouts.
-const int ocrCacheSchemaVersion = 1;
+///
+/// v2: engine identity now includes the host's post-processing pipeline version
+/// (`pipelineVersion`), so entries produced by the old heuristic/row/retry
+/// pipeline can never hide the improved algorithm. The entry layout itself is
+/// unchanged; bumping also clears any v1 entry written before that identity
+/// existed.
+const int ocrCacheSchemaVersion = 2;
 
 /// The page cache.
 class OcrCache {

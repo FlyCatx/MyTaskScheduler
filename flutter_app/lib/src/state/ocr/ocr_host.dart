@@ -218,8 +218,14 @@ String ocrEngineIdentity({
   final hostVersion = availability?.hostVersion.isNotEmpty == true
       ? availability!.hostVersion
       : (buildInfo?.hostVersion ?? '');
+  final pipelineVersion = availability?.pipelineVersion ?? '';
   final parts = <String>[engine, version];
   if (hostVersion.isNotEmpty) parts.add('host$hostVersion');
+  // Post-processing identity: scoring/region selection/row grouping/retry are
+  // part of *what produced this text*, so cached pages from an older pipeline
+  // must miss even when the engine and binary hash are unchanged. Older hosts
+  // send no pipelineVersion: the identity simply stays shorter (compatible).
+  if (pipelineVersion.isNotEmpty) parts.add('pipeline$pipelineVersion');
   if (binary.isNotEmpty) parts.add(binary);
   return parts.join('/');
 }

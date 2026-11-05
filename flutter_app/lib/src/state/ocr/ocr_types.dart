@@ -749,6 +749,7 @@ class OcrAvailability {
     this.hostVersion = '',
     this.engine = '',
     this.engineVersion = '',
+    this.pipelineVersion = '',
     this.languages = const <OcrLanguage>[],
     this.problem,
     this.checkedAt,
@@ -761,6 +762,11 @@ class OcrAvailability {
   final String hostVersion;
   final String engine;
   final String engineVersion;
+
+  /// Post-processing pipeline identity reported by the helper (heuristic
+  /// scoring / region selection / row grouping / retry). Part of the cache key:
+  /// an improved algorithm must not hit pages cached by the old one.
+  final String pipelineVersion;
   final List<OcrLanguage> languages;
 
   /// Why OCR is unavailable (user-facing Chinese), or `null` when available.
@@ -859,6 +865,7 @@ class OcrHostHello {
     required this.engine,
     required this.engineVersion,
     required this.osVersion,
+    this.pipelineVersion = '',
     this.mode = '',
     this.source,
     this.pages = 0,
@@ -869,6 +876,9 @@ class OcrHostHello {
   final String engine;
   final String engineVersion;
   final String osVersion;
+
+  /// Optional (older hosts do not send it): post-processing pipeline version.
+  final String pipelineVersion;
   final String mode;
   final String? source;
   final int pages;
@@ -889,6 +899,7 @@ class OcrHostHello {
       hostVersion: (m['hostVersion'] as String?) ?? '',
       engine: engine,
       engineVersion: (m['engineVersion'] as String?) ?? '',
+      pipelineVersion: (m['pipelineVersion'] as String?) ?? '',
       osVersion: (m['osVersion'] as String?) ?? '',
       mode: (m['mode'] as String?) ?? '',
       source: m['source'] as String?,
