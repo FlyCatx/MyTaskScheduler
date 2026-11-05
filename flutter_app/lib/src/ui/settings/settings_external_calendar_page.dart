@@ -181,7 +181,7 @@ class _SettingsExternalCalendarPageState
             autofocus: true,
             style: const TextStyle(fontSize: 12.5),
             decoration: const InputDecoration(
-              labelText: '来源名称（只影响本地显示，不会进入模型请求）',
+              labelText: '来源名称',
               isDense: true,
             ),
           ),
@@ -305,15 +305,6 @@ class _SettingsExternalCalendarPageState
       key: const Key('settings-external-calendar-page'),
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        const SettingsGroupLabel('外部日历（本地 ICS，只读）'),
-        const SettingsIntro(
-          key: Key('external-calendar-page-intro'),
-          icon: Icons.event_available_outlined,
-          text: '从本地 ICS 文件导入忙碌时间，只作为只读占用参与排程与模型请求：'
-              '不会写入手工时间表，也不能在绘制页编辑。'
-              '事件标题与文件路径不会进入模型请求。',
-        ),
-        const SizedBox(height: 8),
         SettingsCard(
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -368,33 +359,17 @@ class _SettingsExternalCalendarPageState
                     style: TextStyle(fontSize: 11, color: TsColors.blocked),
                   ),
                 ),
-              const SizedBox(height: 8),
-              if (sources.isEmpty)
-                Padding(
-                  key: const Key('external-calendar-sources-empty'),
-                  padding: const EdgeInsets.symmetric(vertical: 10),
-                  child: Text(
-                    '还没有导入任何外部日历。点「新建导入」选择一个 .ics 文件；'
-                    '导入后可以在这里启用/停用、改名、重新导入或删除。',
-                    style: TextStyle(
-                        fontSize: 11.5, height: 1.55, color: TsColors.textFaint),
-                  ),
-                )
-              else
+              // 列表前间距只在确实有来源时使用：零来源保持“来源 0 个 + 新建导入”
+              // 的紧凑空态，最后一个来源删除后同样恢复紧凑。
+              if (sources.isNotEmpty) ...[
+                const SizedBox(height: 8),
                 for (var i = 0; i < sources.length; i++) ...[
                   if (i > 0) const SettingsCardDivider(),
                   _sourceCard(sources[i]),
                 ],
+              ],
             ],
           ),
-        ),
-        const SizedBox(height: 10),
-        const SettingsNote(
-          key: Key('external-calendar-page-note'),
-          text: '外部占用以浅灰斜纹叠加在绘制页的网格上，鼠标悬停可看到「外部日历」'
-              '标记；它不进入时间表草稿，绘制/擦除/绑定只作用于手工数据。'
-              '完整替换只在重新导入时使用，并会二次确认将移除的事件数量与范围。',
-          icon: Icons.layers_outlined,
         ),
       ],
     );

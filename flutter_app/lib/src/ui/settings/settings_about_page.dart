@@ -1,6 +1,10 @@
 // 关于页：版本、许可、帮助入口与脱敏诊断文本。
-// 版本取自 kAppVersion；检查更新保持原位置但禁用（无更新后端）；
+// 版本取自 kAppVersion；检查更新保持原位置但禁用（无更新后端），禁用原因只通过
+// 按钮 Tooltip 提示，不再重复常驻“更新服务未配置”卡片；
 // 帮助打开可执行文件旁的 README，缺失时如实说明；
+// “隐私协议”打开可读的说明弹窗：不再写“程序不上传材料与密钥”的绝对承诺，
+// 而是说明本机 OCR 本地完成、主动发起模型分析时文字会经配置连接发送、
+// API Key 存 Windows 凭据管理器且不随材料发送；
 // 诊断文本只含版本/ABI/端点主机/连接数/存储路径，绝不含密钥、完整 URL 或提示词。
 //
 // 主要类型：SettingsAboutPage、_DiagnosticsDisclosure。
@@ -46,10 +50,6 @@ class SettingsAboutPage extends StatelessWidget {
                         onPressed: null,
                       ),
                     ),
-                  ),
-                  const SettingsNote(
-                    icon: Icons.cloud_off_outlined,
-                    text: '更新服务未配置',
                   ),
                   const SettingsCardDivider(),
                   SettingsTile(
@@ -105,8 +105,7 @@ class SettingsAboutPage extends StatelessWidget {
                 ),
                 _FooterLink(
                   label: '隐私协议',
-                  onTap: () => showSettingsMessage(
-                      context, '隐私说明：所有数据保存在本机，程序不上传材料与密钥'),
+                  onTap: () => _showPrivacyPolicy(context),
                 ),
                 _FooterLink(
                   label: '意见反馈',
@@ -145,6 +144,53 @@ class SettingsAboutPage extends StatelessWidget {
     final ok = await openPathWithShell(path);
     if (!context.mounted) return;
     if (!ok) showSettingsMessage(context, '无法打开 $path');
+  }
+
+  /// 隐私说明弹窗。
+  ///
+  /// 不写“程序不上传材料与密钥”这类绝对承诺：本机 OCR 不上传，但用户主动让
+  /// 已配置的模型分析材料时，材料文字会经该模型连接发送；API Key 存于
+  /// Windows 凭据管理器，只用于认证，不随材料发送。内容与代码事实保持一致。
+  Future<void> _showPrivacyPolicy(BuildContext context) {
+    return showDialog<void>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        key: const Key('about-privacy-dialog'),
+        backgroundColor: TsColors.surface,
+        shape: const BezierRoundedRectangleBorder(radius: 14),
+        title: Row(
+          children: [
+            Icon(Icons.shield_outlined, size: 17, color: TsColors.accent),
+            const SizedBox(width: 8),
+            const Text('隐私说明', style: TextStyle(fontSize: 15)),
+          ],
+        ),
+        content: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 520),
+          child: SingleChildScrollView(
+            child: Text(
+              '• 本地 OCR 与 PDF 文字层提取在你的电脑上完成；选择文件与识别扫描页不会上传。\n'
+              '• 当你主动让已配置的模型分析材料时，材料文字与你的提示会通过该模型连接'
+              '发送给对应服务，这是分析功能所必需的；发送范围取决于你选择的连接与材料。\n'
+              '• API Key 保存在 Windows 凭据管理器，仅用于向你配置的服务认证，'
+              '不随材料内容发送。\n'
+              '• 会话、设置与识别结果保存在本机数据目录；导出的备份不含 API Key。',
+              key: const Key('about-privacy-text'),
+              style: TextStyle(
+                  fontSize: 12.5, height: 1.6, color: TsColors.textSecondary),
+            ),
+          ),
+        ),
+        actions: [
+          TextButton(
+            key: const Key('about-privacy-close'),
+            style: TsButtons.inline(),
+            onPressed: () => Navigator.of(dialogContext).pop(),
+            child: const Text('知道了'),
+          ),
+        ],
+      ),
+    );
   }
 }
 
@@ -322,4 +368,3 @@ String _licenseText() => <String>[
           'Flutter（BSD-3-Clause）。',
       '完整许可文本见程序目录 licenses/ 文件夹。',
     ].join('\n');
-

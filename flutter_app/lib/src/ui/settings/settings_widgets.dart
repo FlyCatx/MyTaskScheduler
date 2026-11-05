@@ -8,6 +8,7 @@
 
 import 'package:flutter/material.dart';
 
+import '../widgets/app_notice.dart';
 import '../widgets/bezier_ui.dart';
 import '../theme.dart';
 
@@ -527,15 +528,30 @@ class _SettingsPageViewportState extends State<SettingsPageViewport> {
   }
 }
 
-/// Floating snack bar; used for "copied" / "not available in this build" messages.
-void showSettingsMessage(BuildContext context, String message) {
-  final messenger = ScaffoldMessenger.maybeOf(context);
-  if (messenger == null) return;
-  messenger.showSnackBar(
-    SnackBar(
-      content: Text(message, maxLines: 3),
-      behavior: SnackBarBehavior.floating,
-      duration: const Duration(seconds: 3),
-    ),
+/// 设置页的一次性反馈：统一进应用级左下角通知（0.3.0 R4-B），不再用 SnackBar。
+///
+/// 设置页在模态路由里，通知宿主位于 Navigator 之上，所以仍然可见可点。默认按
+/// 文案粗略区分成功/警告；调用方可显式传 [kind]。
+void showSettingsMessage(
+  BuildContext context,
+  String message, {
+  AppNoticeKind? kind,
+}) {
+  final text = message.trim();
+  if (text.isEmpty) return;
+  final resolved = kind ??
+      (text.contains('失败') ||
+              text.contains('无法') ||
+              text.contains('未找到') ||
+              text.contains('不可用')
+          ? AppNoticeKind.error
+          : AppNoticeKind.success);
+  AppNotices.instance.show(
+    kind: resolved,
+    message: text,
+    autoDismiss: resolved == AppNoticeKind.error
+        ? null
+        : const Duration(seconds: 3),
+    dedupeKey: 'settings:$text',
   );
 }
