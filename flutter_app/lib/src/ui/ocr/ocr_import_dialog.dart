@@ -97,6 +97,9 @@ class _OcrImportDialogState extends State<_OcrImportDialog> {
   final TextEditingController _passwordController = TextEditingController();
   final Map<int, TextEditingController> _reviewControllers =
       <int, TextEditingController>{};
+
+  /// 页计划列表自己的滚动位置（配置阶段列表长时独立滚动）。
+  final ScrollController _planScroll = ScrollController();
   int _dpi = OcrLimits.standard.defaultDpi;
   OcrCancellation? _cancellation;
   OcrProgress? _progress;
@@ -118,6 +121,7 @@ class _OcrImportDialogState extends State<_OcrImportDialog> {
     _cancellation?.cancel();
     _pageSpecController.dispose();
     _passwordController.dispose();
+    _planScroll.dispose();
     for (final controller in _reviewControllers.values) {
       controller.dispose();
     }
@@ -541,6 +545,7 @@ class _OcrImportDialogState extends State<_OcrImportDialog> {
       insetPadding: const EdgeInsets.all(24),
       shape: const BezierRoundedRectangleBorder(radius: 16),
       child: SizedBox(
+        key: const Key('ocr-import-card'),
         width: width,
         height: height,
         child: Column(
@@ -548,25 +553,80 @@ class _OcrImportDialogState extends State<_OcrImportDialog> {
           children: [
             _titleRow(),
             Divider(height: 1, color: TsColors.border),
-            Expanded(
-              child: SingleChildScrollView(
-                padding: const EdgeInsets.fromLTRB(20, 12, 20, 8),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.stretch,
-                  children: [
-                    _boundaryNotice(),
-                    const SizedBox(height: 10),
-                    ..._phaseBody(),
-                  ],
-                ),
-              ),
-            ),
+            // 主体必须是有界的：配置阶段的页计划列表要吃掉剩余高度并自己滚动。
+            // 0.3.0 删掉了顶部两段常驻说明，省出的高度全部给页列表。
+            Expanded(child: _body()),
             Divider(height: 1, color: TsColors.border),
             _footer(),
           ],
         ),
       ),
     );
+  }
+
+  /// 弹窗主体。
+  ///
+  /// 配置阶段走 [_configureLayout]（有界主体：固定控件 + 页计划列表占剩余高度）；
+  /// 其它阶段内容较短，沿用整页滚动。
+  Widget _body() {
+    if (_phase == _Phase.configure) {
+      return LayoutBuilder(builder: (context, constraints) {
+        return _configureLayout(constraints);
+      });
+    }
+    return SingleChildScrollView(
+      padding: _bodyPadding,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: _phaseBody(),
+      ),
+    );
+  }
+
+  static const EdgeInsets _bodyPadding = EdgeInsets.fromLTRB(20, 12, 20, 8);
+
+  /// 低于这个可用高度时改为整页滚动（极矮窗口），否则固定控件 + 内部滚动的页列表。
+  static const double _boundedConfigureHeight = 340;
+
+  Widget _configureLayout(BoxConstraints constraints) {
+    final detection = _detection;
+    final showPlan = detection != null && detection.pages.isNotEmpty;
+    final bounded = constraints.maxHeight >= _boundedConfigureHeight;
+
+    final Widget plan = showPlan ? _pagePlanList(detection) : const SizedBox.shrink();
+    final List<Widget> children = <Widget>[
+      _fileRow(),
+      const SizedBox(height: 8),
+      if (detection != null) _detectionSummary(detection),
+      if (showPlan) const SizedBox(height: 8),
+      // 有界分支：列表拿剩余高度（长则内部滚动，短则按内容收缩）；
+      // 极矮分支：整页滚动，列表给一个按可用高度算出的上限。
+      if (showPlan)
+        bounded
+            ? Flexible(child: plan)
+            : SizedBox(
+                height: math.max(
+                  96.0,
+                  math.min(280.0, constraints.maxHeight * 0.42),
+                ),
+                child: plan,
+              ),
+      if (showPlan) const SizedBox(height: 8),
+      // 以下控件在两种分支里都固定可见：页范围、DPI、密码、建议页范围。
+      _pageTargetsRow(),
+      const SizedBox(height: 8),
+      _passwordRow(),
+      ..._configureFeedback(),
+    ];
+
+    final content = Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: children,
+    );
+    if (bounded) {
+      return Padding(padding: _bodyPadding, child: content);
+    }
+    return SingleChildScrollView(padding: _bodyPadding, child: content);
   }
 
   Widget _titleRow() {
@@ -583,6 +643,13 @@ class _OcrImportDialogState extends State<_OcrImportDialog> {
             ),
           ),
           IconButton(
+            key: const Key('ocr-help'),
+            tooltip: '使用说明与联网边界',
+            onPressed: _running ? null : () => _showHelp(context),
+            style: TsButtons.closeIcon(size: 28),
+            icon: const Icon(Icons.help_outline, size: 16),
+          ),
+          IconButton(
             key: const Key('ocr-dialog-close'),
             tooltip: '关闭',
             onPressed: _running ? null : () => Navigator.of(context).pop(false),
@@ -590,28 +657,6 @@ class _OcrImportDialogState extends State<_OcrImportDialog> {
             icon: const Icon(Icons.close, size: 16),
           ),
         ],
-      ),
-    );
-  }
-
-  Widget _boundaryNotice() {
-    return Container(
-      key: const Key('ocr-boundary-notice'),
-      padding: const EdgeInsets.all(10),
-      decoration: BoxDecoration(
-        color: TsColors.surfaceAlt,
-        borderRadius: BorderRadius.circular(8),
-        border: Border.all(color: TsColors.border),
-      ),
-      child: Text(
-        '本地离线：识别在你自己的电脑上完成，不上传扫描页，也不需要安装 Python 或配置 PATH。\n'
-        '联网边界：确认加入材料后，这些文字会成为材料；当你让已配置的模型分析材料时，'
-        '文字会通过你的模型连接联网发送。本地识别这一步本身不联网。',
-        style: TextStyle(
-          fontSize: 11.5,
-          height: 1.55,
-          color: TsColors.textSecondary,
-        ),
       ),
     );
   }
@@ -664,13 +709,6 @@ class _OcrImportDialogState extends State<_OcrImportDialog> {
             const SizedBox(height: 8),
             _errorBox(),
           ],
-          const SizedBox(height: 10),
-          Text(
-            '支持扫描型 PDF、混合文字/扫描 PDF，以及 PNG / JPEG 图片。'
-            '文本型 PDF 优先使用原有文字层，不会重复识别。',
-            style: TextStyle(
-                fontSize: 11.5, height: 1.5, color: TsColors.textFaint),
-          ),
         ];
       case _Phase.detecting:
         return <Widget>[
@@ -693,7 +731,8 @@ class _OcrImportDialogState extends State<_OcrImportDialog> {
           ),
         ];
       case _Phase.configure:
-        return _configureBody();
+        // 配置阶段由 [_configureLayout] 单独排版（有界主体 + 页列表占剩余高度）。
+        return const <Widget>[];
       case _Phase.running:
         return _runningBody();
       case _Phase.review:
@@ -703,120 +742,111 @@ class _OcrImportDialogState extends State<_OcrImportDialog> {
 
   Widget _fileRow() {
     return Row(
+      crossAxisAlignment: CrossAxisAlignment.center,
       children: [
-        OutlinedButton(
-          key: const Key('ocr-pick-file'),
-          onPressed: _running || _busy ? null : _pickFile,
-          style: TsButtons.outline(fontSize: 12),
-          child: const Text('选择文件'),
+        // 格式与文字层处理说明并入文件控件：按钮 Tooltip 随时可查，未选文件时
+        // 控件内再给一行简短提示；不再在初始页单独占一段常驻说明。
+        Tooltip(
+          message: '支持扫描型/混合文字层 PDF、PNG、JPEG；'
+              '文本型 PDF 优先使用原有文字层，不重复识别。',
+          child: OutlinedButton(
+            key: const Key('ocr-pick-file'),
+            onPressed: _running || _busy ? null : _pickFile,
+            style: TsButtons.outline(fontSize: 12),
+            child: const Text('选择文件'),
+          ),
         ),
         const SizedBox(width: 10),
         Expanded(
-          child: Text(
-            _filePath == null ? '尚未选择文件（PDF / PNG / JPEG）' : '已选择：$_fileName',
-            key: const Key('ocr-file-name'),
-            overflow: TextOverflow.ellipsis,
-            style: TextStyle(
-              fontSize: 12,
-              color: _filePath == null ? TsColors.textFaint : TsColors.textPrimary,
-            ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text(
+                _filePath == null ? '尚未选择文件（PDF / PNG / JPEG）' : '已选择：$_fileName',
+                key: const Key('ocr-file-name'),
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(
+                  fontSize: 12,
+                  color: _filePath == null ? TsColors.textFaint : TsColors.textPrimary,
+                ),
+              ),
+              if (_filePath == null)
+                Text(
+                  '扫描型/混合 PDF 与 PNG、JPEG；文本型 PDF 复用原文字层',
+                  key: const Key('ocr-file-hint'),
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(fontSize: 10.5, color: TsColors.textFaint),
+                ),
+            ],
           ),
         ),
       ],
     );
   }
 
-  List<Widget> _configureBody() {
-    final detection = _detection;
-    return <Widget>[
-      _fileRow(),
-      const SizedBox(height: 10),
-      if (detection != null) _detectionSummary(detection),
-      if (detection != null && detection.pages.isNotEmpty) ...[
-        const SizedBox(height: 8),
-        _pagePlanList(detection),
-      ],
-      const SizedBox(height: 10),
-      Row(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Expanded(
-            flex: 3,
-            child: TextField(
-              key: const Key('ocr-page-spec'),
-              controller: _pageSpecController,
-              enabled: !_busy,
-              decoration: const InputDecoration(
-                labelText: '页范围（留空 = 全部页）',
-                hintText: '例如 1-3,5',
-                isDense: true,
-                border: OutlineInputBorder(),
-              ),
-              style: const TextStyle(fontSize: 12.5),
-            ),
-          ),
-          const SizedBox(width: 10),
-          Expanded(
-            flex: 2,
-            child: DropdownButtonFormField<int>(
-              key: const Key('ocr-dpi'),
-              initialValue: _dpi,
-              decoration: const InputDecoration(
-                labelText: '渲染 DPI',
-                isDense: true,
-                border: OutlineInputBorder(),
-              ),
-              items: const <DropdownMenuItem<int>>[
-                DropdownMenuItem<int>(value: 100, child: Text('100（更快）')),
-                DropdownMenuItem<int>(value: 150, child: Text('150（默认）')),
-                DropdownMenuItem<int>(value: 200, child: Text('200（更清晰）')),
-                DropdownMenuItem<int>(value: 300, child: Text('300（最慢）')),
-              ],
-              onChanged: _busy
-                  ? null
-                  : (value) {
-                      if (value != null) setState(() => _dpi = value);
-                    },
-            ),
-          ),
-        ],
-      ),
-      const SizedBox(height: 10),
-      Row(
-        children: [
-          Expanded(
-            child: TextField(
-              key: const Key('ocr-password'),
-              controller: _passwordController,
-              enabled: !_busy,
-              obscureText: true,
-              decoration: const InputDecoration(
-                labelText: 'PDF 密码（可选，仅加密文档需要）',
-                isDense: true,
-                border: OutlineInputBorder(),
-              ),
-              style: const TextStyle(fontSize: 12.5),
-            ),
-          ),
-          const SizedBox(width: 10),
-          TextButton(
-            key: const Key('ocr-apply-suggested-pages'),
-            onPressed: _busy ? null : _reapplySuggestedRange,
-            style: TsButtons.inline(fontSize: 11.5),
-            child: const Text('使用建议页范围'),
-          ),
-        ],
-      ),
-      if (_availability != null) ...[
-        const SizedBox(height: 8),
-        Text(
-          '识别语言：'
-          '${_availability!.languages.map((language) => language.displayName).join('、')}'
-          '（每页自动选择最合适的一种）',
-          key: const Key('ocr-languages'),
-          style: TextStyle(fontSize: 11.5, color: TsColors.textFaint),
+  /// 使用说明与联网边界（可从标题栏随时打开）。
+  ///
+  /// 初始页不再常驻“格式/文字层/联网边界”两段；必要说明保留在这个可达入口：
+  /// 本机 OCR 本地完成，只有用户主动发起模型分析时材料文字才经配置连接发送。
+  Future<void> _showHelp(BuildContext context) {
+    return showDialog<void>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        key: const Key('ocr-help-dialog'),
+        backgroundColor: TsColors.surface,
+        shape: const BezierRoundedRectangleBorder(radius: 14),
+        title: Row(
+          children: [
+            Icon(Icons.document_scanner_outlined, size: 17, color: TsColors.accent),
+            const SizedBox(width: 8),
+            const Text('本地 OCR 使用说明', style: TextStyle(fontSize: 15)),
+          ],
         ),
-      ],
+        content: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 560),
+          child: SingleChildScrollView(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(
+                  '• 支持扫描型 PDF、文字层+扫描混合 PDF，以及 PNG / JPEG 图片；'
+                  '文本型 PDF 优先使用原有文字层，不会重复识别。\n'
+                  '• 选择文件与识别都在本机完成，不需要联网，也不需要安装 Python。\n'
+                  '• 缺少识别语言时，在 Windows 设置 → 时间和语言 → 语言 中安装'
+                  '对应语言的“光学字符识别”组件后重试。',
+                  key: const Key('ocr-help-body'),
+                  style: TextStyle(
+                      fontSize: 12.5, height: 1.55, color: TsColors.textSecondary),
+                ),
+                const SizedBox(height: 10),
+                Text(
+                  '联网边界：只有你主动让已配置的模型分析材料时，材料文字才会通过'
+                  '该模型连接发送；发送范围取决于你选择的连接与材料。确认加入材料本身'
+                  '只写入本机，不会触发模型请求。',
+                  key: const Key('ocr-help-boundary'),
+                  style: TextStyle(
+                      fontSize: 12.5, height: 1.55, color: TsColors.textFaint),
+                ),
+              ],
+            ),
+          ),
+        ),
+        actions: [
+          TextButton(
+            key: const Key('ocr-help-close'),
+            style: TsButtons.inline(),
+            onPressed: () => Navigator.of(dialogContext).pop(),
+            child: const Text('知道了'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  List<Widget> _configureFeedback() {
+    return <Widget>[
       if (_notice != null) ...[
         const SizedBox(height: 8),
         Text(
@@ -830,6 +860,86 @@ class _OcrImportDialogState extends State<_OcrImportDialog> {
         _errorBox(),
       ],
     ];
+  }
+
+  /// 页范围 + 渲染 DPI。窄窗下仍并排但左右各自 Expanded，不会溢出。
+  Widget _pageTargetsRow() {
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Expanded(
+          flex: 3,
+          child: TextField(
+            key: const Key('ocr-page-spec'),
+            controller: _pageSpecController,
+            enabled: !_busy,
+            decoration: const InputDecoration(
+              labelText: '页范围（留空 = 全部页）',
+              hintText: '例如 1-3,5',
+              isDense: true,
+              border: OutlineInputBorder(),
+            ),
+            style: const TextStyle(fontSize: 12.5),
+          ),
+        ),
+        const SizedBox(width: 10),
+        Expanded(
+          flex: 2,
+          child: DropdownButtonFormField<int>(
+            key: const Key('ocr-dpi'),
+            initialValue: _dpi,
+            // 窄窗 + 1.5 倍字号下“150（默认）”会撑破 InputDecorator 的 Row：
+            // isExpanded 让选中项按可用宽度省略，而不是溢出画黄条。
+            isExpanded: true,
+            decoration: const InputDecoration(
+              labelText: '渲染 DPI',
+              isDense: true,
+              border: OutlineInputBorder(),
+            ),
+            items: const <DropdownMenuItem<int>>[
+              DropdownMenuItem<int>(value: 100, child: Text('100（更快）')),
+              DropdownMenuItem<int>(value: 150, child: Text('150（默认）')),
+              DropdownMenuItem<int>(value: 200, child: Text('200（更清晰）')),
+              DropdownMenuItem<int>(value: 300, child: Text('300（最慢）')),
+            ],
+            onChanged: _busy
+                ? null
+                : (value) {
+                    if (value != null) setState(() => _dpi = value);
+                  },
+          ),
+        ),
+      ],
+    );
+  }
+
+  /// 可选 PDF 密码 + 重新套用建议页范围。
+  Widget _passwordRow() {
+    return Row(
+      children: [
+        Expanded(
+          child: TextField(
+            key: const Key('ocr-password'),
+            controller: _passwordController,
+            enabled: !_busy,
+            obscureText: true,
+            decoration: const InputDecoration(
+              labelText: 'PDF 密码（可选，仅加密文档需要）',
+              isDense: true,
+              border: OutlineInputBorder(),
+            ),
+            style: const TextStyle(fontSize: 12.5),
+          ),
+        ),
+        const SizedBox(width: 10),
+        TextButton(
+          key: const Key('ocr-apply-suggested-pages'),
+          onPressed: _busy ? null : _reapplySuggestedRange,
+          style: TsButtons.inline(fontSize: 11.5),
+          child: const Text('使用建议页范围'),
+        ),
+      ],
+    );
   }
 
   Widget _detectionSummary(OcrPageDetection detection) {
@@ -846,58 +956,73 @@ class _OcrImportDialogState extends State<_OcrImportDialog> {
 
   Widget _pagePlanList(OcrPageDetection detection) {
     final visible = detection.pages;
+    // 不再固定 maxHeight：高度由父级（配置阶段的有界主体）决定，长则内部滚动、
+    // 短则按内容收缩。滚动条用独立控制器，避免抢外层页面的滚动。
     return Container(
       key: const Key('ocr-page-plan'),
-      constraints: const BoxConstraints(maxHeight: 168),
+      clipBehavior: Clip.antiAlias,
       decoration: BoxDecoration(
         border: Border.all(color: TsColors.border),
         borderRadius: BorderRadius.circular(8),
       ),
-      child: ListView.builder(
-        shrinkWrap: true,
-        padding: const EdgeInsets.symmetric(vertical: 2),
-        itemCount: visible.length,
-        itemBuilder: (context, index) {
-          final plan = visible[index];
-          return Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-            child: Row(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Icon(
-                  plan.needsOcr ? Icons.auto_awesome_outlined : Icons.notes_outlined,
-                  size: 14,
-                  color: plan.needsOcr ? TsColors.accent : TsColors.textFaint,
-                ),
-                const SizedBox(width: 6),
-                SizedBox(
-                  width: 52,
-                  child: Text(
-                    '第 ${plan.page} 页',
-                    style: const TextStyle(fontSize: 11.5),
+      child: Scrollbar(
+        controller: _planScroll,
+        child: ListView.builder(
+          controller: _planScroll,
+          shrinkWrap: true,
+          padding: const EdgeInsets.symmetric(vertical: 2),
+          itemCount: visible.length,
+          itemBuilder: (context, index) {
+            final plan = visible[index];
+            // 字号放大时页码/原因列同比加宽，避免“第 7 页”被折成两行或压到说明上。
+            final scale = MediaQuery.textScalerOf(context)
+                .scale(1.0)
+                .clamp(1.0, 2.0);
+            return Padding(
+              key: Key('ocr-page-plan-row-${plan.page}'),
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+              child: Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Icon(
+                    plan.needsOcr
+                        ? Icons.auto_awesome_outlined
+                        : Icons.notes_outlined,
+                    size: 14,
+                    color: plan.needsOcr ? TsColors.accent : TsColors.textFaint,
                   ),
-                ),
-                SizedBox(
-                  width: 96,
-                  child: Text(
-                    plan.reason.label,
-                    style: TextStyle(
-                      fontSize: 11.5,
-                      color: plan.needsOcr ? TsColors.accent : TsColors.textSecondary,
+                  const SizedBox(width: 6),
+                  SizedBox(
+                    width: 46 * scale,
+                    child: Text(
+                      '第 ${plan.page} 页',
+                      style: const TextStyle(fontSize: 11.5),
                     ),
                   ),
-                ),
-                Expanded(
-                  child: Text(
-                    plan.explanation,
-                    style: TextStyle(
-                        fontSize: 11, height: 1.35, color: TsColors.textFaint),
+                  SizedBox(
+                    width: 90 * scale,
+                    child: Text(
+                      plan.reason.label,
+                      style: TextStyle(
+                        fontSize: 11.5,
+                        color: plan.needsOcr
+                            ? TsColors.accent
+                            : TsColors.textSecondary,
+                      ),
+                    ),
                   ),
-                ),
-              ],
-            ),
-          );
-        },
+                  Expanded(
+                    child: Text(
+                      plan.explanation,
+                      style: TextStyle(
+                          fontSize: 11, height: 1.35, color: TsColors.textFaint),
+                    ),
+                  ),
+                ],
+              ),
+            );
+          },
+        ),
       ),
     );
   }
