@@ -14,6 +14,7 @@ import '../../state/execution/execution_ledger.dart';
 import '../../state/execution/execution_models.dart';
 import '../../state/execution/timer_controller.dart';
 import '../theme.dart';
+import '../widgets/bezier_ui.dart';
 
 class ManualEntryDialog extends StatefulWidget {
   const ManualEntryDialog({
@@ -86,15 +87,27 @@ class _ManualEntryDialogState extends State<ManualEntryDialog> {
     final saveLabel = hasOverlap && !_overlapAcknowledged ? '确认口径并保存' : '保存';
     return AlertDialog(
       key: const Key('manual-entry-dialog'),
+      backgroundColor: TsColors.surface,
+      titlePadding: const EdgeInsets.fromLTRB(20, 12, 8, 0),
       title: Row(
         children: [
-          const Icon(Icons.edit_calendar_outlined, size: 18),
+          Icon(Icons.edit_calendar_outlined, size: 17, color: TsColors.accent),
           const SizedBox(width: 8),
           Expanded(
             child: Text(
               '手工补记实际耗时',
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
               style: TextStyle(fontSize: 15, color: TsColors.textPrimary),
             ),
+          ),
+          // 与执行回顾/OCR 主弹窗一致的右上角关闭入口。
+          IconButton(
+            key: const Key('manual-close'),
+            tooltip: '关闭',
+            style: TsButtons.closeIcon(size: 28),
+            onPressed: _saving ? null : () => Navigator.of(context).pop(),
+            icon: const Icon(Icons.close, size: 16),
           ),
         ],
       ),
@@ -110,24 +123,22 @@ class _ManualEntryDialogState extends State<ManualEntryDialog> {
                 style: TextStyle(fontSize: 12, color: TsColors.textSecondary),
               ),
               const SizedBox(height: 10),
-              SegmentedButton<ManualEntryMode>(
+              // 与执行回顾/设置一致的主题分段控件（不再是 Material SegmentedButton）。
+              BezierSegments(
                 key: const Key('manual-mode'),
-                segments: const [
-                  ButtonSegment<ManualEntryMode>(
-                    value: ManualEntryMode.startEnd,
-                    label: Text('起止时间'),
-                    icon: Icon(Icons.schedule, size: 14),
-                  ),
-                  ButtonSegment<ManualEntryMode>(
-                    value: ManualEntryMode.duration,
-                    label: Text('仅时长'),
-                    icon: Icon(Icons.timer_outlined, size: 14),
-                  ),
+                items: const <BezierSegmentItem>[
+                  BezierSegmentItem('起止时间', icon: Icons.schedule),
+                  BezierSegmentItem('仅时长', icon: Icons.timer_outlined),
                 ],
-                selected: <ManualEntryMode>{_mode},
-                onSelectionChanged: (selection) {
+                selected: _mode.index,
+                expand: true,
+                itemKeys: const <Key?>[
+                  Key('manual-mode-start-end'),
+                  Key('manual-mode-duration'),
+                ],
+                onChanged: (index) {
                   setState(() {
-                    _mode = selection.first;
+                    _mode = ManualEntryMode.values[index];
                     _error = null;
                     _validation = null;
                     _overlapAcknowledged = false;

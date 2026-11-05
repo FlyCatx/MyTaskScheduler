@@ -11,6 +11,7 @@ import 'package:flutter/material.dart';
 import '../../state/execution/execution_models.dart';
 import '../../state/execution/timer_controller.dart';
 import '../theme.dart';
+import '../widgets/app_notice.dart';
 import 'manual_entry_dialog.dart';
 
 class ExecutionActions extends StatelessWidget {
@@ -65,7 +66,7 @@ class ExecutionActions extends StatelessWidget {
                   : () async {
                       final result = await controller.start(taskRef);
                       if (!context.mounted) return;
-                      _showMessage(context, result.message);
+                      _showMessage(context, ok: result.ok, message: result.message);
                     },
             )
           else if (running)
@@ -77,7 +78,7 @@ class ExecutionActions extends StatelessWidget {
               onPressed: () async {
                 final result = await controller.pause();
                 if (!context.mounted) return;
-                _showMessage(context, result.message);
+                _showMessage(context, ok: result.ok, message: result.message);
               },
             )
           else if (paused)
@@ -89,7 +90,7 @@ class ExecutionActions extends StatelessWidget {
               onPressed: () async {
                 final result = await controller.resume();
                 if (!context.mounted) return;
-                _showMessage(context, result.message);
+                _showMessage(context, ok: result.ok, message: result.message);
               },
             ),
           if (isThisTask && !readOnly)
@@ -102,7 +103,7 @@ class ExecutionActions extends StatelessWidget {
               onPressed: () async {
                 final result = await controller.stopAndConfirm();
                 if (!context.mounted) return;
-                _showMessage(context, result.message);
+                _showMessage(context, ok: result.ok, message: result.message);
               },
             ),
           if (onToggleCompletion != null)
@@ -135,7 +136,7 @@ class ExecutionActions extends StatelessWidget {
                   taskRef: taskRef,
                 );
                 if (outcome == null || !context.mounted) return;
-                _showMessage(context, outcome.message);
+                _showMessage(context, ok: outcome.ok, message: outcome.message);
               },
             ),
         ];
@@ -169,15 +170,22 @@ class ExecutionActions extends StatelessWidget {
     return Tooltip(message: tooltip, child: child);
   }
 
-  void _showMessage(BuildContext context, String message) {
-    if (message.trim().isEmpty) return;
-    final messenger = ScaffoldMessenger.maybeOf(context);
-    if (messenger == null) return;
-    messenger
-      ..clearSnackBars()
-      ..showSnackBar(SnackBar(
-        content: Text(message, style: const TextStyle(fontSize: 12)),
-        duration: const Duration(seconds: 4),
-      ));
+  /// 执行计时反馈统一进应用级左下角通知（0.3.0 R4-B）；不再用 ScaffoldMessenger。
+  ///
+  /// 失败保留到用户关闭（计时失败需要读完原因），成功短时后自动消失；同一句提示
+  /// 短时间内重复出现时只更新一条，不堆叠。
+  void _showMessage(
+    BuildContext context, {
+    required bool ok,
+    required String message,
+  }) {
+    final text = message.trim();
+    if (text.isEmpty) return;
+    AppNotices.instance.show(
+      kind: ok ? AppNoticeKind.success : AppNoticeKind.error,
+      message: text,
+      autoDismiss: ok ? const Duration(seconds: 4) : null,
+      dedupeKey: 'execution:$text',
+    );
   }
 }
