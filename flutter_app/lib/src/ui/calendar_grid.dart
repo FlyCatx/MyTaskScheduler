@@ -994,6 +994,11 @@ class _TimetableGridState extends State<TimetableGrid> {
                   children: [
                     Text(
                       _weekdayName(d.weekday),
+                      // 窄到单列只有几十像素时星期/日期宁可省略也不能换行撑高
+                      // 表头（否则表头 Column 会纵向溢出）。
+                      maxLines: 1,
+                      softWrap: false,
+                      overflow: TextOverflow.ellipsis,
                       style: TextStyle(
                         fontSize: 10.5,
                         color: TsColors.textSecondary,
@@ -1001,6 +1006,9 @@ class _TimetableGridState extends State<TimetableGrid> {
                     ),
                     Text(
                       '${_int(d.date.substring(5, 7))}/${_int(d.date.substring(8))}',
+                      maxLines: 1,
+                      softWrap: false,
+                      overflow: TextOverflow.ellipsis,
                       style: TextStyle(
                         fontSize: 11.5,
                         fontWeight: FontWeight.w600,
@@ -1019,7 +1027,9 @@ class _TimetableGridState extends State<TimetableGrid> {
   }
 
   Widget _timeAxis() {
-    const labelHeight = 11.0;
+    // 时间轴标签高度随系统字号放大：固定 11 会把 1.5 倍字号的整点标签纵向裁掉。
+    final labelHeight = 11.0 *
+        MediaQuery.textScalerOf(context).scale(1).clamp(1.0, 1.6).toDouble();
     return SizedBox(
       width: TimetableGrid.timeAxisWidth,
       height: TimetableGrid.contentHeight,
@@ -1058,6 +1068,26 @@ class _TimetableGridState extends State<TimetableGrid> {
       };
 
   static int _int(String s) => int.tryParse(s) ?? 0;
+}
+
+/// 时间表蓝块（任务预留）的**不透明实色**。
+///
+/// 任务 01：蓝块内部必须是纯色，不能被底网格（小时/刻钟线）或未绑定区间的白色
+/// 斜线贯穿。已绑定与未绑定用两种实色区分，形状差异（未绑定的左侧深色标记条）
+/// 仍保留，避免只靠颜色表达状态。
+class TimetableBlockColors {
+  TimetableBlockColors._();
+
+  /// 已绑定任务块：与按钮/选中控件同一个“选中蓝”。
+  static Color get bound => TsColors.selected;
+
+  /// 未绑定任务块：同色系的不透明浅蓝（向白色混合 45%，不是透明度）。
+  static Color get unbound =>
+      Color.lerp(TsColors.selected, const Color(0xFFFFFFFF), 0.45)!;
+
+  /// 未绑定块的左侧标记条：同色系更深一档，作为非颜色的形状标记。
+  static Color get unboundMarker =>
+      Color.lerp(TsColors.selected, const Color(0xFF000000), 0.30)!;
 }
 
 class _GridPainter extends CustomPainter {
@@ -1103,27 +1133,35 @@ class _GridPainter extends CustomPainter {
     final dayWidth = width / 7;
     final height = kTimetableSlotsPerDay * rowHeight;
     final fill = Paint()..style = PaintingStyle.fill;
+    // 任务蓝块：两种不透明实色（已绑定/未绑定），块内部不会被网格线或白斜线贯穿。
+    final taskBound = TimetableBlockColors.bound;
+    final taskUnbound = TimetableBlockColors.unbound;
 
     for (var i = 0; i < days.length && i < 7; i++) {
       final left = i * dayWidth;
       final day = days[i];
       canvas.save();
       canvas.clipRect(Rect.fromLTWH(left, topInset, dayWidth, height));
+
+      // 1) 当日底色。
       fill.color = _free;
       canvas.drawRect(
           Rect.fromLTWH(left, topInset, dayWidth, height), fill);
 
-      // 外部占用画在手工数据下面：手工占用/蓝块始终可见、可编辑。
+      // 2) 底网格（小时/刻钟线）先画。任务块与外部占用随后覆盖它，因此块内部
+      //    不会出现贯穿的周期性横线（任务 01 的第一个来源）。
+      _paintGridLines(canvas, left, dayWidth);
+
+      // 3) 只读外部占用画在手工数据下面：手工占用/蓝块始终可见、可编辑。
       _paintExternalBusy(canvas, day, left, dayWidth);
 
+      // 4) 手工区间：不透明纯色，后画所以完整覆盖底网格。
       for (final interval in day.intervals) {
         if (interval.state == TimetableState.free) continue;
-        final color = interval.state == TimetableState.task
-            ? (interval.taskId == null
-                ? TsColors.accent.withValues(alpha: 0.45)
-                : TsColors.accent)
+        final isTask = interval.state == TimetableState.task;
+        fill.color = isTask
+            ? (interval.taskId == null ? taskUnbound : taskBound)
             : _occupied;
-        fill.color = color;
         final top = topInset + interval.start / 60 * 4 * rowHeight;
         final bottom = topInset + interval.end / 60 * 4 * rowHeight;
         canvas.drawRect(
@@ -1143,19 +1181,16 @@ class _GridPainter extends CustomPainter {
             Paint()..color = const Color(0xFF111827),
           );
         }
-        if (interval.state == TimetableState.task && interval.taskId == null) {
-          // 未绑定：斜线标记，不只依赖颜色。
-          final line = Paint()
-            ..color = const Color(0x99FFFFFF)
-            ..strokeWidth = 1;
-          for (var y = top + 4; y < bottom; y += 8) {
-            canvas.drawLine(
-                Offset(left + 3, y), Offset(left + dayWidth - 4, y + 4), line);
-          }
+        if (isTask && interval.taskId == null) {
+          // 未绑定：左侧实心深色标记条（形状差异，不只依赖颜色深浅）。
+          canvas.drawRect(
+            Rect.fromLTWH(left + 1, top, 2, bottom - top),
+            Paint()..color = TimetableBlockColors.unboundMarker,
+          );
         }
         // 选择模式高亮：选中的蓝色块加蓝色边框与淡色底，避免只靠颜色区分
         // 未选中/已选中；未绑定蓝块也能高亮（按日期+分钟匹配）。
-        if (interval.state == TimetableState.task) {
+        if (isTask) {
           final ranges = selected[day.date];
           if (ranges != null) {
             for (final range in ranges) {
@@ -1183,20 +1218,7 @@ class _GridPainter extends CustomPainter {
         }
       }
 
-      // 15 分钟线与小时线。
-      for (var slot = 0; slot <= kTimetableSlotsPerDay; slot++) {
-        final y = topInset + slot * rowHeight;
-        final hour = slot % 4 == 0;
-        canvas.drawLine(
-          Offset(left, y),
-          Offset(left + dayWidth, y),
-          Paint()
-            ..color = hour
-                ? const Color(0xFF9CA3AF)
-                : _occupiedSoft.withValues(alpha: 0.75)
-            ..strokeWidth = hour ? 1 : 0.5,
-        );
-      }
+      // 5) 日分隔竖线（画在块边缘之外，不进入块内部）。
       canvas.drawLine(
         Offset(left, topInset),
         Offset(left, topInset + height),
@@ -1213,6 +1235,23 @@ class _GridPainter extends CustomPainter {
         ..color = const Color(0xFFD1D5DB)
         ..strokeWidth = 1,
     );
+  }
+
+  /// 15 分钟线与整点线：只画在手工区间之前，作为背景网格。
+  void _paintGridLines(Canvas canvas, double left, double dayWidth) {
+    for (var slot = 0; slot <= kTimetableSlotsPerDay; slot++) {
+      final y = topInset + slot * rowHeight;
+      final hour = slot % 4 == 0;
+      canvas.drawLine(
+        Offset(left, y),
+        Offset(left + dayWidth, y),
+        Paint()
+          ..color = hour
+              ? const Color(0xFF9CA3AF)
+              : _occupiedSoft.withValues(alpha: 0.75)
+          ..strokeWidth = hour ? 1 : 0.5,
+      );
+    }
   }
 
   /// 画一个自然日内的外部占用：浅灰斜纹 + 左侧标记条 + 「外部」文字。

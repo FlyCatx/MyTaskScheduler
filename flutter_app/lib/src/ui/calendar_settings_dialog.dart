@@ -26,6 +26,23 @@ import './timetable_copy_dialog.dart';
 import './widgets/bezier_ui.dart';
 import 'theme.dart';
 
+/// 给按钮样式显式补上应用字体。
+///
+/// `ButtonStyle.textStyle` 会**整体替换**主题的排版样式，只写 fontSize 时字体族为
+/// null，渲染环境没有系统字体（截图/测试）就会退回方块字体；显式写家族后按钮
+/// 与正文同一种中文字体，也不影响任何尺寸/颜色/禁用态。
+ButtonStyle _appFontButton(ButtonStyle style, double fontSize) {
+  return style.copyWith(
+    textStyle: WidgetStatePropertyAll<TextStyle>(
+      TextStyle(
+        fontFamily: kUiFontFamily,
+        fontFamilyFallback: kUiFontFallback,
+        fontSize: fontSize,
+      ),
+    ),
+  );
+}
+
 /// Everything the "从材料识别" section needs, supplied by the app layer.
 ///
 /// The dialog deliberately does not know about `AppController` or the native bridge: it
@@ -234,6 +251,32 @@ class _CalendarSettingsDialog extends StatefulWidget {
   @override
   State<_CalendarSettingsDialog> createState() =>
       _CalendarSettingsDialogState();
+}
+
+/// 绘制工具区的尺寸与“收纳”阈值（唯一来源）。
+///
+/// 工具条里的画笔分段控件外框高 38（轨道 30 + 上下各 4 的间隙），因此每一“组”
+/// 都放进 38 高的行里居中：宽窗同一组的高度与中心线一致，换行后也不会忽高忽低。
+class CalendarToolbarMetrics {
+  CalendarToolbarMetrics._();
+
+  /// 工具区每一行（每一组）的固定高度。
+  static const double rowHeight = 38;
+
+  /// 组内两个控件之间的间距。
+  static const double itemGap = 4;
+
+  /// 组与组之间的间距。
+  static const double groupGap = 12;
+
+  /// 换行时两组之间的垂直间距。
+  static const double runGap = 4;
+
+  /// 可用宽度小于该值（再乘以系统字号）时，把次要绘制动作收进“更多操作”菜单。
+  static const double secondaryBreakpoint = 640;
+
+  /// 可用宽度小于该值（再乘以系统字号）时，连撤销/重做也一起收进菜单。
+  static const double historyBreakpoint = 420;
 }
 
 class _CalendarSettingsDialogState extends State<_CalendarSettingsDialog> {
@@ -1588,6 +1631,11 @@ class _CalendarSettingsDialogState extends State<_CalendarSettingsDialog> {
                 padding: const EdgeInsets.fromLTRB(20, 0, 20, 0),
                 child: _editorHeader(),
               ),
+              if (drawing)
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(20, 4, 20, 0),
+                  child: _drawToolbar(),
+                ),
               const SizedBox(height: 6),
               Expanded(
                 child: Padding(
@@ -1641,84 +1689,24 @@ class _CalendarSettingsDialogState extends State<_CalendarSettingsDialog> {
     );
   }
 
+  /// 标题行只放标题与关闭：绘制动作全部回到下面的编辑工具区，窄窗也不会先把
+  /// 标题/关闭挤走（任务 01：标题与关闭按钮独占稳定位置）。
   Widget _titleRow(BuildContext context) {
-    final drawing = _mode == CalendarEditorMode.drawing;
-    // 标题行压缩到最小并承载绘制动作：网格可写视口必须能容纳 08:00 附近的
-    // 单元格（否则点击/拖到第一节课附近会落在视口边界外，见 regression_0113 F8）。
     return Padding(
-      padding: const EdgeInsets.fromLTRB(20, 4, 8, 2),
+      key: const Key('timetable-title-row'),
+      padding: const EdgeInsets.fromLTRB(20, 6, 8, 2),
       child: Row(
         children: [
           const Expanded(
-            child: Text('可用时间与占用时间', style: TextStyle(fontSize: 15)),
+            child: Text(
+              '可用时间与占用时间',
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(fontSize: 15, fontWeight: FontWeight.w600),
+            ),
           ),
-          if (drawing) ...[
-            _smallToolButton(
-              key: const Key('timetable-undo'),
-              label: '撤销',
-              icon: Icons.undo,
-              onTap: _grid.canUndo
-                  ? () {
-                      _grid.undo();
-                      _syncUndoRedoButtons();
-                    }
-                  : null,
-            ),
-            const SizedBox(width: 4),
-            _smallToolButton(
-              key: const Key('timetable-redo'),
-              label: '重做',
-              icon: Icons.redo,
-              onTap: _grid.canRedo
-                  ? () {
-                      _grid.redo();
-                      _syncUndoRedoButtons();
-                    }
-                  : null,
-            ),
-            const SizedBox(width: 4),
-            _smallToolButton(
-              key: const Key('timetable-clear-week'),
-              label: '清空本周',
-              icon: Icons.layers_clear,
-              onTap: _clearWeek,
-            ),
-            if (!_weeklyMode) ...[
-              const SizedBox(width: 4),
-              _smallToolButton(
-                key: const Key('timetable-select-blocks'),
-                label: _grid.selectionMode ? '退出选择' : '选择蓝块',
-                icon: Icons.check_box_outlined,
-                onTap: () => setState(() {
-                  _grid.setSelectionMode(!_grid.selectionMode);
-                }),
-              ),
-            ],
-            const SizedBox(width: 4),
-            _smallToolButton(
-              key: const Key('timetable-copy-to'),
-              label: '复制到…',
-              icon: Icons.copy_all_outlined,
-              onTap: _busy ? null : _openCopyDialog,
-            ),
-            if (widget.externalCalendar != null) ...[
-              const SizedBox(width: 4),
-              Tooltip(
-                message: '导入本地 ICS 日历：外部占用只读（浅灰斜纹），'
-                    '不写入手工时间表，也不能在此绘制/擦除/绑定',
-                child: _smallToolButton(
-                  key: const Key('external-calendar-open-import'),
-                  label: '外部日历',
-                  icon: Icons.event_available_outlined,
-                  onTap: _busy ? null : _openExternalCalendarImport,
-                ),
-              ),
-            ],
-            const SizedBox(width: 4),
-            _rangeToggleButton(),
-            const SizedBox(width: 4),
-          ],
           IconButton(
+            key: const Key('timetable-close'),
             tooltip: '关闭',
             onPressed: _busy ? null : _handlePopRequest,
             style: TsButtons.closeIcon(size: 28),
@@ -1729,26 +1717,307 @@ class _CalendarSettingsDialogState extends State<_CalendarSettingsDialog> {
     );
   }
 
-  /// 跨日时段开关：固定 30 高，和标题行其它动作同高，避免把网格压矮。
+  /// 绘制动作工具区：画笔选择与撤销/重做/清空/选择/复制/跨日/外部日历同组。
+  ///
+  /// 宽窗一行、同高、中心线对齐；变窄时按“画笔”“历史”“编辑动作”整组换行；
+  /// 再窄时把次要动作（必要时连撤销/重做）收进“更多操作”菜单，禁用态、回调与
+  /// 可辨识文案都保留。高度只由 [ToolbarMetrics] 与换行数决定，不靠缩小字号。
+  Widget _drawToolbar() {
+    return LayoutBuilder(builder: (context, constraints) {
+      final textScale =
+          MediaQuery.textScalerOf(context).scale(1).clamp(1.0, 1.6).toDouble();
+      final available = constraints.maxWidth;
+      // 阈值随系统字号放宽：字越大，需要越宽才放得下一行。
+      final compactSecondary =
+          available < CalendarToolbarMetrics.secondaryBreakpoint * textScale;
+      final compactHistory =
+          available < CalendarToolbarMetrics.historyBreakpoint * textScale;
+
+      final groups = <Widget>[
+        _toolGroup(
+          key: const Key('timetable-brush-group'),
+          children: [
+            Padding(
+              padding: const EdgeInsets.only(right: 2),
+              child: Text(
+                '画笔',
+                key: const Key('timetable-brush-label'),
+                style: TextStyle(fontSize: 10.5, color: TsColors.textFaint),
+              ),
+            ),
+            BezierSegments(
+              key: const Key('timetable-brush'),
+              height: 30,
+              itemWidth: 74,
+              items: const [
+                BezierSegmentItem('占用'),
+                BezierSegmentItem('任务'),
+              ],
+              selected: _grid.brush == TimetableState.occupied ? 0 : 1,
+              onChanged: (index) {
+                setState(() {
+                  _grid.setBrush(index == 0
+                      ? TimetableState.occupied
+                      : TimetableState.task);
+                });
+              },
+            ),
+          ],
+        ),
+        if (!compactHistory)
+          _toolGroup(
+            key: const Key('timetable-history-group'),
+            children: [
+              _smallToolButton(
+                key: const Key('timetable-undo'),
+                label: '撤销',
+                icon: Icons.undo,
+                tooltip: '撤销上一步绘制（Ctrl+Z）',
+                onTap: _grid.canUndo
+                    ? () {
+                        _grid.undo();
+                        _syncUndoRedoButtons();
+                      }
+                    : null,
+              ),
+              _smallToolButton(
+                key: const Key('timetable-redo'),
+                label: '重做',
+                icon: Icons.redo,
+                tooltip: '重做上一步绘制（Ctrl+Y）',
+                onTap: _grid.canRedo
+                    ? () {
+                        _grid.redo();
+                        _syncUndoRedoButtons();
+                      }
+                    : null,
+              ),
+            ],
+          ),
+        if (compactSecondary)
+          _toolSlot(
+            key: const Key('timetable-more-slot'),
+            child: _moreActionsButton(includeHistory: compactHistory),
+          )
+        else
+          _toolGroup(
+            key: const Key('timetable-edit-actions'),
+            children: [
+              _smallToolButton(
+                key: const Key('timetable-clear-week'),
+                label: '清空本周',
+                icon: Icons.layers_clear,
+                tooltip: '清空本周手工绘制（可撤销）',
+                onTap: _clearWeek,
+              ),
+              if (!_weeklyMode)
+                _smallToolButton(
+                  key: const Key('timetable-select-blocks'),
+                  label: _grid.selectionMode ? '退出选择' : '选择蓝块',
+                  icon: Icons.check_box_outlined,
+                  tooltip: _grid.selectionMode
+                      ? '退出蓝块选择，回到画笔绘制'
+                      : '选择模式：单击蓝块多选，不绘制/擦除',
+                  onTap: () => setState(() {
+                    _grid.setSelectionMode(!_grid.selectionMode);
+                  }),
+                ),
+              _smallToolButton(
+                key: const Key('timetable-copy-to'),
+                label: '复制到…',
+                icon: Icons.copy_all_outlined,
+                tooltip: '把本周计划复制到其它日期（可撤销）',
+                onTap: _busy ? null : _openCopyDialog,
+              ),
+              if (widget.externalCalendar != null)
+                _smallToolButton(
+                  key: const Key('external-calendar-open-import'),
+                  label: '外部日历',
+                  icon: Icons.event_available_outlined,
+                  tooltip: '导入外部日历',
+                  onTap: _busy ? null : _openExternalCalendarImport,
+                ),
+              _rangeToggleButton(),
+            ],
+          ),
+      ];
+
+      return SizedBox(
+        key: const Key('timetable-toolbar'),
+        child: Wrap(
+          spacing: CalendarToolbarMetrics.groupGap,
+          runSpacing: CalendarToolbarMetrics.runGap,
+          crossAxisAlignment: WrapCrossAlignment.center,
+          // 组与组之间整组换行，不拆散组内控件；组内统一 [CalendarToolbarMetrics.rowHeight]。
+          children: groups,
+        ),
+      );
+    });
+  }
+
+  /// 固定行高的一“组”：宽窗同一行的画笔与动作因此高度一致、中心线一致。
+  Widget _toolGroup({required List<Widget> children, Key? key}) {
+    return SizedBox(
+      key: key,
+      height: CalendarToolbarMetrics.rowHeight,
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.center,
+        children: [
+          for (var i = 0; i < children.length; i++) ...[
+            if (i > 0) const SizedBox(width: CalendarToolbarMetrics.itemGap),
+            children[i],
+          ],
+        ],
+      ),
+    );
+  }
+
+  /// 单个控件放进同样的行高里并居中；`widthFactor: 1` 保证不会横向吃掉整行。
+  Widget _toolSlot({required Widget child, Key? key}) {
+    return SizedBox(
+      key: key,
+      height: CalendarToolbarMetrics.rowHeight,
+      child: Center(widthFactor: 1, child: child),
+    );
+  }
+
+  /// 窄窗收纳后的“更多操作”菜单：与工具按钮同高的触发按钮 + 保留原 key 的菜单项。
+  Widget _moreActionsButton({required bool includeHistory}) {
+    return PopupMenuButton<String>(
+      key: const Key('timetable-more-actions'),
+      tooltip: '更多绘制操作',
+      offset: const Offset(0, 34),
+      onSelected: _runMoreAction,
+      itemBuilder: (context) => <PopupMenuEntry<String>>[
+        if (includeHistory) ...[
+          PopupMenuItem<String>(
+            key: const Key('timetable-more-undo'),
+            value: 'undo',
+            enabled: _grid.canUndo,
+            child: _moreMenuRow(Icons.undo, '撤销'),
+          ),
+          PopupMenuItem<String>(
+            key: const Key('timetable-more-redo'),
+            value: 'redo',
+            enabled: _grid.canRedo,
+            child: _moreMenuRow(Icons.redo, '重做'),
+          ),
+          const PopupMenuDivider(),
+        ],
+        PopupMenuItem<String>(
+          key: const Key('timetable-clear-week'),
+          value: 'clear',
+          child: _moreMenuRow(Icons.layers_clear, '清空本周'),
+        ),
+        if (!_weeklyMode)
+          PopupMenuItem<String>(
+            key: const Key('timetable-select-blocks'),
+            value: 'select',
+            child: _moreMenuRow(
+              Icons.check_box_outlined,
+              _grid.selectionMode ? '退出选择' : '选择蓝块',
+              checked: _grid.selectionMode,
+            ),
+          ),
+        PopupMenuItem<String>(
+          key: const Key('timetable-copy-to'),
+          value: 'copy',
+          enabled: !_busy,
+          child: _moreMenuRow(Icons.copy_all_outlined, '复制到…'),
+        ),
+        if (widget.externalCalendar != null)
+          PopupMenuItem<String>(
+            key: const Key('external-calendar-open-import'),
+            value: 'external',
+            enabled: !_busy,
+            child: _moreMenuRow(Icons.event_available_outlined, '外部日历'),
+          ),
+        PopupMenuItem<String>(
+          key: const Key('timetable-range-toggle'),
+          value: 'range',
+          child: _moreMenuRow(
+            _rangeMode ? Icons.check_box_outlined : Icons.check_box_outline_blank,
+            '跨日时段',
+            checked: _rangeMode,
+          ),
+        ),
+      ],
+      child: Container(
+        height: 30,
+        padding: const EdgeInsets.symmetric(horizontal: 10),
+        decoration: bezierDecoration(color: TsColors.buttonFill, radius: 7),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(Icons.more_horiz, size: 15, color: TsColors.onButton),
+            const SizedBox(width: 4),
+            Text(
+              '更多操作',
+              style: TextStyle(fontSize: 11, color: TsColors.onButton),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _moreMenuRow(IconData icon, String label, {bool checked = false}) {
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Icon(icon, size: 15, color: TsColors.textSecondary),
+        const SizedBox(width: 8),
+        Text(
+          label,
+          style: TextStyle(fontSize: 11.5, color: TsColors.textPrimary),
+        ),
+        if (checked) ...[
+          const SizedBox(width: 8),
+          Icon(Icons.check, size: 14, color: TsColors.accent),
+        ],
+      ],
+    );
+  }
+
+  void _runMoreAction(String value) {
+    switch (value) {
+      case 'undo':
+        if (_grid.canUndo) {
+          _grid.undo();
+          _syncUndoRedoButtons();
+        }
+      case 'redo':
+        if (_grid.canRedo) {
+          _grid.redo();
+          _syncUndoRedoButtons();
+        }
+      case 'clear':
+        _clearWeek();
+      case 'select':
+        setState(() => _grid.setSelectionMode(!_grid.selectionMode));
+      case 'copy':
+        if (!_busy) _openCopyDialog();
+      case 'external':
+        if (!_busy) _openExternalCalendarImport();
+      case 'range':
+        _toggleRangeMode();
+    }
+  }
+
+  /// 跨日时段开关：固定 30 高，和工具区其它动作同高，避免把网格压矮。
   Widget _rangeToggleButton() {
     return SizedBox(
       height: 30,
       child: TextButton.icon(
         key: const Key('timetable-range-toggle'),
-        onPressed: () => setState(() {
-          _rangeMode = !_rangeMode;
-          _rangeStatus = null;
-          if (_rangeMode) {
-            // 跨日只用显式输入提交：进入该模式时退出选择模式，避免误操作。
-            _grid.setSelectionMode(false);
-          }
-        }),
+        onPressed: _toggleRangeMode,
         icon: Icon(
           _rangeMode ? Icons.check_box_outlined : Icons.check_box_outline_blank,
           size: 15,
         ),
         label: const Text('跨日时段'),
-        style: TsButtons.filled(
+        style: _filledStyle(
           radius: 7,
           minimumSize: const Size(0, 30),
           padding: const EdgeInsets.symmetric(horizontal: 10),
@@ -1756,6 +2025,17 @@ class _CalendarSettingsDialogState extends State<_CalendarSettingsDialog> {
         ),
       ),
     );
+  }
+
+  void _toggleRangeMode() {
+    setState(() {
+      _rangeMode = !_rangeMode;
+      _rangeStatus = null;
+      if (_rangeMode) {
+        // 跨日只用显式输入提交：进入该模式时退出选择模式，避免误操作。
+        _grid.setSelectionMode(false);
+      }
+    });
   }
 
   /// 填写模式：固定标题/模式开关/底部按钮，只有中间表单滚动。
@@ -1962,6 +2242,13 @@ class _CalendarSettingsDialogState extends State<_CalendarSettingsDialog> {
           TextButton(
             key: const Key('timetable-this-week'),
             onPressed: _goThisWeek,
+            style: TextButton.styleFrom(
+              textStyle: const TextStyle(
+                fontFamily: kUiFontFamily,
+                fontFamilyFallback: kUiFontFallback,
+                fontSize: 12,
+              ),
+            ),
             child: const Text('本周'),
           ),
           const SizedBox(width: 8),
@@ -1987,24 +2274,6 @@ class _CalendarSettingsDialogState extends State<_CalendarSettingsDialog> {
               key: const Key('timetable-weekly-mode-note'),
               style: TextStyle(fontSize: 10.5, color: TsColors.textFaint),
             ),
-          ),
-          const SizedBox(width: 8),
-          BezierSegments(
-            key: const Key('timetable-brush'),
-            height: 30,
-            itemWidth: 74,
-            items: const [
-              BezierSegmentItem('占用'),
-              BezierSegmentItem('任务'),
-            ],
-            selected: _grid.brush == TimetableState.occupied ? 0 : 1,
-            onChanged: (index) {
-              setState(() {
-                _grid.setBrush(index == 0
-                    ? TimetableState.occupied
-                    : TimetableState.task);
-              });
-            },
           ),
         ],
       ],
@@ -2071,15 +2340,15 @@ class _CalendarSettingsDialogState extends State<_CalendarSettingsDialog> {
               style: TextStyle(fontSize: 10.5, color: TsColors.pending),
             ),
           ),
+        // 只保留超短的动态数量（对判断叠加范围有用）；常驻教程句已删除。
         if (widget.externalCalendar != null &&
-            widget.externalSourceIds.isNotEmpty)
+            widget.externalSourceIds.isNotEmpty &&
+            externalBusy.isNotEmpty)
           Padding(
             padding: const EdgeInsets.only(top: 4),
             child: Text(
-              '外部日历占用为只读：浅灰斜纹 + 「外部」标记，'
-              '${externalBusy.isEmpty ? '本周没有外部占用' : '本周 ${externalBusy.length} 条叠加实例'}；'
-              '不写入手工时间表，不能绘制/擦除/绑定，点选只显示信息。',
-              key: const Key('external-calendar-editor-note'),
+              '本周 ${externalBusy.length} 条外部占用',
+              key: const Key('external-calendar-week-count'),
               style: TextStyle(fontSize: 10.5, color: TsColors.textFaint),
             ),
           ),
@@ -2206,7 +2475,7 @@ class _CalendarSettingsDialogState extends State<_CalendarSettingsDialog> {
                 child: FilledButton(
                   key: const Key('timetable-range-apply'),
                   onPressed: _busy ? null : _submitRange,
-                  style: TsButtons.filled(
+                  style: _filledStyle(
                     radius: 8,
                     minimumSize: const Size(0, 32),
                     padding: const EdgeInsets.symmetric(horizontal: 12),
@@ -2311,7 +2580,7 @@ class _CalendarSettingsDialogState extends State<_CalendarSettingsDialog> {
             child: TextButton(
               key: const Key('timetable-select-filtered'),
               onPressed: _selectFiltered,
-              style: TsButtons.filled(
+              style: _filledStyle(
                 radius: 7,
                 minimumSize: const Size(0, 28),
                 padding: const EdgeInsets.symmetric(horizontal: 10),
@@ -2330,7 +2599,7 @@ class _CalendarSettingsDialogState extends State<_CalendarSettingsDialog> {
                       setState(() {});
                     }
                   : null,
-              style: TsButtons.filled(
+              style: _filledStyle(
                 radius: 7,
                 minimumSize: const Size(0, 28),
                 padding: const EdgeInsets.symmetric(horizontal: 10),
@@ -2344,7 +2613,7 @@ class _CalendarSettingsDialogState extends State<_CalendarSettingsDialog> {
             child: FilledButton(
               key: const Key('timetable-bind-selection'),
               onPressed: _grid.hasSelection ? _openBindingPanel : null,
-              style: TsButtons.filled(
+              style: _filledStyle(
                 radius: 8,
                 minimumSize: const Size(0, 30),
                 padding: const EdgeInsets.symmetric(horizontal: 12),
@@ -2363,20 +2632,39 @@ class _CalendarSettingsDialogState extends State<_CalendarSettingsDialog> {
   }
 
 
+  /// 本地按钮样式：TsButtons.filled + 显式应用字体（无系统字体的渲染环境也不出方块）。
+  ButtonStyle _filledStyle({
+    double radius = 7,
+    Size minimumSize = const Size(0, 30),
+    EdgeInsetsGeometry? padding,
+    double fontSize = 11,
+  }) {
+    return _appFontButton(
+      TsButtons.filled(
+        radius: radius,
+        minimumSize: minimumSize,
+        padding: padding ?? const EdgeInsets.symmetric(horizontal: 10),
+        fontSize: fontSize,
+      ),
+      fontSize,
+    );
+  }
+
   Widget _smallToolButton({
     required Key key,
     required String label,
     required IconData icon,
+    String? tooltip,
     required VoidCallback? onTap,
   }) {
-    return SizedBox(
+    final button = SizedBox(
       height: 30,
       child: TextButton.icon(
         key: key,
         onPressed: onTap,
         icon: Icon(icon, size: 15),
         label: Text(label),
-        style: TsButtons.filled(
+        style: _filledStyle(
           radius: 7,
           minimumSize: const Size(0, 30),
           padding: const EdgeInsets.symmetric(horizontal: 10),
@@ -2384,6 +2672,9 @@ class _CalendarSettingsDialogState extends State<_CalendarSettingsDialog> {
         ),
       ),
     );
+    // 收纳/禁用都不丢提示：禁用时 Tooltip 仍显示为什么不可用。
+    if (tooltip == null) return button;
+    return Tooltip(message: tooltip, child: button);
   }
 
   void _clearWeek() {
@@ -2498,7 +2789,7 @@ class _CalendarSettingsDialogState extends State<_CalendarSettingsDialog> {
             height: 30,
             child: TextButton(
               onPressed: () => _applyPreset(preset.$1, preset.$2),
-              style: TsButtons.filled(
+              style: _filledStyle(
                 radius: 7,
                 minimumSize: const Size(0, 30),
                 padding: const EdgeInsets.symmetric(horizontal: 10),
@@ -2537,7 +2828,7 @@ class _CalendarSettingsDialogState extends State<_CalendarSettingsDialog> {
         height: 32,
         child: FilledButton(
           onPressed: () => setState(() => row.closed = !row.closed),
-          style: TsButtons.filled(
+          style: _filledStyle(
             radius: 7,
             minimumSize: const Size(0, 32),
             padding: const EdgeInsets.symmetric(horizontal: 12),
@@ -2901,7 +3192,7 @@ class _CalendarSettingsDialogState extends State<_CalendarSettingsDialog> {
     // emphasis differs. `minimumSize` alone is not enough — the visual box is forced by
     // the SizedBox so a longer label cannot make its neighbour shorter.
     final style = filled
-        ? TsButtons.filled(
+        ? _filledStyle(
             radius: _actionRadius,
             minimumSize: const Size(0, _actionHeight),
             padding: const EdgeInsets.symmetric(horizontal: 16),
@@ -2921,7 +3212,10 @@ class _CalendarSettingsDialogState extends State<_CalendarSettingsDialog> {
                 EdgeInsets.symmetric(horizontal: 16)),
             minimumSize: const WidgetStatePropertyAll(Size(0, _actionHeight)),
             textStyle: const WidgetStatePropertyAll(
-                TextStyle(fontSize: _actionFontSize)),
+                TextStyle(
+                    fontFamily: kUiFontFamily,
+                    fontFamilyFallback: kUiFontFallback,
+                    fontSize: _actionFontSize)),
             tapTargetSize: MaterialTapTargetSize.shrinkWrap,
           );
     return SizedBox(
@@ -2951,7 +3245,7 @@ class _CalendarSettingsDialogState extends State<_CalendarSettingsDialog> {
         child: FilledButton.icon(
           key: key,
           onPressed: onTap,
-          style: TsButtons.filled(
+          style: _filledStyle(
             radius: 8,
             minimumSize: const Size(0, 32),
             padding: const EdgeInsets.symmetric(horizontal: 12),
@@ -2974,7 +3268,7 @@ class _CalendarSettingsDialogState extends State<_CalendarSettingsDialog> {
       child: TextButton(
         key: key,
         onPressed: onTap,
-        style: TsButtons.filled(
+        style: _filledStyle(
           radius: 7,
           minimumSize: const Size(0, 28),
           padding: const EdgeInsets.symmetric(horizontal: 10),

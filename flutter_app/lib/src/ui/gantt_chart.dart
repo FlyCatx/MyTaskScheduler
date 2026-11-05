@@ -70,58 +70,74 @@ class _GanttPanelState extends State<GanttPanel> {
     widget.onModeChanged(mode);
   }
 
+  void _onModeSelected(String mode) {
+    if (mode == _mode) return;
+    _setMode(mode);
+  }
+
   @override
   Widget build(BuildContext context) {
     final calendar = _mode == 'calendar';
+    // 0.3.0：模式选择器不再单独占一行（图 6 红框的空行）。日历模式下它被并入日历
+    // 工具带（CalendarGanttView 的 _toolbar，排在日/周之前），相对工时模式才在
+    // 图表上方保留一小行“模式选择 + 返回日历”，因为该视图没有日/周/自动安排。
+    if (calendar) {
+      return CalendarGanttView(
+        snapshot: widget.snapshot,
+        version: widget.version,
+        schedule: widget.calendar,
+        interaction: widget.interaction,
+        actions: widget.actions,
+        clock: widget.clock,
+        proposalSource: widget.proposalSource,
+        onModeSelected: _onModeSelected,
+      );
+    }
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        Padding(
-          padding: const EdgeInsets.only(bottom: 6),
-          child: Row(
-            children: [
-              Text(
-                calendar ? '日历视图' : '甘特视图',
-                style: TextStyle(
-                    fontSize: 11.5,
-                    fontWeight: FontWeight.w600,
-                    color: TsColors.textSecondary),
-              ),
-              const SizedBox(width: 8),
-              BezierSegments(
-                key: const Key('gantt-submode'),
-                height: 26,
-                itemWidth: 84,
-                items: const [
-                  BezierSegmentItem('日历排程',
-                      icon: Icons.calendar_month_outlined),
-                  BezierSegmentItem('相对工时',
-                      icon: Icons.straighten_outlined),
-                ],
-                selected: calendar ? 0 : 1,
-                onChanged: (i) => _setMode(i == 0 ? 'calendar' : 'relative'),
-              ),
-              const SizedBox(width: 10),
-            ],
+        _relativeModeBar(),
+        Expanded(
+          child: GanttChartView(
+            snapshot: widget.snapshot,
+            interaction: widget.interaction,
           ),
         ),
-        Expanded(
-          child: calendar
-              ? CalendarGanttView(
-                  snapshot: widget.snapshot,
-                  version: widget.version,
-                  schedule: widget.calendar,
-                  interaction: widget.interaction,
-                  actions: widget.actions,
-                  clock: widget.clock,
-                  proposalSource: widget.proposalSource,
-                )
-              : GanttChartView(
-                  snapshot: widget.snapshot,
-                  interaction: widget.interaction,
-                ),
-        ),
       ],
+    );
+  }
+
+  /// 相对工时视图顶部的薄工具行：模式选择 + 返回日历 + 必要说明。
+  ///
+  /// 仅日历有效的操作（日/周、可用时间、自动安排、重排全部）不在这里出现；
+  /// 用户仍可点“日历排程”或“返回日历”切回日历视图，模式照旧经
+  /// [GanttPanel.onModeChanged] 写回 `setGanttMode`。
+  Widget _relativeModeBar() {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 6),
+      child: Wrap(
+        spacing: 6,
+        runSpacing: 6,
+        crossAxisAlignment: WrapCrossAlignment.center,
+        children: [
+          GanttModeSegments(
+            calendar: false,
+            height: 30,
+            onChanged: _onModeSelected,
+          ),
+          TextButton.icon(
+            key: const Key('gantt-back-to-calendar'),
+            style: TsButtons.inline(fontSize: 11.5),
+            onPressed: () => _setMode('calendar'),
+            icon: const Icon(Icons.calendar_month_outlined, size: 14),
+            label: const Text('返回日历'),
+          ),
+          Text(
+            '相对工时不使用日历时间轴，日/周与自动安排只在日历视图可用。',
+            style: TextStyle(fontSize: 11, color: TsColors.textFaint),
+          ),
+        ],
+      ),
     );
   }
 }
@@ -648,4 +664,3 @@ class _Banner extends StatelessWidget {
     );
   }
 }
-

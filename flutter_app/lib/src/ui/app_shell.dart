@@ -31,6 +31,8 @@ import 'desktop_window.dart';
 import 'execution/effort_review_dialog.dart';
 import 'execution/execution_actions.dart';
 import 'execution/execution_status_strip.dart';
+import './widgets/app_notice.dart';
+import './widgets/attachment_notice.dart' as attachment_notice;
 import './widgets/bezier_ui.dart';
 import './widgets/bezier_menu.dart';
 import 'dag_graph.dart';
@@ -155,6 +157,20 @@ class _AppShellState extends State<AppShell> {
   /// 关闭流程去重：保存进行中再次点击关闭不会启动第二份流程。
   bool _closing = false;
 
+  // ------------------------------------------------ 应用级通知宿主（0.3.0 R4-B）
+
+  /// 底部输入带（含账号入口）：通知宿主按它实测的高度上移，保证不盖住账号入口。
+  final GlobalKey _bottomBandKey = GlobalKey(debugLabel: 'shell-bottom-band');
+  bool _anchorSyncScheduled = false;
+
+  /// 已被临时通知覆盖的状态条文案：同一事件不再同时出“顶部状态条 + 左下通知”。
+  String? _suppressedStatus;
+  String? _suppressedError;
+
+  /// 最近一次投递到通知宿主的附件反馈（按对象身份去重，避免每次重建重复投递）。
+  Object? _lastAttachmentFeedback;
+  String? _noticeConversationId;
+
   AppController get c => widget.controller;
   SettingsController get s => widget.settings;
 
@@ -167,6 +183,16 @@ class _AppShellState extends State<AppShell> {
     // AppController's own notifier chain — the shell must listen to it separately or
     // the detail card would never appear.
     c.interaction.addListener(_onControllerChanged);
+    // 0.3.0（R4-B）：通知宿主是全局单例（挂在 bootstrap 的 MaterialApp.builder，
+    // 位于 Navigator 之上）。新的 Shell 接管时清掉上一实例的残留并清掉旧计时器；
+    // 控制器里若已有附件反馈（例如窗口重建），按同一宿主补投一次。
+    AppNotices.instance.addListener(_onNoticesChanged);
+    _noticeConversationId = c.conversation?.id;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      AppNotices.instance.reset();
+      _syncAttachmentNotice();
+    });
     _rootFocus.requestFocus();
     // On the real Windows embedder the focus node is not attached during initState,
     // so the call above is a no-op; ask again after the first frame so the global
@@ -268,6 +294,11 @@ class _AppShellState extends State<AppShell> {
     c.removeListener(_onControllerChanged);
     s.removeListener(_onSettingsChanged);
     c.interaction.removeListener(_onControllerChanged);
+    AppNotices.instance.removeListener(_onNoticesChanged);
+    // 同步取消未完成的自动关闭计时器并丢弃仍引用本 State 的撤销回调；
+    // 不 notify——树正在销毁，避免在卸载阶段触发祖先重建。
+    AppNotices.instance.resetSilently();
+    _lastAttachmentFeedback = null;
     _draft.dispose();
     _notificationPoll?.cancel();
     _window.onCloseRequested = null;
@@ -284,7 +315,79 @@ class _AppShellState extends State<AppShell> {
       _notifyRunFinished();
     }
     _previousRun = run;
+    _handleConversationBoundNotices();
+    _syncAttachmentNotice();
     setState(() {});
+  }
+
+  /// 会话切换：清掉属于旧会话的通知（旧“撤销/导出”等动作不得作用到新会话）。
+  void _handleConversationBoundNotices() {
+    final id = c.conversation?.id;
+    if (id == _noticeConversationId) return;
+    final old = _noticeConversationId;
+    _noticeConversationId = id;
+    AppNotices.instance.dismissConversation(old);
+  }
+
+  /// 附件反馈：控制器是唯一数据源，宿主只展示一份（不再分侧栏/抽屉/工作区）。
+  void _syncAttachmentNotice() {
+    final feedback = c.attachmentFeedback;
+    if (feedback == null) {
+      _lastAttachmentFeedback = null;
+      AppNotices.instance.dismissAttachment();
+      return;
+    }
+    if (identical(feedback, _lastAttachmentFeedback)) return;
+    _lastAttachmentFeedback = feedback;
+    AppNotices.instance.showAttachment(
+      feedback: _noticeData(feedback),
+      onDismiss: c.dismissAttachmentFeedback,
+      onShowDetails: () => _showAttachmentFeedbackDetails(feedback),
+    );
+  }
+
+  /// 通知/状态条双回执抑制：同一事件已进入左下通知后，从顶部状态条移除。
+  void _onNoticesChanged() {
+    if (!mounted) return;
+    final status = c.statusMessage;
+    final error = c.errorMessage;
+    var changed = false;
+    if (status != null &&
+        status != _suppressedStatus &&
+        AppNotices.instance.isShowingMessage(status)) {
+      _suppressedStatus = status;
+      changed = true;
+    }
+    if (error != null &&
+        error != _suppressedError &&
+        AppNotices.instance.isShowingMessage(error)) {
+      _suppressedError = error;
+      changed = true;
+    }
+    if (changed) setState(() {});
+  }
+
+  /// 传给 StatusStrip 的已过滤文案：同一事件已经出现在左下通知里就不再重复。
+  String? _visibleStatusMessage() {
+    final message = c.statusMessage;
+    if (message == null) {
+      _suppressedStatus = null;
+      return null;
+    }
+    if (message == _suppressedStatus) return null;
+    _suppressedStatus = null;
+    return message;
+  }
+
+  String? _visibleErrorMessage() {
+    final message = c.errorMessage;
+    if (message == null) {
+      _suppressedError = null;
+      return null;
+    }
+    if (message == _suppressedError) return null;
+    _suppressedError = null;
+    return message;
   }
 
   void _onSettingsChanged() {
@@ -458,6 +561,9 @@ class _AppShellState extends State<AppShell> {
 
   /// In-app completion/failure notice. The 120-second reminder is a *request control*
   /// and deliberately not affected by these preferences.
+  ///
+  /// 0.3.0（R4-B）：分析结束统一进左下通知宿主；成功/失败开关与系统通知偏好保持。
+  /// 成功时顶部状态条的同一条回执被抑制（避免“两张通知”）。
   void _notifyRunFinished() {
     final prefs = s.prefs;
     final status = c.statusMessage ?? '';
@@ -467,9 +573,6 @@ class _AppShellState extends State<AppShell> {
     if (succeeded && !prefs.notifyOnSuccess) return;
     if (!succeeded && error == null) return;
     if (!succeeded && !prefs.notifyOnFailure) return;
-    final message = succeeded
-        ? '分析完成：已生成新版本'
-        : '分析失败：${_short(error ?? status)}';
     final conversationId = c.conversation?.id;
     var systemNoticeFailed = false;
     if (prefs.notifySystem && conversationId != null) {
@@ -478,7 +581,7 @@ class _AppShellState extends State<AppShell> {
         final title = succeeded ? 'TaskScheduler · 分析完成' : 'TaskScheduler · 分析失败';
         final body = succeeded
             ? '${c.conversation?.listTitle ?? '会话'}：已生成新版本'
-            : '${c.conversation?.listTitle ?? '会话'}：$message';
+            : '${c.conversation?.listTitle ?? '会话'}：${_short(error ?? status)}';
         final sent = gw?.showSystemNotification(title, body) ?? false;
         if (sent) {
           _notifiedConversationId = conversationId;
@@ -489,19 +592,25 @@ class _AppShellState extends State<AppShell> {
         systemNoticeFailed = true;
       }
     }
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text(
-            systemNoticeFailed ? '$message（系统通知不可用，已仅显示应用内提醒）' : message,
-            maxLines: 3,
-          ),
-          behavior: SnackBarBehavior.floating,
-          duration: const Duration(seconds: 4),
-        ),
-      );
-    });
+    final headline = succeeded ? '分析完成：已生成新版本' : '分析失败';
+    _showNotice(
+      kind: succeeded ? AppNoticeKind.success : AppNoticeKind.error,
+      message: systemNoticeFailed
+          ? '$headline（系统通知不可用，已仅显示应用内提醒）'
+          : headline,
+      details: succeeded
+          ? const <String>[]
+          : <String>[
+              _short(error ?? status),
+              '原有计划与标题保持不变；按提示修正后可重试。',
+            ],
+      // 失败要读完原因，保留到手动关闭；成功短时后自动消失。
+      autoDismiss: succeeded ? const Duration(seconds: 5) : null,
+      dedupeKey: 'analysis-finished',
+      conversationScoped: true,
+      suppressStatusText: c.statusMessage,
+      suppressErrorText: succeeded ? null : c.errorMessage,
+    );
   }
 
   static String _short(String text) =>
@@ -524,7 +633,8 @@ class _AppShellState extends State<AppShell> {
       for (final n in version?.reviewNotes ?? const []) n.taskId: n.text,
     };
 
-    return Shortcuts(
+    _scheduleBottomAnchorSync();
+    return _maybeHostNotices(Shortcuts(
       shortcuts: _buildShortcuts(),
       child: Actions(
         actions: <Type, Action<Intent>>{
@@ -715,9 +825,17 @@ class _AppShellState extends State<AppShell> {
                               excluding: !residentSidebar,
                               child: ExcludeSemantics(
                                 excluding: !residentSidebar,
-                                child: _sidebarList(
-                                  searchFocusNode:
-                                      residentSidebar ? _searchFocus : null,
+                                child: Column(
+                                  crossAxisAlignment:
+                                      CrossAxisAlignment.stretch,
+                                  children: [
+                                    Expanded(
+                                      child: _sidebarList(
+                                        searchFocusNode:
+                                            residentSidebar ? _searchFocus : null,
+                                      ),
+                                    ),
+                                  ],
                                 ),
                               ),
                             ),
@@ -730,8 +848,9 @@ class _AppShellState extends State<AppShell> {
                                 // Location fallbacks are silent now; only the
                                 // "nothing writable" case is a real warning.
                                 storageNotice: c.storageNotice,
-                                errorMessage: c.errorMessage,
-                                statusMessage: c.statusMessage,
+                                // 已经被左下临时通知覆盖的同一条回执不再在顶部重复。
+                                errorMessage: _visibleErrorMessage(),
+                                statusMessage: _visibleStatusMessage(),
                                 onDismissError: c.clearMessages,
                               ),
                               // 0.2.3（R3-E）：常驻执行计时状态区。切会话/切视图都
@@ -764,6 +883,7 @@ class _AppShellState extends State<AppShell> {
                    * Without it, a Row inside a Column receives unbounded height.
                    */
                   IntrinsicHeight(
+                    key: _bottomBandKey,
                     child: Row(
                       crossAxisAlignment: CrossAxisAlignment.stretch,
                       children: [
@@ -791,7 +911,11 @@ class _AppShellState extends State<AppShell> {
                                   ((_draft.text.trim().isNotEmpty) ||
                                       (conv?.attachments.isNotEmpty ?? false) ||
                                       c.hasRequestTimetable),
-                              onSend: () => c.startAnalysis(),
+                              onSend: _handleSend,
+                              materialNotice: c.materialExceedsSingleRequest
+                                  ? '材料约 ${c.materialUtf8Bytes} 字节，超过单次请求上限 '
+                                      '${c.singleRequestInputBytes} 字节；点击发送将进入「分块分析」'
+                                  : null,
                               onAddFile: _addFile,
                               onRemoveAttachment: (id) => c.removeAttachment(id),
                               onDraftChanged: (text) => c.updateDraft(text),
@@ -832,7 +956,32 @@ class _AppShellState extends State<AppShell> {
           ),
         ),
       ),
+    ));
+  }
+
+  /// 生产环境由 bootstrap 在 MaterialApp.builder 挂载通知宿主（Navigator 之上）；
+  /// 只有独立嵌入/组件测试（没有 [AppNoticeMountScope]）时才在页面内挂一份兜底，
+  /// 保证通知仍可见且只渲染一次。
+  Widget _maybeHostNotices(Widget shell) {
+    if (AppNoticeMountScope.isMounted(context)) return shell;
+    return AppNoticeHost(
+      controller: AppNotices.instance,
+      child: shell,
     );
+  }
+
+  /// 通知锚点：底部输入带（含账号入口）实测高度 + 间距 = 宿主距窗口底边的距离。
+  /// 只在布局结束后量一次，缩放窗口/换字号时随 build 重新测量，不依赖固定像素。
+  void _scheduleBottomAnchorSync() {
+    if (_anchorSyncScheduled) return;
+    _anchorSyncScheduled = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _anchorSyncScheduled = false;
+      if (!mounted) return;
+      final object = _bottomBandKey.currentContext?.findRenderObject();
+      if (object is! RenderBox || !object.hasSize) return;
+      AppNotices.instance.setBottomInset(object.size.height + 12);
+    });
   }
 
   // ------------------------------------------------------------- middle
@@ -1107,11 +1256,12 @@ class _AppShellState extends State<AppShell> {
     );
     if (!mounted) return;
     if (!ok) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text(c.errorMessage ?? '本次编辑未通过校验，已保留原计划'),
-          behavior: SnackBarBehavior.floating,
-        ),
+      _showNotice(
+        kind: AppNoticeKind.error,
+        message: c.errorMessage ?? '本次编辑未通过校验，已保留原计划',
+        autoDismiss: null,
+        conversationScoped: true,
+        suppressErrorText: c.errorMessage,
       );
     } else {
       _offerUndo();
@@ -1123,21 +1273,31 @@ class _AppShellState extends State<AppShell> {
     if (ok && mounted) _offerUndo();
   }
 
+  /// 可撤销操作的通知（保留原来的撤销有效期/回调，迁移到左下宿主）。
+  ///
+  /// 执行前校验：仍停在同一会话，且撤销栈顶部仍是发出通知时的那次操作；切会话或
+  /// 又做了别的修改后旧动作不会落到新状态上。
   void _offerUndo() {
     if (!c.canUndo) return;
-    final messenger = ScaffoldMessenger.of(context);
-    messenger.hideCurrentSnackBar();
-    messenger.showSnackBar(SnackBar(
-      content: Text(c.undoLabel ?? '已修改'),
-      behavior: SnackBarBehavior.floating,
-      action: SnackBarAction(
-        label: '撤销',
-        onPressed: () async {
-          await c.undoLast();
-          if (mounted) _showSnack(c.statusMessage ?? '已撤销');
-        },
-      ),
-    ));
+    final conversationId = c.conversation?.id;
+    final expectedLabel = c.undoLabel;
+    _showNotice(
+      kind: AppNoticeKind.info,
+      message: expectedLabel ?? '已修改',
+      actionLabel: '撤销',
+      actionValidFor: const Duration(seconds: 4),
+      autoDismiss: const Duration(seconds: 4),
+      dedupeKey: 'undo',
+      conversationScoped: true,
+      suppressStatusText: c.statusMessage,
+      onAction: () async {
+        if (!mounted) return;
+        if (c.conversation?.id != conversationId) return;
+        if (c.undoLabel != expectedLabel) return;
+        await c.undoLast();
+        if (mounted) _showSnack(c.statusMessage ?? '已撤销');
+      },
+    );
   }
 
   Future<void> _cycleCondition(
@@ -1150,11 +1310,12 @@ class _AppShellState extends State<AppShell> {
     final next = order[(order.indexOf(current) + 1) % order.length];
     final ok = await c.setPreconditionStatus(view.id, index, next);
     if (!mounted || ok) return;
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text(c.errorMessage ?? '条件状态更新未通过校验'),
-        behavior: SnackBarBehavior.floating,
-      ),
+    _showNotice(
+      kind: AppNoticeKind.error,
+      message: c.errorMessage ?? '条件状态更新未通过校验',
+      autoDismiss: null,
+      conversationScoped: true,
+      suppressErrorText: c.errorMessage,
     );
   }
 
@@ -1497,21 +1658,51 @@ class _AppShellState extends State<AppShell> {
     if (path == null || path.isEmpty) return false;
     final error = await c.writeEffortCsv(path: path, csv: csv);
     if (!mounted) return error == null;
-    _showSnack(error ?? '已导出$name 到 $path');
+    // 控制器同时会把“已导出回顾 CSV：...”写进状态条；这里只保留左下通知一份。
+    _showNotice(
+      kind: error == null ? AppNoticeKind.success : AppNoticeKind.error,
+      message: error ?? '已导出$name 到 $path',
+      autoDismiss: error == null ? const Duration(seconds: 5) : null,
+      suppressStatusText:
+          (c.statusMessage ?? '').startsWith('已导出回顾 CSV') ? c.statusMessage : null,
+    );
     return error == null;
+  }
+
+  /// 发送入口：材料超单次请求预算时不硬发，改为分块分析确认入口。
+  Future<void> _handleSend() async {
+    if (!c.materialExceedsSingleRequest) {
+      await c.startAnalysis();
+      return;
+    }
+    final estimate = c.describeChunkedAnalysis();
+    if (estimate == null) {
+      _showSnack('材料超过单次请求上限，且当前无法建立分块作业；请减少材料后再发送');
+      return;
+    }
+    await ChunkedAnalysisDialog.show(context, controller: c, estimate: estimate);
   }
 
   Future<void> _addFile() async {
     final gw = c.gateway;
     if (gw == null) {
-      _showSnack('原生桥接不可用，无法打开文件对话框');
+      // 提示词 02：附件类反馈走侧栏通知区，不再用底部浮动 SnackBar。
+      c.reportAttachmentFeedback(
+        added: 0,
+        failed: 0,
+        note: '无法打开文件对话框：原生桥接不可用',
+      );
       return;
     }
     List<String> paths;
     try {
       paths = await gw.pickTextFiles();
     } catch (e) {
-      _showSnack('打开文件对话框失败：$e');
+      c.reportAttachmentFeedback(
+        added: 0,
+        failed: 0,
+        note: '打开文件对话框失败：$e',
+      );
       return;
     }
     if (paths.isEmpty) return; // user cancelled
@@ -1552,13 +1743,153 @@ class _AppShellState extends State<AppShell> {
       failures.add('$name：${c.errorMessage ?? '无法添加'}');
     }
     if (!mounted) return;
-    if (failures.isEmpty) {
-      if (added > 1) _showSnack('已添加 $added 个文件');
-      return;
+    // 超单次请求预算时给出可执行说明（材料已保留，不会截断），由侧栏通知展示。
+    final exceeds = added > 0 && c.materialExceedsSingleRequest;
+    c.reportAttachmentFeedback(
+      added: added,
+      failed: failures.length,
+      failures: failures,
+      note: exceeds
+          ? '材料文本约 ${c.materialUtf8Bytes} 字节，超过单次请求上限 '
+              '${c.singleRequestInputBytes} 字节；发送时请使用「分块分析」。'
+          : null,
+    );
+  }
+
+  /// 应用级临时通知（0.3.0 R4-B）：所有原来的 SnackBar/附件三处渲染都收敛到这里。
+  ///
+  /// * 会话归属：`conversationScoped` 时记录当前会话，切会话/窗口重建后旧动作不会
+  ///   作用到新会话；执行动作前再次核对会话仍是当次会话。
+  /// * 双回执：投递后若顶部状态条/错误横幅是同一条文案，就把它从 StatusStrip 移除。
+  void _showNotice({
+    required AppNoticeKind kind,
+    required String message,
+    List<String> details = const <String>[],
+    String? actionLabel,
+    VoidCallback? onAction,
+    Duration? actionValidFor,
+    Duration? autoDismiss,
+    String? dedupeKey,
+    bool conversationScoped = false,
+    String? suppressStatusText,
+    String? suppressErrorText,
+  }) {
+    final text = message.trim();
+    if (text.isEmpty) return;
+    final convId = c.conversation?.id;
+    VoidCallback? wrappedAction;
+    if (onAction != null) {
+      wrappedAction = () {
+        if (!mounted) return;
+        if (conversationScoped && c.conversation?.id != convId) return;
+        onAction();
+      };
     }
-    _showSnack(failures.length == 1 && added == 0
-        ? failures.single
-        : '已添加 $added 个，${failures.length} 个失败：${failures.join('；')}');
+    AppNotices.instance.show(
+      kind: kind,
+      message: text,
+      details: details,
+      actionLabel: actionLabel,
+      onAction: wrappedAction,
+      actionValidFor: actionValidFor,
+      autoDismiss: autoDismiss,
+      dedupeKey: dedupeKey,
+      conversationId: conversationScoped ? convId : null,
+    );
+    if (suppressStatusText != null && c.statusMessage == suppressStatusText) {
+      _suppressedStatus = suppressStatusText;
+    }
+    if (suppressErrorText != null && c.errorMessage == suppressErrorText) {
+      _suppressedError = suppressErrorText;
+    }
+  }
+
+  /// 旧 `_showSnack` 的语义迁移：按文案判断种类，失败保留到用户关闭。
+  void _showSnack(String message) {
+    if (!mounted) return;
+    final kind = _inferNoticeKind(message);
+    _showNotice(
+      kind: kind,
+      message: message,
+      autoDismiss: kind == AppNoticeKind.error || kind == AppNoticeKind.warning
+          ? null
+          : const Duration(seconds: 4),
+    );
+  }
+
+  static AppNoticeKind _inferNoticeKind(String message) {
+    if (message.contains('失败') ||
+        message.contains('未能') ||
+        message.contains('无法') ||
+        message.contains('错误') ||
+        message.contains('未通过')) {
+      return AppNoticeKind.error;
+    }
+    if (message.contains('不能') ||
+        message.contains('不可用') ||
+        message.contains('未启用') ||
+        message.contains('没有')) {
+      return AppNoticeKind.warning;
+    }
+    if (message.startsWith('已') || message.contains('成功')) {
+      return AppNoticeKind.success;
+    }
+    return AppNoticeKind.info;
+  }
+
+  attachment_notice.AttachmentFeedback _noticeData(AttachmentFeedback feedback) {
+    return attachment_notice.AttachmentFeedback(
+      conversationId: feedback.conversationId,
+      at: feedback.at,
+      added: feedback.added,
+      failed: feedback.failed,
+      failures: feedback.failures,
+      note: feedback.note,
+    );
+  }
+
+  /// 打开附件反馈详情（侧栏通知区的“查看全部”入口）。
+  Future<void> _showAttachmentFeedbackDetails(AttachmentFeedback feedback) {
+    final lines = <String>[
+      ...feedback.failures,
+      if (feedback.note != null) feedback.note!,
+    ];
+    return showDialog<void>(
+      context: context,
+      builder: (context) => AlertDialog(
+        backgroundColor: TsColors.surface,
+        shape: const BezierRoundedRectangleBorder(radius: 14),
+        title: const Text('文件导入结果', style: TextStyle(fontSize: 15)),
+        content: SizedBox(
+          width: 560,
+          child: SingleChildScrollView(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(feedback.summary,
+                    style: const TextStyle(
+                        fontSize: 12.5, fontWeight: FontWeight.w600)),
+                const SizedBox(height: 8),
+                for (final line in lines)
+                  Padding(
+                    padding: const EdgeInsets.only(bottom: 6),
+                    child: Text('· $line',
+                        style: TextStyle(
+                            fontSize: 12, height: 1.45, color: TsColors.textSecondary)),
+                  ),
+              ],
+            ),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(),
+            child: const Text('关闭'),
+          ),
+        ],
+      ),
+    );
   }
 
   // --------------------------------------------------- conversation actions
@@ -1758,7 +2089,18 @@ class _AppShellState extends State<AppShell> {
         await c.permanentlyDelete(id);
     }
     if (!mounted) return;
-    _showSnack(c.statusMessage ?? c.errorMessage ?? '完成');
+    final message = c.statusMessage ?? c.errorMessage ?? '完成';
+    final kind = _inferNoticeKind(message);
+    _showNotice(
+      kind: kind,
+      message: message,
+      autoDismiss: kind == AppNoticeKind.error || kind == AppNoticeKind.warning
+          ? null
+          : const Duration(seconds: 4),
+      conversationScoped: true,
+      suppressStatusText: c.statusMessage,
+      suppressErrorText: c.errorMessage,
+    );
     _rootFocus.requestFocus();
   }
 
@@ -1833,7 +2175,14 @@ class _AppShellState extends State<AppShell> {
     );
     if (value == null) return;
     await c.renameConversation(summary.id, value);
-    if (mounted) _showSnack(c.statusMessage ?? '已更新标题');
+    if (!mounted) return;
+    _showNotice(
+      kind: AppNoticeKind.success,
+      message: c.statusMessage ?? '已更新标题',
+      autoDismiss: const Duration(seconds: 4),
+      conversationScoped: true,
+      suppressStatusText: c.statusMessage,
+    );
   }
 
   Future<void> _exportConversation(ConversationSummary summary) async {
@@ -1989,13 +2338,6 @@ class _AppShellState extends State<AppShell> {
     _showSnack(error == null ? '已导出到 $path' : '导出失败：$error');
   }
 
-  void _showSnack(String message) {
-    if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text(message), behavior: SnackBarBehavior.floating),
-    );
-  }
-
   Future<void> _export({required bool diagnostics}) async {
     final controller = TextEditingController(
       text: diagnostics
@@ -2042,11 +2384,10 @@ class _AppShellState extends State<AppShell> {
         ? await c.exportDiagnostics(path)
         : await c.exportUserText(path);
     if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text(error == null ? '已导出到 $path' : '导出失败：$error'),
-        behavior: SnackBarBehavior.floating,
-      ),
+    _showNotice(
+      kind: error == null ? AppNoticeKind.success : AppNoticeKind.error,
+      message: error == null ? '已导出到 $path' : '导出失败：$error',
+      autoDismiss: error == null ? const Duration(seconds: 5) : null,
     );
   }
 

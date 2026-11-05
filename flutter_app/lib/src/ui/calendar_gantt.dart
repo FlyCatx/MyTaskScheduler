@@ -115,6 +115,13 @@ class CalendarGanttView extends StatefulWidget {
   /// calendar is read-only (history version) or in a test without a controller.
   final CalendarProposalSource? proposalSource;
 
+  /// 父级甘特面板的模式切换回调（'calendar' / 'relative'）。
+  ///
+  /// 为 null 表示本视图独立使用（测试、只读嵌入），工具带里不出现
+  /// “日历排程 / 相对工时”分段控件。非 null 时它固定排在工具带最前面，
+  /// 与 日/周/今天/可用时间/自动安排/重排全部 同处一行（宽度不足才整组换行）。
+  final ValueChanged<String>? onModeSelected;
+
   const CalendarGanttView({
     super.key,
     required this.snapshot,
@@ -124,6 +131,7 @@ class CalendarGanttView extends StatefulWidget {
     required this.actions,
     this.clock,
     this.proposalSource,
+    this.onModeSelected,
   });
 
   @override
@@ -141,17 +149,31 @@ class _CalendarGanttViewState extends State<CalendarGanttView> {
   final ScrollController _horizontal = ScrollController();
   final ScrollController _vertical = ScrollController();
   final GlobalKey _contentKey = GlobalKey();
+  final GlobalKey _timelineKey = GlobalKey();
   final FocusNode _dragFocus = FocusNode(debugLabel: 'calendar-drag');
   final Map<String, GlobalKey> _labels = {};
 
   CalendarScale _scale = CalendarScale.day;
+
+  /// 缩放倍数：1 = 默认刻度（日视图 48 px/小时，周视图 14 px/小时）。
   double _zoom = 1;
+
+  /// 缩放上下限与单步倍率。工具带里不再有“缩小/放大”文字按钮，改由视口
+  /// 右下角的百分比 + 加减控件驱动（见 [_zoomControls]）。
+  static const double minZoom = 0.5;
+  static const double maxZoom = 4.0;
+  static const double zoomStep = 1.25;
+
   double _hOffset = 0;
   DateTime? _now;
   Timer? _nowTimer;
   DateTime? _flashUntil;
   String? _flashSegmentId;
   Timer? _flashTimer;
+
+  /// 最近一次指针在图表视口内的全局位置。缩放时优先用它换算锚点时刻
+  /// （鼠标在哪儿就放大哪儿）；指针不在视口内时退回视口中心。
+  Offset? _hoverGlobal;
 
   _DragSession? _drag;
   Timer? _autoScroll;
@@ -311,6 +333,97 @@ class _CalendarGanttViewState extends State<CalendarGanttView> {
 
   GlobalKey _labelKey(String id) => _labels.putIfAbsent(id, () => GlobalKey());
 
+  // ------------------------------------------------------------------ zoom
+
+  /// 缩放锚点在时间轴视口内的局部 X（相对可见区域左边界）。
+  ///
+  /// 鼠标停在图表上时用鼠标位置，否则用视口中心——这样百分比变化时“指针下的
+  /// 那个时刻”保持不动，而不是每次都跳到别处。
+  double _zoomAnchorLocalX() {
+    if (!_horizontal.hasClients) return 0;
+    final viewport = _horizontal.position.viewportDimension;
+    final global = _hoverGlobal;
+    final box = _timelineKey.currentContext?.findRenderObject() as RenderBox?;
+    if (global != null && box != null && box.hasSize) {
+      final local = box.globalToLocal(global);
+      if (local.dx >= 0 &&
+          local.dx <= box.size.width &&
+          local.dy >= 0 &&
+          local.dy <= box.size.height) {
+        return local.dx.clamp(0.0, viewport);
+      }
+    }
+    return viewport / 2;
+  }
+
+  /// 以 [factor] 缩放每小时宽度，并把锚点时刻换算成新的滚动偏移。
+  ///
+  /// 只动日历自己的缩放值与 [_horizontal] 控制器：没有依赖图那样的二维矩阵，
+  /// 也不影响垂直滚动、拖拽预览或冲突检测。
+  void _applyZoom(double factor) {
+    final next = (_zoom * factor).clamp(minZoom, maxZoom).toDouble();
+    if ((next - _zoom).abs() < 1e-6) return;
+    final localX = _zoomAnchorLocalX();
+    final offset = _horizontal.hasClients ? _horizontal.offset : 0.0;
+    // 先用旧刻度记下锚点代表的时刻，再改 _zoom（_xFor/_instantFor 都读它）。
+    final anchorInstant = _instantFor(offset + localX);
+    setState(() => _zoom = next);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || !_horizontal.hasClients) return;
+      final target = (_xFor(anchorInstant) - localX).clamp(
+        0.0,
+        _horizontal.position.maxScrollExtent,
+      );
+      _horizontal.jumpTo(target.toDouble());
+      setState(() => _hOffset = _horizontal.offset);
+    });
+  }
+
+  /// 视口右下角的缩放控件：百分比 + −/+（外观参考依赖图的 Positioned 缩放条）。
+  ///
+  /// 放在 [_timelineKey] 视口内部，避开底部水平滚动条（预留了 10 px + 滚动条本身），
+  /// 冲突清单在图表下方、浮层由 Overlay 绘制，都不会被它挡住。只读历史版本也能缩放。
+  Widget _zoomControls() {
+    final percent = (_zoom * 100).round().clamp(50, 400);
+    final canZoomIn = _zoom < maxZoom - 1e-6;
+    final canZoomOut = _zoom > minZoom + 1e-6;
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Tooltip(
+          message: '缩放 $percent%：每小时 ${_pxPerHour.toStringAsFixed(0)} 像素',
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 5),
+            decoration: bezierDecoration(
+              color: TsColors.surface,
+              radius: 7,
+              border: Border.all(color: TsColors.border),
+            ),
+            child: Text(
+              '$percent%',
+              key: const Key('calendar-zoom-percent'),
+              style: TextStyle(fontSize: 11, color: TsColors.textSecondary),
+            ),
+          ),
+        ),
+        const SizedBox(width: 6),
+        _ZoomButton(
+          key: const Key('calendar-zoom-out'),
+          icon: Icons.remove,
+          tooltip: canZoomOut ? '缩小（−25%）' : '已到最小缩放 50%',
+          onTap: canZoomOut ? () => _applyZoom(1 / zoomStep) : null,
+        ),
+        const SizedBox(width: 6),
+        _ZoomButton(
+          key: const Key('calendar-zoom-in'),
+          icon: Icons.add,
+          tooltip: canZoomIn ? '放大（+25%）' : '已到最大缩放 400%',
+          onTap: canZoomIn ? () => _applyZoom(zoomStep) : null,
+        ),
+      ],
+    );
+  }
+
   /// Row height that fits both the lane stack and the two-line label at the current text
   /// scale (Windows text scaling goes up to 1.5x; a fixed height overflowed there).
   double _heightFor(_CalendarRow row) {
@@ -413,12 +526,25 @@ class _CalendarGanttViewState extends State<CalendarGanttView> {
           _toolbar(conflicts),
           if (_drag != null) _dragInfoBar(),
           Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.stretch,
+            // 缩放条浮在图表视口内（右下角），与依赖图的 Positioned(right:12,bottom:12)
+            // 同一观感；底部留 20 px 让开水平滚动条。
+            child: Stack(
               children: [
-                _axisHeader(),
-                const Divider(height: 1, thickness: 1),
-                Expanded(child: _body(rows, conflicts)),
+                Positioned.fill(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      _axisHeader(),
+                      const Divider(height: 1, thickness: 1),
+                      Expanded(child: _body(rows, conflicts)),
+                    ],
+                  ),
+                ),
+                Positioned(
+                  right: 12,
+                  bottom: 20,
+                  child: _zoomControls(),
+                ),
               ],
             ),
           ),
@@ -473,20 +599,28 @@ class _CalendarGanttViewState extends State<CalendarGanttView> {
 
   Widget _toolbar(List<CalendarConflict> conflicts) {
     final canEdit = widget.actions.canEdit;
+    final onModeSelected = widget.onModeSelected;
     // One compact height for the whole group (segments + every tool button), so the row
     // is a single line of equally tall controls instead of mixed 26/28 px boxes.
     const toolbarHeight = 30.0;
     return Padding(
       padding: const EdgeInsets.only(bottom: 6),
-      // Wrap, not a fixed Row: on a wide window the 日/周 segments and every tool button
-      // share one line; when the pane gets narrow the group wraps naturally instead of
-      // overflowing. The segments no longer claim a full line — see the widthFactor fix
-      // in BezierSegments.
+      // Wrap, not a fixed Row: 模式选择（日历排程/相对工时）固定排在最前，接着是
+      // 日/周、今天、可用时间、自动安排、重排全部；宽窗同处一行，窄窗整组换行。
+      // 这样父级就不必再单独保留一行模式选择器（0.3.0 去掉了那行空行）。
       child: Wrap(
         spacing: 6,
         runSpacing: 6,
         crossAxisAlignment: WrapCrossAlignment.center,
         children: [
+          if (onModeSelected != null) ...[
+            GanttModeSegments(
+              calendar: true,
+              height: toolbarHeight,
+              onChanged: onModeSelected,
+            ),
+            const SizedBox(width: 2),
+          ],
           BezierSegments(
             key: const Key('calendar-scale'),
             height: toolbarHeight,
@@ -506,18 +640,6 @@ class _CalendarGanttViewState extends State<CalendarGanttView> {
             icon: Icons.today_outlined,
             height: toolbarHeight,
             onTap: () => _scrollToFocus(),
-          ),
-          _ToolButton(
-            label: '缩小',
-            icon: Icons.zoom_out,
-            height: toolbarHeight,
-            onTap: () => setState(() => _zoom = (_zoom / 1.25).clamp(0.5, 4)),
-          ),
-          _ToolButton(
-            label: '放大',
-            icon: Icons.zoom_in,
-            height: toolbarHeight,
-            onTap: () => setState(() => _zoom = (_zoom * 1.25).clamp(0.5, 4)),
           ),
           _ToolButton(
             label: '可用时间',
@@ -685,45 +807,51 @@ class _CalendarGanttViewState extends State<CalendarGanttView> {
               ),
             ),
             Expanded(
-              // Blank-timeline pan: only a gesture that starts on empty canvas reaches
-              // this recognizer. A gesture that starts on a bar (or its resize edge)
-              // is claimed by the bar's own horizontal recognizer, which is deeper in
-              // the tree and wins the arena at pointer-down; ownership never switches
-              // mid-drag. Wheel / touchpad / vertical scrolling are untouched.
-              child: GestureDetector(
-                behavior: HitTestBehavior.opaque,
-                onHorizontalDragStart: (_) => _blankPan = true,
-                onHorizontalDragUpdate: (details) {
-                  if (!_blankPan || !_horizontal.hasClients) return;
-                  final c = _horizontal;
-                  // Drag content right → offset decreases; clamp at both ends so the
-                  // timeline does not jitter past its bounds.
-                  c.jumpTo((c.offset - details.delta.dx)
-                      .clamp(c.position.minScrollExtent, c.position.maxScrollExtent)
-                      .toDouble());
-                },
-                onHorizontalDragEnd: (_) => _blankPan = false,
-                onHorizontalDragCancel: () => _blankPan = false,
-                child: Scrollbar(
-                  controller: _horizontal,
-                  thumbVisibility: true,
-                  thickness: 9,
-                  radius: const Radius.circular(4),
-                  scrollbarOrientation: ScrollbarOrientation.bottom,
-                  child: SingleChildScrollView(
-                    scrollDirection: Axis.horizontal,
+              // 记录指针位置：缩放时用它换算锚点时刻（鼠标在哪儿就缩放哪儿）。
+              child: MouseRegion(
+                key: _timelineKey,
+                onHover: (event) => _hoverGlobal = event.position,
+                onExit: (_) => _hoverGlobal = null,
+                // Blank-timeline pan: only a gesture that starts on empty canvas reaches
+                // this recognizer. A gesture that starts on a bar (or its resize edge)
+                // is claimed by the bar's own horizontal recognizer, which is deeper in
+                // the tree and wins the arena at pointer-down; ownership never switches
+                // mid-drag. Wheel / touchpad / vertical scrolling are untouched.
+                child: GestureDetector(
+                  behavior: HitTestBehavior.opaque,
+                  onHorizontalDragStart: (_) => _blankPan = true,
+                  onHorizontalDragUpdate: (details) {
+                    if (!_blankPan || !_horizontal.hasClients) return;
+                    final c = _horizontal;
+                    // Drag content right → offset decreases; clamp at both ends so the
+                    // timeline does not jitter past its bounds.
+                    c.jumpTo((c.offset - details.delta.dx)
+                        .clamp(c.position.minScrollExtent, c.position.maxScrollExtent)
+                        .toDouble());
+                  },
+                  onHorizontalDragEnd: (_) => _blankPan = false,
+                  onHorizontalDragCancel: () => _blankPan = false,
+                  child: Scrollbar(
                     controller: _horizontal,
-                    // Reserve the strip the horizontal bar paints over, so it never
-                    // covers the last row of bars.
-                    padding: const EdgeInsets.only(bottom: 10),
-                    child: SizedBox(
-                      key: _contentKey,
-                      width: _timelineWidth,
-                      child: Column(
-                        children: [
-                          for (final row in rows)
-                            _timelineCell(row, conflicts),
-                        ],
+                    thumbVisibility: true,
+                    thickness: 9,
+                    radius: const Radius.circular(4),
+                    scrollbarOrientation: ScrollbarOrientation.bottom,
+                    child: SingleChildScrollView(
+                      scrollDirection: Axis.horizontal,
+                      controller: _horizontal,
+                      // Reserve the strip the horizontal bar paints over, so it never
+                      // covers the last row of bars.
+                      padding: const EdgeInsets.only(bottom: 10),
+                      child: SizedBox(
+                        key: _contentKey,
+                        width: _timelineWidth,
+                        child: Column(
+                          children: [
+                            for (final row in rows)
+                              _timelineCell(row, conflicts),
+                          ],
+                        ),
                       ),
                     ),
                   ),
@@ -1848,6 +1976,79 @@ class _BannerAction extends StatelessWidget {
           fontSize: 11.5,
         ),
         child: Text(label),
+      ),
+    );
+  }
+}
+
+/// “日历排程 / 相对工时”模式分段控件（0.3.0）。
+///
+/// 只负责回传 'calendar' / 'relative'；模式由父级 [GanttPanel] 持久化（setGanttMode），
+/// 本控件不读控制器。日历模式下它排在日历工具带最前面，相对工时模式下排在
+/// 相对工时视图顶部的小工具行里（与“返回日历”一起）。
+class GanttModeSegments extends StatelessWidget {
+  final bool calendar;
+  final ValueChanged<String> onChanged;
+  final double height;
+
+  const GanttModeSegments({
+    super.key,
+    required this.calendar,
+    required this.onChanged,
+    this.height = 30,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return BezierSegments(
+      key: const Key('gantt-submode'),
+      height: height,
+      itemWidth: 84,
+      items: const [
+        BezierSegmentItem('日历排程', icon: Icons.calendar_month_outlined),
+        BezierSegmentItem('相对工时', icon: Icons.straighten_outlined),
+      ],
+      selected: calendar ? 0 : 1,
+      onChanged: (index) => onChanged(index == 0 ? 'calendar' : 'relative'),
+    );
+  }
+}
+
+/// 视口内的方形缩放按钮（外观参考 dag_graph.dart 的 _ZoomButton：surface 底、
+/// 贝塞尔圆角、hover 高亮；到上下限时禁用但 Tooltip 仍说明原因）。
+class _ZoomButton extends StatelessWidget {
+  final IconData icon;
+  final String tooltip;
+  final VoidCallback? onTap;
+
+  const _ZoomButton({
+    super.key,
+    required this.icon,
+    required this.tooltip,
+    this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Tooltip(
+      message: tooltip,
+      child: Material(
+        color: TsColors.surface,
+        elevation: 1,
+        shape: const BezierRoundedRectangleBorder(radius: 8),
+        child: InkWell(
+          customBorder: const BezierRoundedRectangleBorder(radius: 8),
+          onTap: onTap,
+          child: SizedBox(
+            width: 30,
+            height: 30,
+            child: Icon(
+              icon,
+              size: 17,
+              color: onTap == null ? TsColors.textFaint : TsColors.textSecondary,
+            ),
+          ),
+        ),
       ),
     );
   }

@@ -296,6 +296,7 @@ class _ExternalCalendarImportDialogState
       insetPadding: const EdgeInsets.all(24),
       shape: const BezierRoundedRectangleBorder(radius: 16),
       child: SizedBox(
+        key: const Key('external-calendar-import-card'),
         width: width,
         height: height,
         child: Column(
@@ -309,8 +310,6 @@ class _ExternalCalendarImportDialogState
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.stretch,
                   children: [
-                    _intro(),
-                    const SizedBox(height: 8),
                     _fileRow(),
                     const SizedBox(height: 8),
                     _policyRow(),
@@ -384,8 +383,9 @@ class _ExternalCalendarImportDialogState
           const SizedBox(width: 8),
           Expanded(
             child: Text(
-              _existing == null ? '导入外部日历（本地 ICS，只读）' : '重新导入「${_existing!.name}」',
+              _existing == null ? '导入外部日历' : '重新导入「${_existing!.name}」',
               style: const TextStyle(fontSize: 15),
+              softWrap: true,
             ),
           ),
           IconButton(
@@ -397,15 +397,6 @@ class _ExternalCalendarImportDialogState
           ),
         ],
       ),
-    );
-  }
-
-  Widget _intro() {
-    return Text(
-      '外部日历只作为只读占用参与排程与模型请求，不会写入手工时间表；'
-      '事件标题与文件路径也不会进入模型请求。',
-      key: const Key('external-calendar-import-intro'),
-      style: TextStyle(fontSize: 11, height: 1.55, color: TsColors.textSecondary),
     );
   }
 
@@ -698,53 +689,39 @@ class _ExternalCalendarImportDialogState
       decoration: BoxDecoration(
         border: Border(top: BorderSide(color: TsColors.border)),
       ),
-      child: Row(
+      // 常驻模式说明已删除：合并/完整替换由主题分段控件表达。动作组显式右对齐；
+      // 窄窗时 Wrap 让分段控件整组换行，提交按钮保持 32 高 + 14 横内边距的热区。
+      child: Wrap(
+        alignment: WrapAlignment.end,
+        crossAxisAlignment: WrapCrossAlignment.center,
+        spacing: 8,
+        runSpacing: 6,
         children: [
-          Expanded(
-            child: Text(
-              _replaceMode && _existing != null
-                  ? '完整替换：新文件里没有的事件会被移除'
-                  : '合并导入：保留现有事件，按 UID 更新',
-              key: const Key('external-calendar-mode-note'),
-              style: TextStyle(fontSize: 10.5, color: TsColors.textFaint),
+          if (_existing != null)
+            BezierSegments(
+              key: const Key('external-calendar-mode-segments'),
+              items: const <BezierSegmentItem>[
+                BezierSegmentItem('合并'),
+                BezierSegmentItem('完整替换'),
+              ],
+              selected: _replaceMode ? 1 : 0,
+              itemKeys: const <Key?>[
+                Key('external-calendar-mode-merge'),
+                Key('external-calendar-mode-replace'),
+              ],
+              enabled: !_busy,
+              onChanged: (index) {
+                final replace = index == 1;
+                if (replace == _replaceMode) return;
+                setState(() => _replaceMode = replace);
+                _refreshPreview();
+              },
             ),
-          ),
-          if (_existing != null) ...[
-            _ModeChip(
-              key: const Key('external-calendar-mode-merge'),
-              label: '合并',
-              selected: !_replaceMode,
-              onTap: _busy
-                  ? null
-                  : () {
-                      if (_replaceMode) {
-                        setState(() => _replaceMode = false);
-                        _refreshPreview();
-                      }
-                    },
-            ),
-            const SizedBox(width: 6),
-            _ModeChip(
-              key: const Key('external-calendar-mode-replace'),
-              label: '完整替换',
-              selected: _replaceMode,
-              onTap: _busy
-                  ? null
-                  : () {
-                      if (!_replaceMode) {
-                        setState(() => _replaceMode = true);
-                        _refreshPreview();
-                      }
-                    },
-            ),
-            const SizedBox(width: 10),
-          ],
           TextButton(
             key: const Key('external-calendar-import-cancel'),
             onPressed: _busy ? null : () => Navigator.of(context).pop(false),
             child: const Text('取消'),
           ),
-          const SizedBox(width: 8),
           SizedBox(
             height: 32,
             child: FilledButton(
@@ -860,48 +837,6 @@ class _ExternalCalendarImportDialogState
   static String _short(Object error) {
     final text = error.toString().replaceAll('\n', ' ');
     return text.length > 180 ? '${text.substring(0, 180)}…' : text;
-  }
-}
-
-/// 底部模式切换小按钮（合并 / 完整替换）。
-class _ModeChip extends StatelessWidget {
-  const _ModeChip({
-    super.key,
-    required this.label,
-    required this.selected,
-    required this.onTap,
-  });
-
-  final String label;
-  final bool selected;
-  final VoidCallback? onTap;
-
-  @override
-  Widget build(BuildContext context) {
-    return SizedBox(
-      height: 28,
-      child: TextButton(
-        onPressed: onTap,
-        style: TsButtons.filled(
-          radius: 7,
-          minimumSize: const Size(0, 28),
-          padding: const EdgeInsets.symmetric(horizontal: 10),
-          fontSize: 11,
-        ).copyWith(
-          backgroundColor: WidgetStatePropertyAll<Color>(
-            selected ? TsColors.accentSoft : const Color(0x00000000),
-          ),
-        ),
-        child: Text(
-          label,
-          style: TextStyle(
-            fontSize: 11,
-            color: selected ? TsColors.accent : TsColors.textSecondary,
-            fontWeight: selected ? FontWeight.w600 : FontWeight.normal,
-          ),
-        ),
-      ),
-    );
   }
 }
 

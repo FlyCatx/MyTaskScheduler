@@ -80,6 +80,10 @@ class Composer extends StatefulWidget {
   final bool useCustomBindings;
   final KeyChord? sendChord;
 
+  /// 0.3.0（提示词 06）：材料超过单次请求上限时的常驻说明（含“用分块分析发送”
+  /// 的可执行提示）。null = 材料在预算内，不占空间。
+  final String? materialNotice;
+
   const Composer({
     super.key,
     required this.textController,
@@ -99,6 +103,7 @@ class Composer extends StatefulWidget {
     this.focusNode,
     this.useCustomBindings = false,
     this.sendChord,
+    this.materialNotice,
   });
 
   @override
@@ -140,6 +145,28 @@ class _ComposerState extends State<Composer> {
       children: [
         if (widget.attachments.isNotEmpty) _fileLinks(),
         if (widget.timetableSummary != null) _timetableChip(),
+        if (widget.materialNotice != null)
+          Padding(
+            padding: const EdgeInsets.only(bottom: 6),
+            child: Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Icon(Icons.info_outline,
+                    size: 13, color: TsColors.pending),
+                const SizedBox(width: 6),
+                Expanded(
+                  child: Text(
+                    widget.materialNotice!,
+                    key: const Key('composer-material-notice'),
+                    style: TextStyle(
+                        fontSize: 11.5,
+                        height: 1.35,
+                        color: TsColors.textSecondary),
+                  ),
+                ),
+              ],
+            ),
+          ),
         // Same TextField instance/position in both states; only constraints change.
         SendShortcut(
           controller: widget.textController,
