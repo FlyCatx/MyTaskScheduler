@@ -318,6 +318,14 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_window_geometry.c)
     endif()
 endif()
 
+# 整窗圆角外轮廓几何（三次贝塞尔采样，不需要窗口/GDI 设备）。
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_window_region.c)
+    add_executable(ts_test_window_region tests/test_window_region.c)
+    if(MSVC)
+        target_compile_options(ts_test_window_region PRIVATE /W4 /utf-8)
+    endif()
+endif()
+
 # JSON 导出（export_json.c）的运行期输出：真实 cJSON 构造 + 读回校验。
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_export_json.c)
     add_executable(ts_test_export_json tests/test_export_json.c)
@@ -419,6 +427,7 @@ set(TS_OFFLINE_TEST_TARGETS
     ts_test_probe
     ts_test_gui
     ts_test_window_geometry
+    ts_test_window_region
 )
 
 foreach(ts_test_name IN LISTS TS_OFFLINE_TEST_TARGETS)

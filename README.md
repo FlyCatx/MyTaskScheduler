@@ -4,7 +4,7 @@ TaskScheduler 是一款 Windows 桌面任务规划工具，可从文字和文档
 
 ## 当前源码版本
 
-0.2.3（Windows x64）。已发布的程序包见 [GitHub Releases](https://github.com/FlyCatx/MyTaskScheduler/releases)，各版本变化见 [更新日志](CHANGELOG.md)。
+0.3.0（Windows x64）。已发布的程序包见 [GitHub Releases](https://github.com/FlyCatx/MyTaskScheduler/releases)，各版本变化见 [更新日志](CHANGELOG.md)。
 
 ## 主要功能
 
@@ -32,7 +32,7 @@ TaskScheduler 是一款 Windows 桌面任务规划工具，可从文字和文档
 powershell -ExecutionPolicy Bypass -File scripts/build.ps1 -Test
 powershell -ExecutionPolicy Bypass -File scripts/build_ocr_host.ps1
 powershell -ExecutionPolicy Bypass -File scripts/build_flutter_app.ps1
-powershell -ExecutionPolicy Bypass -File scripts/make_flutter_release.ps1 -Version 0.2.3 -NoApiKey
+powershell -ExecutionPolicy Bypass -File scripts/make_flutter_release.ps1 -Version 0.3.0 -NoApiKey
 ```
 
 Flutter 应用通过 `ts_bridge.dll` 调用 C 内核。界面说明见 [Flutter README](flutter_app/README.md)。
