@@ -1,14 +1,6 @@
-// AppController — orchestration: conversations, versions, analysis lifecycle.
-//
-// Invariants enforced here (and covered by tests):
-//   * a draft can always be edited; the plan cannot be edited while this
-//     conversation has an analysis in flight (so the base revision cannot move
-//     underneath the request);
-//   * a failed / cancelled analysis never clears the old plan and never rewrites
-//     the old title;
-//   * a late result is verified against the request ticket before committing;
-//   * while waiting, the UI shows only "正在思考 · 用时" + stop — never model
-//     reasoning text, never a fake percentage.
+// 管理会话、版本、分析和执行状态。
+// 主要入口：createConversation、startAnalysis、startChunkedAnalysis、cancelAnalysis。
+// 迟到分析结果按请求票据校验；失败或取消不覆盖已有计划。
 
 import 'dart:async';
 import 'dart:convert';
@@ -40,6 +32,9 @@ import 'external_calendar_service.dart';
 import 'ocr/ocr_material.dart';
 import 'ocr/ocr_service.dart';
 import 'reconciler.dart';
+import 'schedule/schedule_busy.dart';
+import 'schedule/schedule_controller.dart';
+import 'schedule/schedule_store.dart';
 import 'schedule_engine.dart';
 import 'session_repository.dart';
 import 'session_store.dart';
@@ -73,6 +68,15 @@ class RunState {
   /// 请求发出时实际使用的外部来源快照引用（写入新版本的 `externalCalendarRef`）。
   final List<ExternalCalendarSourceRef> externalSourcesRef;
 
+  /// 请求发出时本地全局日程的忙碌指纹（范围+时区+有效区间并集）；空 = 本次不校验。
+  final String scheduleFingerprint;
+
+  /// 复核指纹所用的规划范围/时区（与请求时间表一致）。
+  final String scheduleDateFrom;
+  final String scheduleDateTo;
+  final String scheduleTimezoneId;
+  final int scheduleTimezoneOffsetMinutes;
+
   const RunState({
     required this.conversationId,
     required this.requestId,
@@ -87,6 +91,11 @@ class RunState {
     this.submittedDraft = '',
     this.externalFingerprint = '',
     this.externalSourcesRef = const <ExternalCalendarSourceRef>[],
+    this.scheduleFingerprint = '',
+    this.scheduleDateFrom = '',
+    this.scheduleDateTo = '',
+    this.scheduleTimezoneId = '',
+    this.scheduleTimezoneOffsetMinutes = 0,
   });
 
   RunState copyWith({
@@ -109,6 +118,11 @@ class RunState {
         submittedDraft: submittedDraft,
         externalFingerprint: externalFingerprint,
         externalSourcesRef: externalSourcesRef,
+        scheduleFingerprint: scheduleFingerprint,
+        scheduleDateFrom: scheduleDateFrom,
+        scheduleDateTo: scheduleDateTo,
+        scheduleTimezoneId: scheduleTimezoneId,
+        scheduleTimezoneOffsetMinutes: scheduleTimezoneOffsetMinutes,
       );
 
   String get elapsedText {
@@ -119,10 +133,7 @@ class RunState {
   }
 }
 
-/// 附件导入的一次性反馈（0.3.0，提示词 02）。
-///
-/// 只描述“本次批量导入发生了什么”，由 UI 在侧栏通知区展示；不再是底部浮动
-/// SnackBar。失败项保留文件名与短原因；`note` 用于“已成功但需要分块分析”等附加说明。
+/// 一次附件导入的结果。失败项带文件名和简短原因；[note] 用于提示后续操作。
 class AttachmentFeedback {
   const AttachmentFeedback({
     required this.conversationId,
@@ -162,13 +173,7 @@ class AppController extends ChangeNotifier {
   /// source of the model selection used for a request.
   final SettingsController? settings;
 
-  /// Alias kept for older call sites / tests that used the longer name.
-  SettingsController? get settingsController => settings;
-
-  /// 外部日历来源服务（只读导入）。
-  ///
-  /// 可空：没有来源管理/测试/无原生环境时传 null —— 此时一切行为与 0.2.1 相同
-  /// （不会有任何合成时间表，也不会有外部指纹）。
+  /// 外部日历来源服务；为空时不合成占用时间，也不生成来源指纹。
   final ExternalCalendarService? externalCalendar;
 
   /// Where sessions are stored (shown in the sidebar footer) and, when the primary
@@ -181,18 +186,20 @@ class AppController extends ChangeNotifier {
   final String storageSource;
   final List<RejectedRoot> storageRejected;
 
-  /// 0.2.3（R3-E）：执行计时账本控制器。
-  ///
-  /// 可空：无原生/测试嵌入时不启用执行计时，所有 `execution*` 接口安全降级，
-  /// 既有行为（0.2.2）完全不变。执行记录与计划版本分开持久化，计划 JSON 不被改写。
+  /// 执行计时；为空时相关操作降级。执行记录单独持久化，不改写计划 JSON。
   final TimerController? timer;
 
-  /// 0.2.3（R3-O/R3-Q）：数据根目录，供 OCR 缓存/分块作业等本地服务使用。
-  /// 可空 = 本次运行没有可写目录（内存模式），相关功能必须明确报不可用。
+  /// OCR 缓存和分块作业的数据根目录。为空时依赖落盘的功能应明确报不可用。
   final Directory? dataDirectory;
 
-  /// 0.2.3（R3-O）：本地离线 OCR 服务；null = 本环境未启用（文件仍走文本提取）。
+  /// 本地 OCR 服务；为空时仍可提取文本文件。
   final OcrService? ocr;
+
+  /// 全局日程服务；为空表示本构建没有启用日程（行为与 0.3.x 一致）。
+  final ScheduleController? schedule;
+
+  /// 日程存储（备份/迁移接线用）；没有启用日程时为 null。
+  ScheduleStore? get scheduleStore => schedule?.store;
 
   AppController({
     required this.engine,
@@ -203,6 +210,7 @@ class AppController extends ChangeNotifier {
     this.timer,
     this.dataDirectory,
     this.ocr,
+    this.schedule,
     this.storagePath = '',
     this.storageNotice,
     this.storageIsPersistent = true,
@@ -210,7 +218,6 @@ class AppController extends ChangeNotifier {
     this.storageRejected = const <RejectedRoot>[],
   });
 
-  // ------------------------------------------------------------------ state
 
   final TaskInteraction interaction = TaskInteraction();
   final ConversationCommitGate gate = ConversationCommitGate();
@@ -228,20 +235,26 @@ class AppController extends ChangeNotifier {
   bool _waitPromptShown = false;
   bool _disposed = false;
 
+  /// 启动准备窗口的占位。从点击到取得 gate ticket / native job 之间有多个 await，
+  /// 不占位时连点会并发保存 pending 并让第二个请求撞上 gate.begin 的 StateError。
+  bool _starting = false;
+
+  /// 释放被 ABI 拒绝（job 仍在运行）时保留 id，按有界节奏重试；不伪造“已释放”。
+  /// 退出时 gateway.close() 的 shutdownBegin 会统一取消并销毁剩余 job。
+  final Set<int> _nativeJobsPendingRelease = <int>{};
+
   String? _statusMessage;
   String? _errorMessage;
   String? _lastDocumentErrorCode;
   bool _busy = false;
 
-  /// 0.3.0（提示词 02）：附件导入反馈。不再用底部浮动 SnackBar，而是交给
-  /// 侧栏/工作区的紧凑通知区显示。按会话隔离，避免切会话后看到上一会话的回执。
+  /// 最近一次附件导入反馈按会话隔离，切换会话后不显示旧回执。
   AttachmentFeedback? _attachmentFeedback;
 
   /// 最近一次添加文件的结构化失败码（如 `unsupported_ocr`）；成功/无关时为 null。
   /// UI 用它决定是否提供“本地 OCR 导入”，不靠匹配中文错误文案。
   String? get lastDocumentErrorCode => _lastDocumentErrorCode;
 
-  // ------------------------------------------------ attachment feedback (0.3.0)
 
   /// 当前会话的附件导入反馈；没有或属于别的会话时为 null（切会话不串回执）。
   AttachmentFeedback? get attachmentFeedback {
@@ -279,7 +292,6 @@ class AppController extends ChangeNotifier {
     _notify();
   }
 
-  // ------------------------------------------- material size / request budget
 
   /// 当前会话会随请求发送的材料文本总字节数（草稿 + 附件提取文本，UTF-8）。
   int get materialUtf8Bytes {
@@ -346,7 +358,6 @@ class AppController extends ChangeNotifier {
     return isViewingCurrentVersion;
   }
 
-  // ------------------------------------------------------------- lifecycle
 
   Future<void> initialize() async {
     await store.ensureLayout();
@@ -619,7 +630,6 @@ class AppController extends ChangeNotifier {
     return true;
   }
 
-  // ----------------------------------------------------------- attachments
 
   /// Extracts TXT/MD/PDF/DOCX/PPTX locally and stores the text with its source location.
   Future<bool> addTextFile(String path) async {
@@ -637,9 +647,8 @@ class AppController extends ChangeNotifier {
       return false;
     }
     try {
-      // 0.3.0（提示词 06A）：本地抽取使用分开的预算（容器 32MB / 文本 8MB），
-      // 不再拿单次请求上限 262144 字节同时卡文件大小和文本长度。文件可抽取但
-      // 超单次请求时保留材料，由 UI 引导到分块分析（见 AppShell._handleSend）。
+      // 本地抽取和单次模型请求分别限额。抽取成功但请求超限时保留材料，
+      // 由发送入口提示使用分块分析。
       final result = await extractDocument(
         file,
         limits: DocumentExtractionLimits.defaults,
@@ -654,7 +663,7 @@ class AppController extends ChangeNotifier {
       final text = doc.segments
           .map((s) => s.location == null ? s.text : '【${s.location}】\n${s.text}')
           .join('\n\n');
-      // 抽取结果一律不截断；超出单次请求预算不算导入失败（提示词 06A）：
+      // 抽取结果不截断；超出单次请求预算也不算导入失败。
       // 材料保留在本地，发送时由 UI 提供分块估算/确认入口。
       final textBytes = result.textUtf8Bytes ?? utf8.encode(text).length;
       // 提取是异步的：完成后必须合并到“最近”的会话，不能用提取前的旧快照覆盖。
@@ -705,7 +714,7 @@ class AppController extends ChangeNotifier {
     }
   }
 
-  /// 0.2.3（R3-O）：把本地 OCR（含用户校对）结果加入当前会话材料。
+  /// 把本地 OCR（含用户校对）结果加入当前会话材料。
   ///
   /// 返回 null = 成功；否则为用户可读的失败原因。完整页级来源（页号/bbox/引擎
   /// 版本/置信度/校对原文）写入 `<data>/ocr_materials/<id>.json`，附件里只存摘要
@@ -793,7 +802,6 @@ class AppController extends ChangeNotifier {
     _notify();
   }
 
-  // ------------------------------------------------- execution (0.2.3 R3-E)
 
   /// 执行计时控制器；null = 本构建/本环境未启用执行计时。
   TimerController? get executionTimer => timer;
@@ -1076,7 +1084,6 @@ class AppController extends ChangeNotifier {
     }
   }
 
-  // ------------------------------------------------- chunked analysis (R3-L)
 
   static const AnalysisLimits _chunkedLimits =
       AnalysisLimits(maxConcurrentRequests: 1);
@@ -1087,7 +1094,331 @@ class AppController extends ChangeNotifier {
   ChunkedJob? _chunkedJob;
   ModelSelection? _chunkedSelection;
 
+  // 预览会话（任务 4）：分析结束只产出预览，用户确认后才提交。
+  ChunkedCoordinator? _previewCoordinator;
+  ChunkedJob? _previewJob;
+  FactLedger? _previewLedger;
+  AnalysisJobSpec? _previewSpec;
+  DraftPlanPreview? _preview;
+  List<String> _previewBlockers = const <String>[];
+  List<String> _previewCoverageLines = const <String>[];
+  String _previewExternalFingerprint = '';
+  List<ExternalCalendarSourceRef> _previewExternalRefs =
+      const <ExternalCalendarSourceRef>[];
+  bool _previewCommitting = false;
+
+  /// 已提交过的预览身份（jobId + 候选任务集合）：双击确认不能生成第二个版本。
+  final Set<String> _committedPreviewKeys = <String>{};
+
   bool get chunkedAnalysisRunning => _chunkedRunning;
+
+  bool get chunkedPreviewAvailable => _preview != null;
+
+  bool get chunkedPreviewCommitting => _previewCommitting;
+
+  /// 当前预览视图；没有预览时为 null。失效原因（材料/时间表/版本/模型变化）
+  /// 在读取时重新计算，不依赖 UI 主动刷新。
+  ChunkedPreviewView? get chunkedPreview {
+    final preview = _preview;
+    if (preview == null) return null;
+    final excludedFacts =
+        _previewLedger?.excludedFacts.keys.toSet() ?? const <String>{};
+    final excludedCandidates = <String>{};
+    for (final fact in preview.facts) {
+      final factId = fact['factId']?.toString() ?? '';
+      if (!excludedFacts.contains(factId)) continue;
+      for (final raw in (fact['taskCandidateIds'] as List<dynamic>?) ??
+          const <dynamic>[]) {
+        final id = raw.toString();
+        if (id.isNotEmpty) excludedCandidates.add(id);
+      }
+    }
+    return ChunkedPreviewView(
+      preview: preview,
+      staleReason: _chunkedPreviewStaleReason(),
+      excludedFactIds: excludedFacts,
+      excludedCandidateIds: excludedCandidates,
+      committing: _previewCommitting,
+      coverageLines: _previewCoverageLines,
+    );
+  }
+
+  /// 用 [base] 的固定 asOf 归一化 [current]，用于比较“除作业基准时间外”的基线。
+  /// asOf 是作业开始时固定的相对日期锚点，重建作业时必然不同，不能算作失效。
+  static JobBaseline normalizePreviewBaseline(
+    JobBaseline current,
+    JobBaseline base,
+  ) =>
+      JobBaseline(
+        asOf: base.asOf,
+        timeZoneId: current.timeZoneId,
+        timezoneOffsetMinutes: current.timezoneOffsetMinutes,
+        baseVersionId: current.baseVersionId,
+        baseRevision: current.baseRevision,
+        calendarRevision: current.calendarRevision,
+        materialHashes: current.materialHashes,
+        modelConfigSignature: current.modelConfigSignature,
+        userRequestHash: current.userRequestHash,
+        timetableSignature: current.timetableSignature,
+        externalSources: current.externalSources,
+        scheduleFingerprint: current.scheduleFingerprint,
+        promptVersion: current.promptVersion,
+      );
+
+  String? _chunkedPreviewStaleReason() {
+    final spec = _previewSpec;
+    final job = _previewJob;
+    if (spec == null || job == null) return null;
+    final session = _conversation;
+    if (session == null || session.id != spec.conversationId) {
+      return '当前会话与预览不一致';
+    }
+    final prepared = _prepareChunkedInputs(resolveSelection: false);
+    final current = prepared.spec;
+    if (current == null) {
+      return prepared.error ?? '当前材料已不可用';
+    }
+    final normalized =
+        normalizePreviewBaseline(current.buildBaseline(), job.baseline);
+    if (normalized.signature != job.baseline.signature) {
+      return '材料、时间表、计划版本或模型配置已变化，请重新分析';
+    }
+    return null;
+  }
+
+  void _clearChunkedPreviewState() {
+    _previewCoordinator = null;
+    _previewJob = null;
+    _previewLedger = null;
+    _previewSpec = null;
+    _preview = null;
+    _previewBlockers = const <String>[];
+    _previewCoverageLines = const <String>[];
+    _previewExternalFingerprint = '';
+    _previewExternalRefs = const <ExternalCalendarSourceRef>[];
+  }
+
+  /// 丢弃预览（不产生版本；关闭预览不应修改当前正式版本）。
+  void discardChunkedPreview() {
+    if (_preview == null) return;
+    _clearChunkedPreviewState();
+    _notify();
+  }
+
+  void _rebuildChunkedPreview() {
+    final coordinator = _previewCoordinator;
+    final job = _previewJob;
+    final ledger = _previewLedger;
+    if (coordinator == null || job == null || ledger == null) return;
+    _preview = coordinator.buildPreview(job, ledger, blockers: _previewBlockers);
+  }
+
+  void _installChunkedPreview({
+    required ChunkedCoordinator coordinator,
+    required ChunkedJob job,
+    required FactLedger ledger,
+    required AnalysisJobSpec spec,
+    required DraftPlanPreview preview,
+    required List<String> blockers,
+    required List<String> coverageLines,
+    required String externalFingerprint,
+    required List<ExternalCalendarSourceRef> externalSourcesRef,
+  }) {
+    _previewCoordinator = coordinator;
+    _previewJob = job;
+    _previewLedger = ledger;
+    _previewSpec = spec;
+    _preview = preview;
+    _previewBlockers = List<String>.unmodifiable(blockers);
+    _previewCoverageLines = List<String>.unmodifiable(coverageLines);
+    _previewExternalFingerprint = externalFingerprint;
+    _previewExternalRefs =
+        List<ExternalCalendarSourceRef>.unmodifiable(externalSourcesRef);
+  }
+
+  /// 人工排除/恢复一个候选任务：更新账本与预览（不是只隐藏一行提示）。
+  ChunkedRunResult setChunkedPreviewTaskExcluded(
+    String candidateId, {
+    required bool excluded,
+  }) {
+    final preview = _preview;
+    final ledger = _previewLedger;
+    if (preview == null || ledger == null) {
+      return const ChunkedRunResult(ok: false, message: '没有待处理的分块预览');
+    }
+    String? factId;
+    for (final fact in preview.facts) {
+      final ids = ((fact['taskCandidateIds'] as List<dynamic>?) ??
+              const <dynamic>[])
+          .map((e) => e.toString());
+      if (ids.contains(candidateId)) {
+        factId = fact['factId']?.toString();
+        break;
+      }
+    }
+    if (factId == null || factId.isEmpty) {
+      return const ChunkedRunResult(
+          ok: false, message: '找不到该候选任务对应的账本事实');
+    }
+    if (excluded) {
+      ledger.excludeFact(factId, reason: '用户在预览中排除候选任务');
+    } else {
+      ledger.restoreFact(factId);
+    }
+    _rebuildChunkedPreview();
+    _notify();
+    return ChunkedRunResult(
+      ok: true,
+      message: excluded ? '已排除该候选任务，依赖与待确认项已重算' : '已恢复该候选任务',
+      previewReady: true,
+    );
+  }
+
+  /// 把预览转成正式提交。
+  ///
+  /// 只有 [ChunkedPreviewView.canCommit] 为 true 的预览才应调用；该入口与普通分析
+  /// 共用提交门/落盘顺序，成功时 [ChunkedRunResult.committedPlanVersionId] 是本次
+  /// 新增版本。单独公开是为了让测试不依赖真实原生桥接。
+  Future<ChunkedRunResult> commitChunkedPreview({
+    required DraftPlanPreview preview,
+    required String conversationId,
+    required int calendarRevision,
+    String externalFingerprint = '',
+    List<ExternalCalendarSourceRef> externalSourcesRef =
+        const <ExternalCalendarSourceRef>[],
+  }) async {
+    final c = _conversation;
+    if (c == null || c.id != conversationId) {
+      return const ChunkedRunResult(
+          ok: false, message: '结果不属于当前会话，已丢弃');
+    }
+    if (preview.partial || preview.blockers.isNotEmpty) {
+      return ChunkedRunResult(
+        ok: false,
+        message: '材料未完整处理，不能生成正式计划',
+        partial: true,
+        blockers: preview.blockers,
+        previewReady: true,
+      );
+    }
+    final previewKey = _chunkedPreviewKey(preview);
+    if (_committedPreviewKeys.contains(previewKey)) {
+      return const ChunkedRunResult(
+        ok: false,
+        message: '该预览已提交，不能重复生成版本',
+        previewReady: true,
+      );
+    }
+    final RequestTicket ticket;
+    try {
+      ticket = gate.begin(
+        conversationId: conversationId,
+        requestId: IdGenerator.next('req'),
+        baseVersionId: c.currentVersion?.id,
+        baseRevision: c.currentVersion?.revision ?? 0,
+        calendarRevision: calendarRevision,
+      );
+    } on StateError catch (e) {
+      return ChunkedRunResult(ok: false, message: e.message);
+    }
+    final PlanCommitResult commit;
+    try {
+      commit = await commitAnalysisResult(
+        ticket,
+        AnalyzeOutcome(
+          ok: true,
+          plan: preview.toPlanJson(),
+          elapsedMs: 0,
+          httpStatus: 200,
+        ),
+        c.draftText,
+        externalFingerprint: externalFingerprint,
+        externalSourcesRef: externalSourcesRef,
+      );
+    } finally {
+      gate.finish(ticket);
+    }
+    if (commit.status != PlanCommitStatus.committed || commit.versionId == null) {
+      if (commit.status == PlanCommitStatus.failed) {
+        _errorMessage = commit.message;
+      }
+      _statusMessage = commit.message;
+      _notify();
+      return ChunkedRunResult(
+        ok: false,
+        message: commit.message,
+        previewReady: true,
+      );
+    }
+    _committedPreviewKeys.add(previewKey);
+    final message = commit.warning == null
+        ? '已确认并生成计划版本'
+        : '已确认并生成计划版本；${commit.warning}';
+    _statusMessage = message;
+    _notify();
+    return ChunkedRunResult(
+      ok: true,
+      message: message,
+      committedPlanVersionId: commit.versionId,
+    );
+  }
+
+  /// 预览身份：同一个 job + 相同候选任务集合视为同一份预览（排除/恢复会改变它）。
+  static String _chunkedPreviewKey(DraftPlanPreview preview) =>
+      '${preview.jobId}::'
+      '${preview.tasks.map((t) => '${t.candidateId}|${t.name}').join(',')}';
+
+  /// 确认预览：重新校验基线、完整性、关键待确认项后才提交；双击幂等。
+  Future<ChunkedRunResult> confirmChunkedPreview() async {
+    final preview = _preview;
+    final spec = _previewSpec;
+    final job = _previewJob;
+    if (preview == null || spec == null || job == null) {
+      return const ChunkedRunResult(ok: false, message: '没有待确认的分块预览');
+    }
+    if (_previewCommitting) {
+      return const ChunkedRunResult(
+          ok: false, message: '正在提交预览，请勿重复点击', previewReady: true);
+    }
+    final stale = _chunkedPreviewStaleReason();
+    if (stale != null) {
+      return ChunkedRunResult(
+          ok: false, message: '预览已失效：$stale', previewReady: true);
+    }
+    if (preview.partial || preview.blockers.isNotEmpty) {
+      return ChunkedRunResult(
+        ok: false,
+        message: '材料未完整处理，不能生成正式计划',
+        partial: true,
+        blockers: preview.blockers,
+        previewReady: true,
+      );
+    }
+    final critical = preview.pending.where((p) => p.critical).toList();
+    if (critical.isNotEmpty) {
+      return ChunkedRunResult(
+        ok: false,
+        message: '仍有待确认的关键问题：${critical.first.text}',
+        previewReady: true,
+      );
+    }
+    _previewCommitting = true;
+    _notify();
+    try {
+      final result = await commitChunkedPreview(
+        preview: preview,
+        conversationId: spec.conversationId,
+        calendarRevision: job.baseline.calendarRevision,
+        externalFingerprint: _previewExternalFingerprint,
+        externalSourcesRef: _previewExternalRefs,
+      );
+      if (result.ok) _clearChunkedPreviewState();
+      return result;
+    } finally {
+      _previewCommitting = false;
+      _notify();
+    }
+  }
 
   /// 分块分析预估（不发起任何模型请求）；材料为空/参数不合法时返回 null。
   ChunkedEstimateView? describeChunkedAnalysis() {
@@ -1118,13 +1449,27 @@ class AppController extends ChangeNotifier {
   Future<ChunkedRunResult> startChunkedAnalysis({
     void Function(JobProgress progress)? onProgress,
   }) async {
-    if (_chunkedRunning) {
-      return const ChunkedRunResult(ok: false, message: '已有分块分析在进行中');
+    if (_disposed) {
+      return const ChunkedRunResult(ok: false, message: '应用已关闭');
     }
-    if (_run != null) {
+    // 与普通分析共享启动占位：从点击到 coordinator.run 之间不能并发启动第二个作业。
+    if (_starting || _chunkedRunning || _run != null) {
       return const ChunkedRunResult(
-          ok: false, message: '普通分析进行中，无法开始分块分析');
+          ok: false, message: '已有分析在进行中，请等待或取消');
     }
+    _starting = true;
+    try {
+      return await _startChunkedAnalysisBody(onProgress: onProgress);
+    } catch (e) {
+      return ChunkedRunResult(ok: false, message: '分块分析失败：$e');
+    } finally {
+      _starting = false;
+    }
+  }
+
+  Future<ChunkedRunResult> _startChunkedAnalysisBody({
+    void Function(JobProgress progress)? onProgress,
+  }) async {
     final gw = gateway;
     if (gw == null) {
       return const ChunkedRunResult(ok: false, message: '原生桥接不可用，无法发起分块分析');
@@ -1133,6 +1478,8 @@ class AppController extends ChangeNotifier {
     if (_disposed) {
       return const ChunkedRunResult(ok: false, message: '应用已关闭');
     }
+    // 新的分块分析会让旧预览失效：先丢弃（旧预览对应旧基线）。
+    _clearChunkedPreviewState();
     final version = c.currentVersion;
     final draft = c.draftText.trim();
     if (draft.isEmpty && c.attachments.isEmpty && !hasRequestTimetable) {
@@ -1183,7 +1530,24 @@ class AppController extends ChangeNotifier {
     );
     _conversation = withPending;
     _cache[c.id] = withPending;
-    await store.saveConversation(withPending);
+    try {
+      await store.saveConversation(withPending);
+    } catch (e) {
+      _conversation = c;
+      _cache[c.id] = c;
+      gate.finish(ticket);
+      return ChunkedRunResult(
+          ok: false, message: '保存请求占位失败，未发起分块分析：$e');
+    }
+    if (_disposed) {
+      gate.finish(ticket);
+      try {
+        await clearPendingFor(conversationId: c.id, requestId: requestId);
+      } catch (_) {
+        // 退出清理尽力而为。
+      }
+      return const ChunkedRunResult(ok: false, message: '应用已关闭');
+    }
 
     final coordinator = ChunkedCoordinator(
       spec: spec,
@@ -1195,7 +1559,11 @@ class AppController extends ChangeNotifier {
       job = coordinator.createJob();
     } catch (e) {
       gate.finish(ticket);
-      await _clearPending();
+      try {
+        await clearPendingFor(conversationId: c.id, requestId: requestId);
+      } catch (_) {
+        // 清理失败不改变“作业创建失败”的结论。
+      }
       return ChunkedRunResult(ok: false, message: '分块作业创建失败：$e');
     }
 
@@ -1216,9 +1584,24 @@ class AppController extends ChangeNotifier {
           });
     final watch = Stopwatch()..start();
     ChunkedJobOutcome? outcome;
+    var cancelRequested = false;
     try {
       outcome = await coordinator.run(job);
+      cancelRequested = _chunkedCancelRequested;
     } catch (e) {
+      // 运行异常也必须结束票据并清匹配占位；否则下一次分析会被 gate 永久拒绝。
+      gate.finish(ticket);
+      try {
+        await clearPendingFor(conversationId: c.id, requestId: requestId);
+      } catch (_) {
+        // 不覆盖最初的失败原因。
+      }
+      _chunkedRunning = false;
+      _chunkedCoordinator = null;
+      _chunkedJob = null;
+      _chunkedSelection = null;
+      _chunkedCancelRequested = false;
+      _notify();
       return ChunkedRunResult(ok: false, message: '分块分析失败：$e');
     } finally {
       progressTimer?.cancel();
@@ -1231,9 +1614,13 @@ class AppController extends ChangeNotifier {
     }
     watch.stop();
 
-    if (_chunkedCancelRequested || job.isCancelled) {
+    if (cancelRequested || job.isCancelled) {
       gate.finish(ticket);
-      await _clearPending();
+      try {
+        await clearPendingFor(conversationId: c.id, requestId: requestId);
+      } catch (_) {
+        // 取消路径的清理失败不改变“已取消”的结论。
+      }
       _statusMessage = '分块分析已取消（已完成的本地阶段保留，不自动重发）';
       _notify();
       return ChunkedRunResult(
@@ -1254,57 +1641,63 @@ class AppController extends ChangeNotifier {
                 : '${d.label}: ${d.coveredSegments}/${d.totalSegments} 段')
             .toList(growable: false) ??
         const <String>[];
-    if (!outcome.officialPlanAvailable || outcome.officialPlanJson == null) {
+    // 任务 4：分析结束先产出预览，不自动提交；提交由 confirmChunkedPreview 单独触发。
+    final ledger = outcome.ledger;
+    if (preview == null || ledger == null) {
       gate.finish(ticket);
-      await _clearPending();
+      try {
+        await clearPendingFor(conversationId: c.id, requestId: requestId);
+      } catch (_) {
+        // 清理失败不改变结论。
+      }
       final message = outcome.message.isEmpty
-          ? '材料未完整处理，未生成正式计划'
+          ? '分块分析结束，但没有可展示的预览，未生成计划'
           : outcome.message;
       _errorMessage = message;
-      _statusMessage = blockers.isEmpty ? message : '$message；${blockers.first}';
+      _statusMessage = message;
       _notify();
       return ChunkedRunResult(
         ok: false,
-        message: _statusMessage!,
-        partial: preview?.partial ?? true,
+        message: message,
         blockers: blockers,
         pendingConfirmations: pendingCount,
         factsCount: factsCount,
         coverageLines: coverageLines,
       );
     }
-
-    // 正式提交：与普通分析同一条本地校验/版本提交路径（C 校验 + reconcile）。
-    final planJson = outcome.officialPlanJson!;
-    await _commitResult(
-      ticket,
-      AnalyzeOutcome(
-        ok: true,
-        plan: planJson,
-        elapsedMs: watch.elapsedMilliseconds,
-        httpStatus: 200,
-      ),
-      draft,
+    _installChunkedPreview(
+      coordinator: coordinator,
+      job: job,
+      ledger: ledger,
+      spec: spec,
+      preview: preview,
+      blockers: blockers,
+      coverageLines: coverageLines,
       externalFingerprint: requestExternalFingerprint,
       externalSourcesRef: requestExternalRefs,
     );
     gate.finish(ticket);
-    await _clearPending();
-    final committed = _conversation?.currentVersion?.id;
-    final message = (planJson['partial'] == true)
-        ? '分块结果不完整，已拒绝提交'
-        : '分块分析完成，已生成计划版本';
+    try {
+      await clearPendingFor(conversationId: c.id, requestId: requestId);
+    } catch (e) {
+      _errorMessage = '清理待处理标记失败：$e';
+    }
+    final blocked = preview.partial || blockers.isNotEmpty;
+    final message = blocked
+        ? '分块分析结束：材料未完整处理，预览不可提交'
+        : '分块分析结束，请在预览中确认后生成计划';
     _statusMessage = message;
+    if (blocked) _errorMessage = message;
     _notify();
     return ChunkedRunResult(
-      ok: planJson['partial'] != true,
-      message: _statusMessage!,
-      committedPlanVersionId: committed,
-      partial: planJson['partial'] == true,
+      ok: false,
+      message: message,
+      partial: preview.partial,
       blockers: blockers,
       pendingConfirmations: pendingCount,
       factsCount: factsCount,
       coverageLines: coverageLines,
+      previewReady: true,
     );
   }
 
@@ -1350,11 +1743,8 @@ class AppController extends ChangeNotifier {
         await Future<void>.delayed(const Duration(milliseconds: 200));
       }
     } finally {
-      try {
-        gw.release(nativeJob);
-      } catch (_) {
-        // 释放失败不影响结果；桥接关闭时统一清理。
-      }
+      // 运行中的 job 释放会被 ABI 拒绝；交给有界回收，最终由关闭流程统一销毁。
+      _releaseNativeJob(nativeJob);
     }
   }
 
@@ -1420,6 +1810,26 @@ class AppController extends ChangeNotifier {
           documentCount: documents.length,
         );
       }
+    }
+    // 分块作业与普通分析使用同一份日程忙碌指纹；展开不完整时直接报错。
+    var scheduleFingerprint = '';
+    if (requestTimetable != null && schedule != null) {
+      final scheduleError = validateScheduleForRequest(
+        c,
+        version?.timetable ?? c.calendarDraft,
+      );
+      if (scheduleError != null) {
+        return (
+          spec: null,
+          selection: null,
+          migratedSelection: null,
+          error: scheduleError,
+          materialBytes: materialBytes,
+          documentCount: documents.length,
+        );
+      }
+      scheduleFingerprint =
+          captureScheduleRequestBaseline(c, version)?.fingerprint ?? '';
     }
     ModelSelection? selection;
     ModelSelection? migrated;
@@ -1487,6 +1897,7 @@ class AppController extends ChangeNotifier {
         timetableJson: timetableJson,
         effectiveTimetableJson: effectiveTimetable,
         externalSources: externalSources,
+        scheduleFingerprint: scheduleFingerprint,
         modelSelection: selection?.toJson(),
         modelConfigSignature: selection == null
             ? ''
@@ -1565,9 +1976,8 @@ class AppController extends ChangeNotifier {
     );
   }
 
-  // ------------------------------------------------------- external calendar
 
-  /// 外部日历集合指纹（全局启用来源）；服务不可用时为空串（= 0.2.1 行为）。
+  /// 全局启用来源的指纹；服务不可用时为空串。
   ///
   /// 迟到结果的实际判定请用会话级 [externalFingerprintFor]：只有该会话**实际
   /// 关联并使能**的来源变化才应让结果过期（无关来源的导入/改名不应打断分析）。
@@ -1694,10 +2104,26 @@ class AppController extends ChangeNotifier {
       dateTo: _settingsDateTo(settings),
       timezoneId: settings.timezoneId,
     );
-    if (busy.isEmpty) return version.calendar;
-    return version.calendar.copyWith(
-      settings: composeExternalSettings(base: settings, busy: busy),
+    var composed = settings;
+    if (busy.isNotEmpty) {
+      composed = composeExternalSettings(base: composed, busy: busy);
+    }
+    final scheduleBusy = scheduleBusyForRange(
+      dateFrom: _settingsDateFrom(settings),
+      dateTo: _settingsDateTo(settings),
+      timezoneId: settings.timezoneId,
+      timezoneOffsetMinutes: settings.timezoneOffsetMinutes,
     );
+    if (scheduleBusy != null &&
+        scheduleBusy.available &&
+        scheduleBusy.wallRanges.isNotEmpty) {
+      composed = composeScheduleSettings(
+        base: composed,
+        busy: scheduleBusy.wallRanges,
+      );
+    }
+    if (identical(composed, settings)) return version.calendar;
+    return version.calendar.copyWith(settings: composed);
   }
 
   /// 当前查看版本的合成排程快照；没有版本时为 null。
@@ -1732,18 +2158,36 @@ class AppController extends ChangeNotifier {
 
   Timetable _composeTimetable(Conversation conversation, Timetable manual) {
     final range = _busyRangeForTimetable(conversation, manual);
+    var composed = manual;
     final busy = _externalBusyForRange(
       conversation: conversation,
       dateFrom: range.from,
       dateTo: range.to,
       timezoneId: manual.timezoneId,
     );
-    if (busy.isEmpty) return manual;
-    return composeExternalBusy(
-      manual: manual,
-      busy: busy,
+    if (busy.isNotEmpty) {
+      composed = composeExternalBusy(
+        manual: composed,
+        busy: busy,
+        timezoneId: manual.timezoneId,
+      );
+    }
+    final scheduleBusy = scheduleBusyForRange(
+      dateFrom: range.from,
+      dateTo: range.to,
       timezoneId: manual.timezoneId,
+      timezoneOffsetMinutes: manual.timezoneOffsetMinutes,
     );
+    if (scheduleBusy != null &&
+        scheduleBusy.available &&
+        scheduleBusy.wallRanges.isNotEmpty) {
+      composed = composeScheduleBusy(
+        manual: composed,
+        busy: scheduleBusy.wallRanges,
+        timezoneId: manual.timezoneId,
+      );
+    }
+    return composed;
   }
 
   List<ExternalBusyInstance> _externalBusyForRange({
@@ -1764,6 +2208,88 @@ class AppController extends ChangeNotifier {
       dateFrom: dateFrom,
       dateTo: dateTo,
       timezoneId: timezoneId,
+    );
+  }
+
+  /// 本地全局日程在 [dateFrom,dateTo]（含首尾本地日期）内的忙碌与指纹。
+  ///
+  /// 返回 null = 未启用日程服务（与 0.3.x 行为一致）；available=false 表示展开
+  /// 不完整，调用方必须阻断/提示，不能当成“没有忙碌”。
+  ScheduleBusySnapshot? scheduleBusyForRange({
+    required String dateFrom,
+    required String dateTo,
+    required String timezoneId,
+    required int timezoneOffsetMinutes,
+  }) {
+    final ctrl = schedule;
+    if (ctrl == null) return null;
+    final from = parseDateKey(dateFrom);
+    final to = parseDateKey(dateTo);
+    if (from == null || to == null || to.compareTo(from) < 0) {
+      return ScheduleBusySnapshot.unavailable(
+        fromUtc: DateTime.utc(1970),
+        toUtc: DateTime.utc(1970),
+        timezoneId: timezoneId,
+        warnings: const <String>['日程范围不合法'],
+      );
+    }
+    final clock = WallClock(timezoneOffsetMinutes);
+    final fromUtc = clock.dayStartUtcForDateKey(from);
+    final toUtc = clock.dayStartUtcForDateKey(to).add(const Duration(days: 1));
+    return computeScheduleBusy(
+      events: ctrl.events,
+      fromUtc: fromUtc,
+      toUtc: toUtc,
+      timezoneId: timezoneId,
+    );
+  }
+
+  /// 校验请求时间表范围上的本地日程能否完整展开；null = 可继续。
+  String? validateScheduleForRequest(
+    Conversation conversation,
+    Timetable? manual,
+  ) {
+    if (manual == null || schedule == null) return null;
+    final range = _busyRangeForTimetable(conversation, manual);
+    final snap = scheduleBusyForRange(
+      dateFrom: range.from,
+      dateTo: range.to,
+      timezoneId: manual.timezoneId,
+      timezoneOffsetMinutes: manual.timezoneOffsetMinutes,
+    );
+    if (snap == null || snap.complete) return null;
+    final reason = snap.warnings.isEmpty ? '展开失败' : snap.warnings.first;
+    return '本地日程忙碌无法完整展开（$reason），请检查日程时区/重复设置后重试';
+  }
+
+  /// 捕获请求发出时的日程忙碌基线；未携带时间表或没有日程服务时返回 null。
+  ({
+    String fingerprint,
+    String dateFrom,
+    String dateTo,
+    String timezoneId,
+    int offsetMinutes
+  })? captureScheduleRequestBaseline(
+    Conversation conversation,
+    PlanVersion? version,
+  ) {
+    final manual = version?.timetable ?? conversation.calendarDraft;
+    if (manual == null || schedule == null) return null;
+    final range = _busyRangeForTimetable(conversation, manual);
+    final snap = scheduleBusyForRange(
+      dateFrom: range.from,
+      dateTo: range.to,
+      timezoneId: manual.timezoneId,
+      timezoneOffsetMinutes: manual.timezoneOffsetMinutes,
+    );
+    final fingerprint = snap?.fingerprint;
+    if (fingerprint == null) return null;
+    return (
+      fingerprint: fingerprint,
+      dateFrom: range.from,
+      dateTo: range.to,
+      timezoneId: manual.timezoneId,
+      offsetMinutes: manual.timezoneOffsetMinutes,
     );
   }
 
@@ -1812,8 +2338,25 @@ class AppController extends ChangeNotifier {
       dateTo: _settingsDateTo(settings),
       timezoneId: settings.timezoneId,
     );
-    if (busy.isEmpty) return settings;
-    return composeExternalSettings(base: settings, busy: busy);
+    var composed = settings;
+    if (busy.isNotEmpty) {
+      composed = composeExternalSettings(base: composed, busy: busy);
+    }
+    final scheduleBusy = scheduleBusyForRange(
+      dateFrom: _settingsDateFrom(settings),
+      dateTo: _settingsDateTo(settings),
+      timezoneId: settings.timezoneId,
+      timezoneOffsetMinutes: settings.timezoneOffsetMinutes,
+    );
+    if (scheduleBusy != null &&
+        scheduleBusy.available &&
+        scheduleBusy.wallRanges.isNotEmpty) {
+      composed = composeScheduleSettings(
+        base: composed,
+        busy: scheduleBusy.wallRanges,
+      );
+    }
+    return composed;
   }
 
   static String _settingsDateFrom(CalendarSettings settings) {
@@ -1828,7 +2371,6 @@ class AppController extends ChangeNotifier {
     return addDaysToDateKey(start, days - 1);
   }
 
-  // -------------------------------------------------------------- analysis
 
   /// 构造正式分析请求。独立成方法，测试可以直接断言请求形状而不启动网络。
   ///
@@ -1944,7 +2486,25 @@ class AppController extends ChangeNotifier {
   }
 
   Future<void> startAnalysis() async {
-    if (_run != null) return;
+    if (_disposed) return;
+    // 启动占位先于第一个 await：连点/与分块分析交叉启动时不能并发保存 pending。
+    if (_starting || _run != null || _chunkedRunning) {
+      _errorMessage = '已有分析在进行中，请等待或取消';
+      _notify();
+      return;
+    }
+    _starting = true;
+    try {
+      await _startAnalysisBody();
+    } catch (e) {
+      _errorMessage = '启动分析失败：$e';
+      _notify();
+    } finally {
+      _starting = false;
+    }
+  }
+
+  Future<void> _startAnalysisBody() async {
     // Sending from a brand-new session must work without clicking "新建会话" first.
     var c = await ensureConversation();
     if (_disposed) return;
@@ -1955,7 +2515,7 @@ class AppController extends ChangeNotifier {
       _notify();
       return;
     }
-    // 0.3.0（提示词 06）：材料超过单次请求预算时不能硬发（C 侧会拒绝），
+    // 材料超过单次请求预算时不能硬发（C 侧会拒绝），
     // 保留本地材料并明确引导到分块分析；不截断材料。
     if (materialExceedsSingleRequest) {
       _errorMessage = '材料约 $materialUtf8Bytes 字节，超过单次请求上限 '
@@ -1976,6 +2536,19 @@ class AppController extends ChangeNotifier {
       _notify();
       return;
     }
+    // 本地日程展开不完整时不能把"空忙碌"发给模型（宁可不分析）。
+    final manualTimetable = version?.timetable ?? c.calendarDraft;
+    final scheduleError = c.includeTimetable
+        ? validateScheduleForRequest(c, manualTimetable)
+        : null;
+    if (scheduleError != null) {
+      _errorMessage = scheduleError;
+      _notify();
+      return;
+    }
+    final scheduleBaseline = c.includeTimetable
+        ? captureScheduleRequestBaseline(c, version)
+        : null;
 
     // Resolve the model selection **now**: switching the default connection later must
     // not change a request that is already on its way. The native side receives the exact
@@ -2021,15 +2594,22 @@ class AppController extends ChangeNotifier {
     final requestExternalFingerprint = externalFingerprintFor(c);
     final requestExternalRefs = _externalSourceRefs(c);
 
-    final ticket = gate.begin(
-      conversationId: c.id,
-      requestId: requestId,
-      baseVersionId: version?.id,
-      baseRevision: version?.revision ?? 0,
-      // -1 = 本次请求没有带时间表，之后改时间表不影响结果可用性。
-      calendarRevision:
-          requestTimetable == null ? -1 : requestTimetable.revision,
-    );
+    final RequestTicket ticket;
+    try {
+      ticket = gate.begin(
+        conversationId: c.id,
+        requestId: requestId,
+        baseVersionId: version?.id,
+        baseRevision: version?.revision ?? 0,
+        // -1 = 本次请求没有带时间表，之后改时间表不影响结果可用性。
+        calendarRevision:
+            requestTimetable == null ? -1 : requestTimetable.revision,
+      );
+    } on StateError catch (e) {
+      _errorMessage = e.message;
+      _notify();
+      return;
+    }
 
     // Persist the pending request before starting, so a crash cannot leave a
     // half-locked conversation behind silently.
@@ -2043,7 +2623,29 @@ class AppController extends ChangeNotifier {
     );
     _conversation = withPending;
     _cache[c.id] = withPending;
-    await store.saveConversation(withPending);
+    try {
+      await store.saveConversation(withPending);
+    } catch (e) {
+      // 占位没写成功就不能继续：回退内存并释放票据，否则会话被永久锁住。
+      _conversation = c;
+      _cache[c.id] = c;
+      gate.finish(ticket);
+      _errorMessage = '保存请求占位失败，未发起分析：$e';
+      _notify();
+      return;
+    }
+    if (_disposed) {
+      gate.finish(ticket);
+      try {
+        await clearPendingFor(
+          conversationId: c.id,
+          requestId: requestId,
+        );
+      } catch (_) {
+        // 退出清理尽力而为；崩溃恢复会再次处理 pending。
+      }
+      return;
+    }
 
     final planContext = version == null ? null : _buildPlanContext(version);
     final request = buildAnalysisRequest(
@@ -2070,6 +2672,11 @@ class AppController extends ChangeNotifier {
         submittedDraft: c.draftText,
         externalFingerprint: requestExternalFingerprint,
         externalSourcesRef: requestExternalRefs,
+        scheduleFingerprint: scheduleBaseline?.fingerprint ?? '',
+        scheduleDateFrom: scheduleBaseline?.dateFrom ?? '',
+        scheduleDateTo: scheduleBaseline?.dateTo ?? '',
+        scheduleTimezoneId: scheduleBaseline?.timezoneId ?? '',
+        scheduleTimezoneOffsetMinutes: scheduleBaseline?.offsetMinutes ?? 0,
       );
       _waitPromptShown = false;
       _errorMessage = null;
@@ -2081,7 +2688,14 @@ class AppController extends ChangeNotifier {
       gate.finish(ticket);
       _run = null;
       _errorMessage = _describeStartFailure(e);
-      await _clearPending();
+      try {
+        await clearPendingFor(
+          conversationId: c.id,
+          requestId: requestId,
+        );
+      } catch (cleanupError) {
+        _errorMessage = '$_errorMessage；清理待处理标记失败：$cleanupError';
+      }
     }
     _notify();
   }
@@ -2168,7 +2782,44 @@ class AppController extends ChangeNotifier {
     _tickTimer = null;
   }
 
+  /// 尝试释放一个已终结的原生 job。ABI 规定运行中的 job 释放返回非 0：
+  /// 此时保留 id 交给 [_reapNativeJobs] 重试，绝不假装已释放。
+  bool _releaseNativeJob(int jobId) {
+    final gw = gateway;
+    if (gw == null) return true;
+    var released = false;
+    try {
+      released = gw.tryRelease(jobId);
+    } catch (_) {
+      released = false;
+    }
+    if (released) {
+      _nativeJobsPendingRelease.remove(jobId);
+    } else {
+      _nativeJobsPendingRelease.add(jobId);
+    }
+    return released;
+  }
+
+  /// 有界回收：每次 tick 尝试一次；取消失败/仍运行不会阻塞 UI，也不会无限忙等。
+  void _reapNativeJobs() {
+    if (_nativeJobsPendingRelease.isEmpty) return;
+    final gw = gateway;
+    if (gw == null) {
+      _nativeJobsPendingRelease.clear();
+      return;
+    }
+    for (final id in _nativeJobsPendingRelease.toList(growable: false)) {
+      try {
+        if (gw.tryRelease(id)) _nativeJobsPendingRelease.remove(id);
+      } catch (_) {
+        // 保持待回收：桥接关闭时统一销毁。
+      }
+    }
+  }
+
   void _tick() {
+    _reapNativeJobs();
     final run = _run;
     if (run == null) return;
     final elapsed = DateTime.now().difference(run.startedAt);
@@ -2188,8 +2839,29 @@ class AppController extends ChangeNotifier {
     try {
       polled = gw.poll(run.jobId);
     } catch (e) {
-      _errorMessage = '读取分析进度失败：$e';
+      // 轮询本身坏掉时不能只丢内存引用：必须结束票据、清匹配的占位、回收原生 job，
+      // 否则会话会被“幽灵锁”卡住且退出时无法判断 job 是否已终结。
+      var detail = '读取分析进度失败：$e';
       _stopTimers();
+      try {
+        gw.cancel(run.jobId);
+      } catch (_) {
+        // 取消失败不改变结论：job 仍可能运行，交给有界回收/关闭等待。
+      }
+      _releaseNativeJob(run.jobId);
+      final ticket = gate.activeFor(run.conversationId);
+      if (ticket != null && ticket.requestId == run.requestId) {
+        gate.finish(ticket);
+      }
+      try {
+        await clearPendingFor(
+          conversationId: run.conversationId,
+          requestId: run.requestId,
+        );
+      } catch (cleanupError) {
+        detail = '$detail；清理待处理标记失败：$cleanupError';
+      }
+      _errorMessage = detail;
       _run = null;
       _notify();
       return;
@@ -2218,7 +2890,7 @@ class AppController extends ChangeNotifier {
     } catch (e) {
       _errorMessage = '读取分析结果失败：$e';
     }
-    gw.release(run.jobId);
+    _releaseNativeJob(run.jobId);
 
     final ticket = gate.activeFor(run.conversationId);
     if (ticket == null || ticket.requestId != run.requestId) {
@@ -2228,63 +2900,127 @@ class AppController extends ChangeNotifier {
       return;
     }
 
-    await _clearPending();
-
-    if (terminal.type == 'cancelled' || outcome == null || !outcome.ok) {
-      final message = terminal.type == 'cancelled'
-          ? '已取消本次分析；原有计划与标题保持不变'
-          : '分析失败：${outcome?.error ?? terminal.error}；原有计划与标题保持不变';
-      _statusMessage = message;
-      if (terminal.type != 'cancelled') _errorMessage = outcome?.error;
-      gate.finish(ticket);
-      _run = null;
-      _notify();
-      return;
+    var cleanupNote = '';
+    try {
+      await clearPendingFor(
+        conversationId: run.conversationId,
+        requestId: run.requestId,
+      );
+    } catch (e) {
+      cleanupNote = '；清理待处理标记失败：$e';
     }
 
-    await _commitResult(
-      ticket,
-      outcome,
-      run.submittedDraft,
-      externalFingerprint: run.externalFingerprint,
-      externalSourcesRef: run.externalSourcesRef,
-    );
-    gate.finish(ticket);
-    _run = null;
-    _waitPromptShown = false;
-    _notify();
+    try {
+      if (terminal.type == 'cancelled' || outcome == null || !outcome.ok) {
+        final message = terminal.type == 'cancelled'
+            ? '已取消本次分析；原有计划与标题保持不变'
+            : '分析失败：${outcome?.error ?? terminal.error}；原有计划与标题保持不变';
+        _statusMessage = '$message$cleanupNote';
+        if (terminal.type != 'cancelled') _errorMessage = outcome?.error;
+        return;
+      }
+
+      final commit = await commitAnalysisResult(
+        ticket,
+        outcome,
+        run.submittedDraft,
+        externalFingerprint: run.externalFingerprint,
+        externalSourcesRef: run.externalSourcesRef,
+        scheduleFingerprint: run.scheduleFingerprint,
+        scheduleDateFrom: run.scheduleDateFrom,
+        scheduleDateTo: run.scheduleDateTo,
+        scheduleTimezoneId: run.scheduleTimezoneId,
+        scheduleTimezoneOffsetMinutes: run.scheduleTimezoneOffsetMinutes,
+      );
+      _statusMessage = commit.warning == null
+          ? '${commit.message}$cleanupNote'
+          : '${commit.message}；${commit.warning}$cleanupNote';
+      if (commit.status == PlanCommitStatus.failed) {
+        _errorMessage = commit.message;
+      }
+    } catch (e) {
+      // 提交过程中的意外异常也必须结束票据，避免下一次分析被永久锁死。
+      _errorMessage = '提交分析结果失败：$e';
+      _statusMessage = '分析已完成，但结果未能写入本地版本；原有计划保持不变$cleanupNote';
+    } finally {
+      gate.finish(ticket);
+      _run = null;
+      _waitPromptShown = false;
+      _notify();
+    }
   }
 
-  Future<void> _commitResult(
+  /// 把 [outcome] 应用到 [ticket] 对应的会话，并返回明确结果。
+  ///
+  /// 校验顺序：请求身份/会话可用性 → 时间表与外部日历基线 → 任务映射 → 提交门
+  /// → 候选计划本地校验 → 落盘。任何一步失败都不改磁盘与内存版本；只有
+  /// [PlanCommitStatus.committed] 才表示成功，且 [PlanCommitResult.versionId]
+  /// 只可能是本次新增版本。该入口同时供普通分析与分块分析复用。
+  Future<PlanCommitResult> commitAnalysisResult(
     RequestTicket ticket,
     AnalyzeOutcome outcome,
     String submittedDraft, {
     String externalFingerprint = '',
     List<ExternalCalendarSourceRef> externalSourcesRef =
         const <ExternalCalendarSourceRef>[],
+    String scheduleFingerprint = '',
+    String scheduleDateFrom = '',
+    String scheduleDateTo = '',
+    String scheduleTimezoneId = '',
+    int scheduleTimezoneOffsetMinutes = 0,
   }) async {
-    final c = _conversation;
     final plan = outcome.plan;
     final latest = await _loadFor(ticket.conversationId);
     if (latest == null || latest.isDeleted || latest.isArchived) {
-      _statusMessage = '会话已归档或删除，迟到结果已丢弃';
-      return;
+      return const PlanCommitResult(
+        status: PlanCommitStatus.rejected,
+        message: '会话已归档或删除，迟到结果已丢弃',
+      );
     }
     final currentTimetable =
         latest.currentVersion?.timetable ?? latest.calendarDraft;
+    var currentScheduleFingerprint = '';
+    if (scheduleFingerprint.isNotEmpty) {
+      final snapshot = scheduleBusyForRange(
+        dateFrom: scheduleDateFrom,
+        dateTo: scheduleDateTo,
+        timezoneId: scheduleTimezoneId,
+        timezoneOffsetMinutes: scheduleTimezoneOffsetMinutes,
+      );
+      if (snapshot == null || !snapshot.available) {
+        return const PlanCommitResult(
+          status: PlanCommitStatus.failed,
+          message: '本地日程数据当前不可用，无法确认分析结果是否已过期；'
+              '原有计划保持不变',
+        );
+      }
+      currentScheduleFingerprint = snapshot.fingerprint!;
+    }
     final stale = staleResultMessage(
       requestedTimetableRevision: ticket.calendarRevision,
       currentTimetableRevision: currentTimetable?.revision ?? 0,
       requestedExternalFingerprint: externalFingerprint,
       currentExternalFingerprint: externalFingerprintFor(latest),
+      requestedScheduleFingerprint: scheduleFingerprint,
+      currentScheduleFingerprint: currentScheduleFingerprint,
     );
     if (stale != null) {
-      _statusMessage = stale;
-      return;
+      return PlanCommitResult(status: PlanCommitStatus.rejected, message: stale);
     }
+    final c = _conversation;
     if (c == null || c.id != ticket.conversationId || plan == null) {
-      _statusMessage = '结果不属于当前会话，已丢弃';
-      return;
+      return const PlanCommitResult(
+        status: PlanCommitStatus.rejected,
+        message: '结果不属于当前会话，已丢弃',
+      );
+    }
+    // 取消或新请求已接管时，即使结果完整也不能提交（提交门之外的第二道保险）。
+    if (ticket.cancelled ||
+        !identical(gate.activeFor(ticket.conversationId), ticket)) {
+      return const PlanCommitResult(
+        status: PlanCommitStatus.rejected,
+        message: '本次请求已取消或已被新请求替代，结果未采纳',
+      );
     }
 
     final proposed = ((plan['tasks'] as List<dynamic>?) ?? const [])
@@ -2292,8 +3028,10 @@ class AppController extends ChangeNotifier {
         .map((t) => TaskRecord.fromLocalJson(t))
         .toList(growable: false);
     if (proposed.isEmpty) {
-      _statusMessage = '模型没有返回任何任务，已忽略本次结果';
-      return;
+      return const PlanCommitResult(
+        status: PlanCommitStatus.rejected,
+        message: '模型没有返回任何任务，已忽略本次结果',
+      );
     }
 
     final base = _versionById(c, ticket.baseVersionId);
@@ -2382,8 +3120,39 @@ class AppController extends ChangeNotifier {
       resultVersionId: newVersion.id,
     );
     if (!allowed) {
-      _statusMessage = '本次结果已过期（计划版本已变化），未采纳；原有计划保持不变';
-      return;
+      return const PlanCommitResult(
+        status: PlanCommitStatus.rejected,
+        message: '本次结果已过期（计划版本已变化），未采纳；原有计划保持不变',
+      );
+    }
+    // 乐观并发检查：校验期间若有其他流程替换了会话缓存，本次提交直接放弃，
+    // 不覆盖别人的状态。检查与落盘之间没有 await。
+    if (!identical(_conversation, c) || !identical(_cache[c.id], c)) {
+      return const PlanCommitResult(
+        status: PlanCommitStatus.rejected,
+        message: '会话状态在提交前已变化，未采纳；请重新分析',
+      );
+    }
+    if (newVersion.plan.tasks.isEmpty) {
+      return const PlanCommitResult(
+        status: PlanCommitStatus.rejected,
+        message: '本地整理后没有可提交的任务，未生成新版本',
+      );
+    }
+    // 先跑 C 内核的校验/重排；非法计划绝不能先落盘再失败。
+    final DisplaySnapshot snapshot;
+    try {
+      snapshot = engine.compute(newVersion.plan);
+    } on ScheduleException catch (e) {
+      return PlanCommitResult(
+        status: PlanCommitStatus.failed,
+        message: '计划校验失败：${e.message}',
+      );
+    } catch (e) {
+      return PlanCommitResult(
+        status: PlanCommitStatus.failed,
+        message: '计划校验失败：$e',
+      );
     }
 
     // Commit title + plan together: the title only changes with the new result.
@@ -2413,16 +3182,38 @@ class AppController extends ChangeNotifier {
       updatedAt: DateTime.now(),
       clearPendingRequest: true,
     );
+    // 先落盘、后发布内存状态：写入失败时界面不能显示“已生成”，也不能留下
+    // 一个只存在于内存中的版本。保存失败时旧文件由原子写入保留。
+    try {
+      await store.saveConversation(updated);
+    } catch (e) {
+      return PlanCommitResult(
+        status: PlanCommitStatus.failed,
+        message: '新版本未能写入本地存储：$e',
+      );
+    }
     _conversation = updated;
     _cache[c.id] = updated;
     _viewVersion = newVersion;
-    _display = _compute(newVersion.plan) ?? _display;
-    await store.saveConversation(updated);
-    _reindexSummaries();
-    await store.saveIndex(_summaries);
-    _statusMessage = reconciled.reviewNotes.isEmpty
+    _display = snapshot;
+    String? warning;
+    try {
+      _reindexSummaries();
+      await store.saveIndex(_summaries);
+    } catch (e) {
+      // 会话文件已经保存；索引只服务侧栏摘要，重启或下次保存会重建。
+      warning = '计划版本已保存，但会话列表索引更新失败：$e';
+      _errorMessage = warning;
+    }
+    final message = reconciled.reviewNotes.isEmpty
         ? '已生成新版本'
         : '已生成新版本；有 ${reconciled.reviewNotes.length} 项完成状态需要你复核';
+    return PlanCommitResult(
+      status: PlanCommitStatus.committed,
+      message: message,
+      versionId: newVersion.id,
+      warning: warning,
+    );
   }
 
   PlanVersion? _versionById(Conversation c, String? id) {
@@ -2442,12 +3233,28 @@ class AppController extends ChangeNotifier {
     return '新计划';
   }
 
-  Future<void> _clearPending() async {
-    final fresh = _conversation;
-    if (fresh == null) return;
-    final cleared = fresh.copyWith(clearPendingRequest: true);
-    _conversation = cleared;
-    _cache[cleared.id] = cleared;
+  /// 只清除与本次请求匹配的持久化占位标记。
+  ///
+  /// 不能按“当前会话”清理：请求期间用户可能切换会话，或新请求已写入自己的
+  /// pending；按 conversationId + requestId 清理可避免旧任务回调清掉新任务的占位。
+  Future<void> clearPendingFor({
+    required String conversationId,
+    required String requestId,
+  }) async {
+    var c = _cache[conversationId];
+    if (c == null) {
+      try {
+        c = await store.loadConversation(conversationId);
+      } catch (_) {
+        return;
+      }
+    }
+    if (c == null) return;
+    final pending = c.pendingRequest;
+    if (pending == null || pending.requestId != requestId) return;
+    final cleared = c.copyWith(clearPendingRequest: true);
+    if (identical(_cache[conversationId], c)) _cache[conversationId] = cleared;
+    if (_conversation?.id == conversationId) _conversation = cleared;
     await store.saveConversation(cleared);
   }
 
@@ -2470,7 +3277,6 @@ class AppController extends ChangeNotifier {
     _notify();
   }
 
-  // ------------------------------------------------------------- versions
 
   /// Remembers the dependency view per conversation (it survives restarts).
   Future<void> setChartMode(String mode) async {
@@ -2506,7 +3312,6 @@ class AppController extends ChangeNotifier {
     _notify();
   }
 
-  // ----------------------------------------------------------- plan edits
 
   Future<bool> toggleCompletion(String taskId) async {
     if (!canEditPlan) return false;
@@ -2655,7 +3460,6 @@ class AppController extends ChangeNotifier {
     return true;
   }
 
-  // ------------------------------------------------- calendar (0.06)
 
   /// Notes produced by the last automatic pass ("容量不足…", "前置还未安排…"), keyed by
   /// task id. Transient on purpose: the persisted facts are the segments and the
@@ -2791,7 +3595,8 @@ class AppController extends ChangeNotifier {
     final v = _viewVersion;
     if (v == null) return false;
     // 编辑器可能拿到的是合成快照的 settings；落盘前剥掉外部占用。
-    final manualSettings = withoutExternalOccupancies(settings);
+    final manualSettings = withoutLocalScheduleOccupancies(
+        withoutExternalOccupancies(settings));
     var schedule = v.calendar.copyWith(settings: manualSettings);
     if (reschedule) {
       final plan = autoSchedule(
@@ -2813,7 +3618,6 @@ class AppController extends ChangeNotifier {
     ));
   }
 
-  // ------------------------------------------------ structured timetable
 
   int get weekStartsOn => settings?.prefs.weekStartsOn ?? 1;
 
@@ -2874,12 +3678,21 @@ class AppController extends ChangeNotifier {
     required int currentTimetableRevision,
     required String requestedExternalFingerprint,
     required String currentExternalFingerprint,
+    String requestedScheduleFingerprint = '',
+    String currentScheduleFingerprint = '',
   }) {
     final timetableStale =
         calendarStaleMessage(requestedTimetableRevision, currentTimetableRevision);
     if (timetableStale != null) return timetableStale;
-    return externalCalendarStaleMessage(
+    final externalStale = externalCalendarStaleMessage(
         requestedExternalFingerprint, currentExternalFingerprint);
+    if (externalStale != null) return externalStale;
+    if (requestedScheduleFingerprint.isNotEmpty &&
+        requestedScheduleFingerprint != currentScheduleFingerprint) {
+      return '本地日程在分析期间已变化（新增/改期/删除/忙闲切换），'
+          '本次结果未应用；请重新分析';
+    }
+    return null;
   }
 
   /// 输入框里的时间表摘要；没有可发送的时间表时为 null。
@@ -2923,7 +3736,8 @@ class AppController extends ChangeNotifier {
     bool reschedule = true,
   }) async {
     // 编辑器可能拿的是合成快照 settings；外部占用绝不进入版本数据。
-    final manualSettings = withoutExternalOccupancies(settings);
+    final manualSettings = withoutLocalScheduleOccupancies(
+        withoutExternalOccupancies(settings));
     if (_applyingTimetable) {
       _errorMessage = '时间表正在保存，请稍候';
       _notify();
@@ -2953,8 +3767,6 @@ class AppController extends ChangeNotifier {
         _conversation = updated;
         _cache[updated.id] = updated;
         await store.saveConversation(updated);
-        // 提示词 02：保存成功回执不在主区顶部显示（也不留占位）；数据已落盘，
-        // 失败仍走 _errorMessage。撤销/历史不依赖这条文案。
         _notify();
         return true;
       }
@@ -2997,8 +3809,7 @@ class AppController extends ChangeNotifier {
         timetable: nextTimetable,
       );
       if (ok) {
-        // 提示词 02：时间表保存成功回执不在主区顶部显示，也不留占位。底层操作名
-        // /撤销数据仍保留在 `_rememberTaskUndo` 与版本数据里；失败与存储警告不受影响。
+        // 成功不占用主区状态栏；撤销和版本数据仍保留。
         _statusMessage = null;
         _notify();
       }
@@ -3008,7 +3819,6 @@ class AppController extends ChangeNotifier {
     }
   }
 
-  // ---------------------------------------- AI calendar-constraint proposals
 
   /// The material a constraint scan is allowed to see: everything the user actually
   /// submitted for this conversation (their messages) plus the extracted text of every
@@ -3225,11 +4035,8 @@ class AppController extends ChangeNotifier {
       _proposalJob = null;
       _proposalStage = '';
       _notify();
-      try {
-        gw.release(jobId);
-      } catch (_) {
-        // Releasing a finished job must never surface as a user-facing error.
-      }
+      // 结束的 job 才可释放；运行中释放会被 ABI 拒绝并转入有界回收。
+      _releaseNativeJob(jobId);
     }
   }
 
@@ -3307,7 +4114,6 @@ class AppController extends ChangeNotifier {
         ],
       };
 
-  // ------------------------------------------------- conversation lifecycle
 
   List<ConversationSummary> get visibleSummaries => _summaries
       .where((s) => !s.isArchived && !s.isDeleted)
@@ -3558,7 +4364,6 @@ class AppController extends ChangeNotifier {
     }
   }
 
-  // --------------------------------------------------------------- export
   Future<String?> exportUserText(String path) async {
     final v = _viewVersion;
     final gw = gateway;
@@ -3710,7 +4515,6 @@ class AppController extends ChangeNotifier {
   Map<String, dynamic> _localJsonForExport(PlanVersion v) =>
       _planWithCompletion(v).toLocalJson();
 
-  // ------------------------------------------------------------- internals
 
   void _reindexSummaries() {
     final updated = <ConversationSummary>[];
@@ -3748,6 +4552,8 @@ class AppController extends ChangeNotifier {
     await flushPendingWrites();
     // 活动计时保存检查点并暂停（不把退出到重启之间的时间算成工作）。
     await timer?.shutdown();
+    // 日程命令在退出前排空：不能 dispose 后丢写入；实例锁由 bootstrap 释放。
+    await schedule?.drain();
   }
 
   @override
@@ -3756,6 +4562,15 @@ class AppController extends ChangeNotifier {
     unawaited(flushPendingWrites());
     _disposed = true;
     _stopTimers();
+    final run = _run;
+    if (run != null) {
+      try {
+        gateway?.cancel(run.jobId);
+      } catch (_) {
+        // 关闭流程会统一取消；这里只尽量缩短工作线程存活时间。
+      }
+    }
+    _reapNativeJobs();
     interaction.dispose();
     super.dispose();
   }

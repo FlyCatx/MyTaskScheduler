@@ -4,7 +4,7 @@
 //   sources.json                 — 来源列表（id/名称/启用/范围/策略/统计）
 //   snapshots/<sourceId>.json    — 每个来源一份导入快照（事件 + 警告 + 统计）
 //
-// 可靠性写法与 SessionStore 一致（见 session_store.dart 顶部注释）：
+// 可靠性写法见 storage_json_write.dart（与 SessionStore、ExecutionStore 共用）：
 //   * 新内容先写唯一临时文件 `<file>.<token>.tmp` 并 flush；
 //   * 旧主文件改名 `<file>.bak`；
 //   * 临时文件改名成主文件；
@@ -22,7 +22,7 @@ import 'dart:convert';
 import 'dart:io';
 
 import '../model/external_calendar.dart';
-import 'storage_migration.dart';
+import 'storage_json_write.dart';
 
 /// 存储层错误（损坏、不可写、非法 id）。
 class ExternalCalendarStoreException implements Exception {
@@ -283,49 +283,7 @@ class ExternalCalendarStore {
     return (data: null, unreadable: sawExisting);
   }
 
-  static final Map<String, Future<void>> _writeQueues = <String, Future<void>>{};
-  static int _writeSequence = 0;
-
-  Future<void> _writeJson(File file, Map<String, dynamic> data) {
-    final previous = _writeQueues[file.path] ?? Future<void>.value();
-    late final Future<void> next;
-    next = previous
-        .catchError((Object _) {})
-        .then((_) => _writeJsonNow(file, data))
-        .whenComplete(() {
-      if (identical(_writeQueues[file.path], next)) {
-        _writeQueues.remove(file.path);
-      }
-    });
-    _writeQueues[file.path] = next;
-    return next;
-  }
-
-  Future<void> _writeJsonNow(File file, Map<String, dynamic> data) async {
-    StorageWriteGate.beginOperation();
-    try {
-      final token =
-          '${DateTime.now().microsecondsSinceEpoch}-${_writeSequence++}';
-      final tmp = File('${file.path}.$token.tmp');
-      final bak = File('${file.path}.bak');
-      final payload = const JsonEncoder.withIndent('  ').convert(data);
-      await ensureLayout();
-      await tmp.writeAsString(payload, flush: true);
-      try {
-        if (await file.exists()) {
-          if (await bak.exists()) await bak.delete();
-          await file.rename(bak.path);
-        }
-        await tmp.rename(file.path);
-      } catch (e) {
-        // 清理半成品，但绝不覆盖主文件；错误交给调用方显示。
-        try {
-          if (await tmp.exists()) await tmp.delete();
-        } catch (_) {}
-        rethrow;
-      }
-    } finally {
-      StorageWriteGate.endOperation();
-    }
-  }
+  /// 同路径串行化、临时文件与 `.bak` 的落盘协议见 [writeJsonAtomically]。
+  Future<void> _writeJson(File file, Map<String, dynamic> data) =>
+      writeJsonAtomically(file, data, prepareDirectory: ensureLayout);
 }

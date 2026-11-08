@@ -38,6 +38,36 @@ class CommitRejection {
   String toString() => 'CommitRejection($reason)';
 }
 
+/// 把一次模型结果应用到会话的明确结果。
+///
+/// 调用方不能再从“当前版本存在”或 `partial == false` 推断成功：只有
+/// [PlanCommitStatus.committed] 且 [PlanCommitResult.versionId] 非空才代表本次结果
+/// 真正写入了存储。[rejected] 表示被提交门/本地校验拒绝（磁盘未动），[failed] 表示
+/// 写入或校验过程出错（磁盘内容以 [PlanCommitResult.warning] 说明为准）。
+enum PlanCommitStatus { committed, rejected, failed }
+
+class PlanCommitResult {
+  const PlanCommitResult({
+    required this.status,
+    required this.message,
+    this.versionId,
+    this.warning,
+  });
+
+  final PlanCommitStatus status;
+
+  /// 给用户看的简短说明；调用方不得用别的字段替代它。
+  final String message;
+
+  /// 仅 committed 时非空，且必须是**本次**新增版本 id。
+  final String? versionId;
+
+  /// committed 但仍需提示的可恢复问题（例如索引写入失败，版本文件已落盘）。
+  final String? warning;
+
+  bool get ok => status == PlanCommitStatus.committed && versionId != null;
+}
+
 /// Immutable description of the conversation state a commit would apply to.
 class CommitContext {
   final String conversationId;

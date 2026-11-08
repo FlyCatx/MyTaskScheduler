@@ -25,11 +25,15 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:crypto/crypto.dart';
+
 import '../model/external_calendar.dart' show kExternalCalendarDirName;
+import '../model/schedule_event.dart';
 import '../model/session.dart';
 import '../model/settings.dart';
 import 'execution/execution_ledger.dart';
 import 'execution/execution_store.dart';
+import 'schedule/schedule_store.dart';
 import 'session_repository.dart';
 import 'settings_controller.dart';
 import 'settings_store.dart';
@@ -41,6 +45,11 @@ class BackupExportResult {
     required this.conversationCount,
     required this.profileCount,
     required this.byteLength,
+    this.ocrMaterialFileCount = 0,
+    this.missingOcrMaterialPaths = const <String>[],
+    this.unsafeOcrMaterialPaths = const <String>[],
+    this.scheduleEventCount = 0,
+    this.warning,
   });
 
   final String path;
@@ -48,8 +57,36 @@ class BackupExportResult {
   final int profileCount;
   final int byteLength;
 
-  String get summary => '已备份 $conversationCount 个会话、$profileCount 个连接'
-      '（${formatByteCount(byteLength)}）：$path';
+  /// 备份里实际包含的 OCR 来源文件数（`ocr_materials/<attachmentId>.json`）。
+  final int ocrMaterialFileCount;
+
+  /// 会话引用了、但数据目录里已缺失（或不是普通文件）的 OCR 来源文件。
+  ///
+  /// 备份仍然写出其余数据，但这些附件的详细来源没有进入备份，必须如实报告，
+  /// 不能把这份备份说成“完整成功”。
+  final List<String> missingOcrMaterialPaths;
+
+  /// 引用路径落在符号链接/联接点上而被拒绝读取的 OCR 来源文件（不跟随到目录外）。
+  final List<String> unsafeOcrMaterialPaths;
+
+  /// 备份里包含的全局日程记录数（含删除标记）。0 = 未启用日程服务或没有日程。
+  final int scheduleEventCount;
+
+  /// 非致命问题（OCR 来源文件缺失/被拒绝、日程内存模式等）；UI 应展示，
+  /// 不能静默忽略。
+  final String? warning;
+
+  String get summary {
+    final ocr = ocrMaterialFileCount > 0
+        ? '、$ocrMaterialFileCount 个 OCR 来源文件'
+        : '';
+    final schedule =
+        scheduleEventCount > 0 ? '、$scheduleEventCount 条日程' : '';
+    final base = '已备份 $conversationCount 个会话、$profileCount 个连接$ocr$schedule'
+        '（${formatByteCount(byteLength)}）：$path';
+    final notice = warning;
+    return notice == null ? base : '$base；$notice';
+  }
 }
 
 /// Result of a restore attempt. [ok] false always leaves the previous data in place.
@@ -76,6 +113,19 @@ class BackupRestoreResult {
     this.restoredExternalCalendarFileCount = 0,
     this.executionRecordCount = 0,
     this.restoredExecutionRecordCount = 0,
+    this.ocrMaterialFileCount = 0,
+    this.restoredOcrMaterialFileCount = 0,
+    this.skippedOcrMaterialFileCount = 0,
+    this.conflictOcrMaterialPaths = const <String>[],
+    this.missingOcrMaterialReferenceCount = 0,
+    this.scheduleSectionPresent = false,
+    this.scheduleEventCount = 0,
+    this.restoredScheduleEventCount = 0,
+    this.skippedScheduleEventCount = 0,
+    this.conflictScheduleEventIds = const <String>[],
+    this.unlinkedScheduleEventIds = const <String>[],
+    this.scheduleNotices = const <String>[],
+    this.scheduleReloaded = false,
   });
 
   final bool ok;
@@ -145,6 +195,46 @@ class BackupRestoreResult {
   final int executionRecordCount;
   final int restoredExecutionRecordCount;
 
+  /// 备份里包含的 OCR 来源文件数（`ocr_materials/<attachmentId>.json`）。
+  final int ocrMaterialFileCount;
+
+  /// 实际写入的 OCR 来源文件数（同路径同内容的会跳过，重复恢复因此幂等）。
+  final int restoredOcrMaterialFileCount;
+
+  /// 本地已有相同内容、按幂等跳过写入的 OCR 来源文件数。
+  final int skippedOcrMaterialFileCount;
+
+  /// 本地同路径内容不同（或路径不可安全写入）而未覆盖的 OCR 来源文件。
+  final List<String> conflictOcrMaterialPaths;
+
+  /// 备份中被附件引用、但备份与本地都没有的来源文件数：恢复后详细来源缺失，
+  /// 文字仍然有效。必须计数并作为 warning 报告。
+  final int missingOcrMaterialReferenceCount;
+
+  /// 备份里是否带全局日程段。旧备份没有该段 → false；此时绝不清空本地日程。
+  final bool scheduleSectionPresent;
+
+  /// 备份里的日程记录数（含删除标记）。
+  final int scheduleEventCount;
+
+  /// 实际新增到本地日程库的记录数。
+  final int restoredScheduleEventCount;
+
+  /// 本地已存在且内容相同、按幂等跳过的日程记录数。
+  final int skippedScheduleEventCount;
+
+  /// 本地同 ID 但内容不同、为避免覆盖而保留本地的日程记录 ID。
+  final List<String> conflictScheduleEventIds;
+
+  /// 恢复的日程中，关联会话在备份与本地都不存在、因而被解除关联的记录 ID。
+  final List<String> unlinkedScheduleEventIds;
+
+  /// 日程未恢复/未刷新等需要用户知道的原因；同时并入 [warning]，存储页单独展示。
+  final List<String> scheduleNotices;
+
+  /// 日程服务是否已在本次恢复后刷新成功。
+  final bool scheduleReloaded;
+
   /// True only when no file was replaced, or every replaced file was verifiably put
   /// back. An empty rollback list after a partially attempted commit is *not* proof of
   /// "unchanged".
@@ -159,6 +249,10 @@ class BackupRestoreResult {
       if (restoredConversationCount > 0) '$restoredConversationCount 个会话',
       if (restoredExternalCalendarFileCount > 0)
         '$restoredExternalCalendarFileCount 个外部日历文件',
+      if (restoredOcrMaterialFileCount > 0)
+        '$restoredOcrMaterialFileCount 个 OCR 来源文件',
+      if (restoredScheduleEventCount > 0)
+        '$restoredScheduleEventCount 条日程',
       if (restoredPrefs) '应用偏好',
       if (restoredProfileCount > 0)
         '$restoredProfileCount 个模型连接（密钥需重新输入）',
@@ -166,8 +260,25 @@ class BackupRestoreResult {
     final skipped = skippedConversationCount > 0
         ? '；$skippedConversationCount 个会话内容相同，已跳过'
         : '';
-    if (applied.isEmpty) return '备份内容与本地一致，未恢复任何数据$skipped';
-    return '已恢复 ${applied.join('、')}$skipped';
+    // 部分恢复必须让用户看到：被跳过的来源文件、悬空引用与日程冲突不能只藏在
+    // warning 字段里（存储页展示的是 summary）。
+    final notesList = <String>[
+      if (conflictOcrMaterialPaths.isNotEmpty)
+        '${conflictOcrMaterialPaths.length} 个 OCR 来源文件与本地不同或不可安全写入，未覆盖',
+      if (missingOcrMaterialReferenceCount > 0)
+        '$missingOcrMaterialReferenceCount 个 OCR 附件的详细来源文件缺失（文字保留）',
+      if (skippedScheduleEventCount > 0)
+        '$skippedScheduleEventCount 条日程内容相同，已跳过',
+      if (conflictScheduleEventIds.isNotEmpty)
+        '${conflictScheduleEventIds.length} 条日程与本地同 ID 但内容不同，保留本地',
+      if (unlinkedScheduleEventIds.isNotEmpty)
+        '${unlinkedScheduleEventIds.length} 条日程的关联会话不存在，已解除关联',
+    ];
+    final notes = notesList.isEmpty ? '' : '；${notesList.join('；')}';
+    if (applied.isEmpty) {
+      return '备份内容与本地一致，未恢复任何数据$skipped$notes';
+    }
+    return '已恢复 ${applied.join('、')}$skipped$notes';
   }
 }
 
@@ -291,9 +402,15 @@ class BackupService {
     SettingsStore? settingsStore,
     this.execution,
     this.maxImportBytesLimit = maxImportBytes,
+    this.maxOcrMaterialBytesLimit = maxOcrMaterialBytes,
+    this.maxOcrMaterialsTotalBytesLimit = maxOcrMaterialsTotalBytes,
+    this.maxScheduleEventsLimit = maxScheduleEvents,
+    this.maxScheduleSectionBytesLimit = maxScheduleSectionBytes,
+    this.scheduleStore,
     this.isBusy,
     this.reloadSessions,
     this.reloadExternalCalendar,
+    this.reloadSchedule,
   }) : settingsStore = settingsStore ?? SettingsStore(root);
 
   /// Backup schema version written by this build.
@@ -308,9 +425,40 @@ class BackupService {
   /// 外部日历在备份文档里的结构版本。
   static const int externalCalendarSchemaVersion = 1;
 
+  /// OCR 页级来源数据目录名：`<root>/ocr_materials/`。
+  ///
+  /// `AppController.addOcrMaterial` 把每份 OCR 材料的页级来源、校对记录与引擎信息
+  /// 写成 `<attachmentId>.json`；附件只保存摘要与相对路径。备份按会话实际引用收集
+  /// 这些文件（base64 内容 + 长度 + SHA-256），**不含原始页图、密钥或任意原路径文件**。
+  static const String ocrMaterialsDirectoryName = 'ocr_materials';
+
+  /// OCR 来源数据在备份文档里的结构版本。
+  static const int ocrMaterialsSchemaVersion = 1;
+
   /// Hard limit for an import file (a backup is text; 32 MB is generous). Overridable
   /// through [maxImportBytesLimit] so tests do not have to write 32 MB.
   static const int maxImportBytes = 32 * 1024 * 1024;
+
+  /// 单个 OCR 来源文件的上限（解码后字节）。正常页级 JSON 每页只有几百字节到几 KB。
+  ///
+  /// 备份是单个 JSON 文本，恢复上限仍受 [maxImportBytesLimit] 约束；两个 OCR 上限
+  /// 一起保证导出的备份不会大到本程序自己无法导入。可用构造参数在测试中收紧。
+  static const int maxOcrMaterialBytes = 4 * 1024 * 1024;
+
+  /// 一次备份/恢复中所有 OCR 来源文件的总字节上限（解码后）。
+  static const int maxOcrMaterialsTotalBytes = 8 * 1024 * 1024;
+
+  /// 全局日程数据在备份文档里的结构版本（与 `schedules/events.json` 相同）。
+  static const int scheduleSchemaVersion = kScheduleSchemaVersion;
+
+  /// 单次备份/恢复允许的日程记录上限（含删除标记）；超出整份拒绝。
+  ///
+  /// 正常本地日程远小于该值；上限只用于阻止恶意/损坏备份撑爆内存。可用构造
+  /// 参数在测试中收紧。
+  static const int maxScheduleEvents = 20000;
+
+  /// 日程段序列化后的字节上限（备份是单个 JSON，仍受 [maxImportBytesLimit] 约束）。
+  static const int maxScheduleSectionBytes = 8 * 1024 * 1024;
 
   /// Name of the app-owned cache directory (`<root>/cache`).
   static const String cacheDirectoryName = 'cache';
@@ -327,6 +475,18 @@ class BackupService {
   static const String cacheFilePrefix = 'tsc-';
 
   final int maxImportBytesLimit;
+
+  /// 见 [maxOcrMaterialBytes]；测试用较小值验证解码前后的总量限额。
+  final int maxOcrMaterialBytesLimit;
+
+  /// 见 [maxOcrMaterialsTotalBytes]；测试用较小值验证总量限额。
+  final int maxOcrMaterialsTotalBytesLimit;
+
+  /// 见 [maxScheduleEvents]；测试用较小值验证日程数量限额。
+  final int maxScheduleEventsLimit;
+
+  /// 见 [maxScheduleSectionBytes]；测试用较小值验证日程段大小限额。
+  final int maxScheduleSectionBytesLimit;
 
   static const String backupKind = 'taskscheduler-backup';
 
@@ -354,6 +514,18 @@ class BackupService {
 
   /// 恢复外部日历文件后让内存里的服务重新加载。缺失时可报告“重启后生效”。
   final Future<void> Function()? reloadExternalCalendar;
+
+  /// 全局日程权威库（0.4.0）。null = 本次运行未启用日程：导出不带日程段，
+  /// 恢复遇到日程段时如实提示未恢复，而不是假装成功。
+  ///
+  /// 必须复用运行中的 [ScheduleStore]（它持有实例锁并缓存快照）；另外 new 一个
+  /// 同目录的 store 会变成只读实例，无法写回。
+  final ScheduleStore? scheduleStore;
+
+  /// 备份恢复后刷新日程服务：生产接线为 `ScheduleController.reloadFromDisk`，
+  /// 它会重新读盘并通知日历叠层。缺失时退回 `ScheduleStore.reload()` 并报告
+  /// 界面需重启/重新打开日程列表后才一致。
+  final Future<void> Function()? reloadSchedule;
 
   static const Set<String> _sensitiveKeys = <String>{
     'apikey',
@@ -406,17 +578,42 @@ class BackupService {
       '${externalCalendarDirectory.path}${Platform.pathSeparator}'
       '${relativePosix.replaceAll('/', Platform.pathSeparator)}');
 
+  /// `<root>/ocr_materials/`（OCR 页级来源数据目录，由 `addOcrMaterial` 写入）。
+  Directory get ocrMaterialsDirectory => Directory(
+      '${root.path}${Platform.pathSeparator}$ocrMaterialsDirectoryName');
+
+  File _ocrMaterialFile(String relativePosix) => File(
+      '${root.path}${Platform.pathSeparator}'
+      '${relativePosix.replaceAll('/', Platform.pathSeparator)}');
+
+  /// `<root>/schedules/`（全局日程权威目录，由 ScheduleStore 写入）。
+  Directory get schedulesDirectory =>
+      Directory('${root.path}${Platform.pathSeparator}schedules');
+
+  /// `<root>/schedules/events.json`（全局日程权威文件）。
+  File get scheduleEventsFile => File(
+      '${schedulesDirectory.path}${Platform.pathSeparator}events.json');
+
   // --------------------------------------------------------------- export
 
   /// Writes one key-less backup JSON to [path].
   Future<BackupExportResult> exportBackup(String path) async {
     final index = await store.loadIndex();
     final conversations = <Map<String, dynamic>>[];
+    final referencedOcrPaths = <String>{};
     for (final summary in index) {
       final conversation = await store.loadConversation(summary.id);
-      if (conversation != null) conversations.add(conversation.toJson());
+      if (conversation == null) continue;
+      conversations.add(conversation.toJson());
+      // 只收集会话实际引用、且路径通过 `ocr_materials/<id>.json` 白名单的来源文件。
+      for (final attachment in conversation.attachments) {
+        final relative = _ocrMaterialPathOf(attachment);
+        if (relative != null) referencedOcrPaths.add(relative);
+      }
     }
     final externalCalendarFiles = await _readExternalCalendarFiles();
+    final ocrRead = await _readOcrMaterialFiles(referencedOcrPaths);
+    final scheduleRead = await _readScheduleForExport();
     final controller = settings;
     AppPreferences prefs;
     List<ProviderProfile> profiles;
@@ -442,6 +639,15 @@ class BackupService {
         'schemaVersion': externalCalendarSchemaVersion,
         'files': externalCalendarFiles,
       },
+      // OCR 来源数据：保存会话引用到的页级来源/校对/引擎 JSON（base64 + 长度 +
+      // SHA-256），不含原始页图、密钥或任意原路径文件。旧备份没有该键，读取兼容。
+      'ocrMaterials': <String, dynamic>{
+        'schemaVersion': ocrMaterialsSchemaVersion,
+        'files': ocrRead.files,
+      },
+      // 全局日程：含重复/例外/删除标记/会话关联身份；不含提醒运行记录（提醒去重
+      // 不跨目录，恢复后由新快照重建）。旧备份没有该键，读取兼容。
+      if (scheduleRead.section != null) 'schedules': scheduleRead.section!,
       'settings': <String, dynamic>{
         'schemaVersion': SettingsSnapshot.profilesSchemaVersion,
         'defaultProfileId': selection?.profileId ?? '',
@@ -479,11 +685,23 @@ class BackupService {
       }
       throw BackupException('写入备份文件失败：${_shortError(e)}');
     }
+    final exportWarnings = <String>[
+      if (ocrRead.missing.isNotEmpty)
+        '${ocrRead.missing.length} 个 OCR 来源文件缺失，备份不含其详细来源',
+      if (ocrRead.unsafe.isNotEmpty)
+        '${ocrRead.unsafe.length} 个 OCR 来源文件是符号链接/联接点，已拒绝读取',
+      if (scheduleRead.warning != null) scheduleRead.warning!,
+    ];
     return BackupExportResult(
       path: target.path,
       conversationCount: conversations.length,
       profileCount: profiles.length,
       byteLength: utf8.encode(payload).length,
+      ocrMaterialFileCount: ocrRead.files.length,
+      missingOcrMaterialPaths: List<String>.unmodifiable(ocrRead.missing),
+      unsafeOcrMaterialPaths: List<String>.unmodifiable(ocrRead.unsafe),
+      scheduleEventCount: scheduleRead.eventCount,
+      warning: exportWarnings.isEmpty ? null : exportWarnings.join('；'),
     );
   }
 
@@ -548,6 +766,351 @@ class BackupService {
       toWrite: List<_ExternalCalendarBackupFile>.unmodifiable(toWrite),
       total: files.length,
     );
+  }
+
+  // ---------------------------------------------------------- ocr materials
+
+  /// 会话实际引用的 OCR 来源文件路径（只接受 `ocr_materials/<id>.json` 白名单）。
+  ///
+  /// 旧数据、非 OCR 附件或没有 `provenance.materialFile` 的附件返回 null。
+  static String? _ocrMaterialPathOf(Attachment attachment) {
+    final provenance = attachment.provenance;
+    if (provenance == null) return null;
+    final raw = provenance['materialFile'];
+    return raw is String ? _safeOcrMaterialPath(raw) : null;
+  }
+
+  /// 读取被会话引用的 OCR 来源文件（相对路径 + 长度 + SHA-256 + base64 内容）。
+  ///
+  /// 只读 `<root>/ocr_materials/` 里的普通文件：目录或文件本身是符号链接/联接点时
+  /// 拒绝读取（不跟随到数据目录之外）。引用文件缺失时如实收集到 `missing`，
+  /// 由导出结果报告——不静默导出一份“完整”备份。
+  Future<
+      ({
+        List<Map<String, dynamic>> files,
+        List<String> missing,
+        List<String> unsafe,
+      })> _readOcrMaterialFiles(Set<String> referenced) async {
+    final files = <Map<String, dynamic>>[];
+    final missing = <String>[];
+    final unsafe = <String>[];
+    if (referenced.isEmpty) {
+      return (files: files, missing: missing, unsafe: unsafe);
+    }
+    final sorted = referenced.toList()..sort();
+    if (await _isReparsePoint(ocrMaterialsDirectory.path)) {
+      unsafe.addAll(sorted);
+      return (files: files, missing: missing, unsafe: unsafe);
+    }
+    var totalBytes = 0;
+    for (final relative in sorted) {
+      final target = _ocrMaterialFile(relative);
+      if (await _isReparsePoint(target.path)) {
+        unsafe.add(relative);
+        continue;
+      }
+      if (!await target.exists()) {
+        missing.add(relative);
+        continue;
+      }
+      List<int> bytes;
+      try {
+        bytes = await target.readAsBytes();
+      } catch (e) {
+        throw BackupException('读取 OCR 来源数据失败（$relative）：${_shortError(e)}');
+      }
+      if (bytes.length > maxOcrMaterialBytesLimit) {
+        throw BackupException('OCR 来源数据过大（$relative，'
+            '上限 ${formatByteCount(maxOcrMaterialBytesLimit)}），无法写入单文件备份');
+      }
+      totalBytes += bytes.length;
+      if (totalBytes > maxOcrMaterialsTotalBytesLimit) {
+        throw BackupException('OCR 来源数据总量过大'
+            '（上限 ${formatByteCount(maxOcrMaterialsTotalBytesLimit)}），'
+            '无法写入单文件备份');
+      }
+      // 损坏的来源文件不能被写进“可恢复”的备份：结构/JSON 校验失败直接报错。
+      _validateOcrMaterialJson(relative, bytes);
+      files.add(<String, dynamic>{
+        'path': relative,
+        'byteLength': bytes.length,
+        'sha256': _sha256Hex(bytes),
+        'content': base64Encode(bytes),
+      });
+    }
+    return (files: files, missing: missing, unsafe: unsafe);
+  }
+
+  /// 计划 OCR 来源文件恢复：同路径同内容跳过（幂等），不同内容不覆盖，链接不跟随。
+  ///
+  /// 附件引用但备份与本地都没有的来源文件计入 [missingReferenceCount]：恢复后文字
+  /// 仍然有效，但详细来源缺失，必须计数并提示（旧备份没有 OCR 段时就是这种情况）。
+  Future<_OcrMaterialRestorePlan> _planOcrMaterialRestore(
+      _ParsedBackup parsed) async {
+    final files = parsed.ocrMaterialFiles;
+    final toWrite = <_OcrMaterialBackupFile>[];
+    final identical = <String>[];
+    final conflicts = <String>[];
+    final directoryIsLink =
+        await _isReparsePoint(ocrMaterialsDirectory.path);
+    for (final file in files) {
+      final target = _ocrMaterialFile(file.relativePath);
+      if (directoryIsLink || await _isReparsePoint(target.path)) {
+        conflicts.add(file.relativePath);
+        continue;
+      }
+      if (!await target.exists()) {
+        toWrite.add(file);
+        continue;
+      }
+      try {
+        final existing = await target.readAsBytes();
+        if (_sameBytes(existing, file.bytes)) {
+          identical.add(file.relativePath);
+          continue;
+        }
+      } catch (_) {
+        // 读不出来的本地文件按冲突处理：不覆盖、不删除。
+      }
+      conflicts.add(file.relativePath);
+    }
+
+    final inBackup = files.map((file) => file.relativePath).toSet();
+    var missingReferences = 0;
+    for (final conversation in parsed.conversations) {
+      for (final attachment in conversation.attachments) {
+        final relative = _ocrMaterialPathOf(attachment);
+        if (relative == null || inBackup.contains(relative)) continue;
+        final target = _ocrMaterialFile(relative);
+        if (directoryIsLink || await _isReparsePoint(target.path)) {
+          missingReferences++;
+          continue;
+        }
+        if (!await target.exists()) missingReferences++;
+      }
+    }
+    return _OcrMaterialRestorePlan(
+      toWrite: List<_OcrMaterialBackupFile>.unmodifiable(toWrite),
+      identical: List<String>.unmodifiable(identical),
+      conflicts: List<String>.unmodifiable(conflicts),
+      total: files.length,
+      directoryIsLink: directoryIsLink,
+      missingReferenceCount: missingReferences,
+    );
+  }
+
+  // ------------------------------------------------------------ schedules
+
+  /// 导出全局日程快照（含删除标记）；不含提醒运行记录。
+  ///
+  /// 未启用日程服务（[scheduleStore] 为 null）→ 不写该段（返回 null section）。
+  /// 日程服务尚未打开时先尝试打开；仍不可读则明确报错，绝不导出一份缺日程的
+  /// “成功”备份。
+  Future<
+      ({
+        int eventCount,
+        Map<String, dynamic>? section,
+        String? warning,
+      })> _readScheduleForExport() async {
+    final store = scheduleStore;
+    if (store == null) {
+      return (eventCount: 0, section: null, warning: null);
+    }
+    if (!store.opened) {
+      try {
+        await store.open();
+      } catch (e) {
+        throw BackupException('读取日程数据失败：${_shortError(e)}');
+      }
+    }
+    if (!store.opened) {
+      throw BackupException('日程数据尚未加载（${store.notice ?? '日程库未打开'}），'
+          '已拒绝导出不完整备份');
+    }
+    final snapshot = store.snapshot;
+    final events = snapshot.events.values.toList(growable: false)
+      ..sort((a, b) => a.id.compareTo(b.id));
+    if (events.length > maxScheduleEventsLimit) {
+      throw BackupException('日程记录过多（${events.length} 条，'
+          '上限 $maxScheduleEventsLimit），已拒绝导出不完整备份');
+    }
+    final section = <String, dynamic>{
+      'schemaVersion': scheduleSchemaVersion,
+      'revision': snapshot.revision,
+      'events': events.map((event) => event.toJson()).toList(growable: false),
+    };
+    final sectionBytes = utf8.encode(jsonEncode(section)).length;
+    if (sectionBytes > maxScheduleSectionBytesLimit) {
+      throw BackupException('日程数据过大（${formatByteCount(sectionBytes)}，'
+          '上限 ${formatByteCount(maxScheduleSectionBytesLimit)}），'
+          '已拒绝导出不完整备份');
+    }
+    return (
+      eventCount: events.length,
+      section: section,
+      warning: store.isMemoryOnly
+          ? '日程服务为内存模式，备份只包含当前内存中的日程，重启后可能丢失'
+          : null,
+    );
+  }
+
+  /// 计划合并备份里的全局日程。
+  ///
+  /// 规则：同 ID 同内容幂等跳过；同 ID 不同内容保留本地并计数；只把新增记录
+  /// 写入合并快照，并按备份内会话映射重写关联、无匹配则解除。提醒运行记录不
+  /// 随备份恢复（由提醒服务按新快照重建）。
+  Future<_ScheduleRestorePlan> _planScheduleRestore(
+      _ParsedBackup parsed, List<ConversationSummary> localIndex) async {
+    final section = parsed.schedule;
+    if (section == null) return const _ScheduleRestorePlan();
+    final store = scheduleStore;
+    if (store == null) {
+      return _ScheduleRestorePlan(
+        present: true,
+        total: section.events.length,
+        skipReason: '本次运行未启用日程服务',
+      );
+    }
+    if (!store.opened) {
+      try {
+        await store.open();
+      } catch (e) {
+        return _ScheduleRestorePlan(
+          present: true,
+          total: section.events.length,
+          skipReason: '日程服务无法打开（${_shortError(e)}）',
+        );
+      }
+    }
+    if (!store.opened) {
+      return _ScheduleRestorePlan(
+        present: true,
+        total: section.events.length,
+        skipReason: '日程数据未加载（${store.notice ?? '日程库未打开'}）',
+      );
+    }
+    if (store.readOnly) {
+      return _ScheduleRestorePlan(
+        present: true,
+        total: section.events.length,
+        skipReason: '日程处于只读状态（${store.notice ?? '另一个实例正在使用该数据目录'}）',
+      );
+    }
+    if (!_sameAbsolutePath(store.eventsFile.path, scheduleEventsFile.path)) {
+      return _ScheduleRestorePlan(
+        present: true,
+        total: section.events.length,
+        skipReason: '日程服务的数据目录与恢复目标不一致',
+      );
+    }
+
+    final local = store.snapshot;
+    // 当前恢复不重命名会话 ID，因此映射是恒等的；保留这层映射，未来若加入会话
+    // ID 重命名，只需在这里给出真实映射即可同步日程关联。
+    final conversationIdMap = <String, String>{
+      for (final conversation in parsed.conversations)
+        conversation.id: conversation.id,
+    };
+    final validConversationIds = <String>{
+      ...conversationIdMap.values,
+      ...localIndex.map((summary) => summary.id),
+    };
+
+    final merged = Map<String, ScheduleEvent>.from(local.events);
+    final conflicts = <String>[];
+    final unlinked = <String>[];
+    var added = 0;
+    var skipped = 0;
+    for (final incoming in section.events) {
+      final existing = local.events[incoming.id];
+      if (existing != null) {
+        if (_canonicalJson(existing.toJson()) ==
+            _canonicalJson(incoming.toJson())) {
+          skipped++;
+        } else {
+          conflicts.add(incoming.id);
+        }
+        continue;
+      }
+      var event = incoming;
+      final linked = incoming.linkedConversationId;
+      if (linked != null && linked.isNotEmpty) {
+        final mapped = conversationIdMap[linked] ??
+            (validConversationIds.contains(linked) ? linked : null);
+        if (mapped == null) {
+          event = _withLinkedConversation(incoming, null);
+          unlinked.add(incoming.id);
+        } else if (mapped != linked) {
+          event = _withLinkedConversation(incoming, mapped);
+        }
+      }
+      merged[incoming.id] = event;
+      added++;
+    }
+
+    if (added == 0) {
+      return _ScheduleRestorePlan(
+        present: true,
+        total: section.events.length,
+        skipped: skipped,
+        conflicts: List<String>.unmodifiable(conflicts),
+        unlinkedEventIds: List<String>.unmodifiable(unlinked),
+      );
+    }
+    final localRevision = local.revision;
+    final revision =
+        (localRevision > section.revision ? localRevision : section.revision) + 1;
+    return _ScheduleRestorePlan(
+      present: true,
+      total: section.events.length,
+      restored: added,
+      skipped: skipped,
+      conflicts: List<String>.unmodifiable(conflicts),
+      unlinkedEventIds: List<String>.unmodifiable(unlinked),
+      merged: ScheduleSnapshot(
+        revision: revision,
+        events: Map<String, ScheduleEvent>.unmodifiable(merged),
+      ),
+    );
+  }
+
+  /// 复制一条日程并替换其会话关联（模型是不可变值，没有通用的关联 copyWith）。
+  static ScheduleEvent _withLinkedConversation(
+    ScheduleEvent event,
+    String? linkedConversationId,
+  ) =>
+      ScheduleEvent(
+        id: event.id,
+        revision: event.revision,
+        title: event.title,
+        location: event.location,
+        notes: event.notes,
+        category: event.category,
+        timezoneId: event.timezoneId,
+        allDay: event.allDay,
+        startDate: event.startDate,
+        startMinute: event.startMinute,
+        endMinute: event.endMinute,
+        endDateExclusive: event.endDateExclusive,
+        blocksScheduling: event.blocksScheduling,
+        linkedConversationId: linkedConversationId,
+        repeat: event.repeat,
+        reminder: event.reminder,
+        exceptions: event.exceptions,
+        createdAtUtc: event.createdAtUtc,
+        updatedAtUtc: event.updatedAtUtc,
+        deletedAtUtc: event.deletedAtUtc,
+      );
+
+  /// Windows 盘符不区分大小写；比较日程服务文件与恢复目标是否同一路径。
+  static bool _sameAbsolutePath(String a, String b) {
+    String normalize(String path) {
+      final absolute =
+          File(path).absolute.path.replaceAll(Platform.pathSeparator, '/');
+      return Platform.isWindows ? absolute.toLowerCase() : absolute;
+    }
+
+    return normalize(a) == normalize(b);
   }
 
   // -------------------------------------------------------------- restore
@@ -654,9 +1217,11 @@ class BackupService {
     final toWrite = parsed.conversations
         .where((c) => !identicalIds.contains(c.id))
         .toList(growable: false);
+    final localIndex = await store.loadIndex();
     final externalPlan =
         await _planExternalCalendarRestore(parsed.externalCalendarFiles);
-    final localIndex = await store.loadIndex();
+    final ocrPlan = await _planOcrMaterialRestore(parsed);
+    final schedulePlan = await _planScheduleRestore(parsed, localIndex);
     final mergedIndex = <ConversationSummary>[
       ...parsed.index,
       ...localIndex.where((s) => !parsed.index.any((r) => r.id == s.id)),
@@ -686,6 +1251,32 @@ class BackupService {
         staged.add(_StagedFile(
           tmp: tmp,
           target: _externalCalendarFile(external.relativePath),
+        ));
+      }
+      // OCR 来源文件与其余恢复文件走同一套暂存/提交/回滚：任一步磁盘失败都不会
+      // 留下“会话已恢复、来源文件却被覆盖/未落盘”的混合状态。
+      for (var i = 0; i < ocrPlan.toWrite.length; i++) {
+        final ocr = ocrPlan.toWrite[i];
+        final tmp = _stagedFile('tsc-restore-ocr-$i.json');
+        await tmp.writeAsBytes(ocr.bytes, flush: true);
+        staged.add(_StagedFile(
+          tmp: tmp,
+          target: _ocrMaterialFile(ocr.relativePath),
+        ));
+      }
+      // 全局日程与其余数据同一暂存/提交/回滚边界：写失败会整体回滚，不会留下
+      // “会话/偏好已恢复、日程却是半份”的状态。
+      final mergedSchedule = schedulePlan.merged;
+      if (mergedSchedule != null) {
+        final scheduleTmp = _stagedFile('tsc-restore-schedules.json');
+        await scheduleTmp.writeAsString(
+          const JsonEncoder.withIndent('  ').convert(mergedSchedule.toJson()),
+          flush: true,
+        );
+        await scheduleEventsFile.parent.create(recursive: true);
+        staged.add(_StagedFile(
+          tmp: scheduleTmp,
+          target: scheduleEventsFile,
         ));
       }
       if (indexChanged) {
@@ -824,9 +1415,74 @@ class BackupService {
       }
     }
 
+    // OCR 来源文件：冲突/链接不覆盖（本地数据优先），缺失引用与部分恢复都要计数并
+    // 明确提示，不能让用户以为详细来源已经完整恢复。
+    if (ocrPlan.directoryIsLink && ocrPlan.conflicts.isNotEmpty) {
+      warnings.add('本地 ocr_materials 目录是符号链接/联接点，已跳过 ${ocrPlan.conflicts.length} 个 OCR 来源文件（避免写到数据目录之外）');
+    } else if (ocrPlan.conflicts.isNotEmpty) {
+      warnings.add('本地已有不同的 OCR 来源数据（${ocrPlan.conflicts.length} 个文件），'
+          '为避免覆盖未恢复；如需替换请先导出/删除本地 OCR 来源数据');
+    }
+    if (ocrPlan.missingReferenceCount > 0) {
+      warnings.add('${ocrPlan.missingReferenceCount} 个 OCR 附件的详细来源文件不在备份中，'
+          '文字已恢复但详细来源缺失');
+    }
+    final restoredOcrFiles = ocrPlan.toWrite.length;
+
+    // 全局日程：提醒运行记录不随备份恢复（提醒服务按新快照重建）；冲突保留本地，
+    // 关联无匹配则解除，全部计数并提示。
+    final scheduleNotices = <String>[];
+    var scheduleReloaded = false;
+    if (schedulePlan.skipReason != null) {
+      final notice = '备份包含日程，但未恢复：${schedulePlan.skipReason}';
+      scheduleNotices.add(notice);
+      warnings.add(notice);
+    }
+    if (schedulePlan.conflicts.isNotEmpty) {
+      final notice = '本地已有不同的日程（${schedulePlan.conflicts.length} 条同 ID），'
+          '为避免覆盖保留本地';
+      scheduleNotices.add(notice);
+      warnings.add(notice);
+    }
+    if (schedulePlan.unlinkedEventIds.isNotEmpty) {
+      final notice = '${schedulePlan.unlinkedEventIds.length} 条恢复的日程关联会话'
+          '在本地不存在，已解除关联';
+      scheduleNotices.add(notice);
+      warnings.add(notice);
+    }
+    if (schedulePlan.merged != null) {
+      final reload = reloadSchedule;
+      if (reload != null) {
+        try {
+          await reload();
+          scheduleReloaded = true;
+        } catch (e) {
+          final notice = '日程已恢复，但刷新日程服务失败：${_shortError(e)}';
+          scheduleNotices.add(notice);
+          warnings.add(notice);
+        }
+      } else {
+        final schedule = scheduleStore;
+        if (schedule != null) {
+          try {
+            await schedule.reload();
+          } catch (e) {
+            final notice = '日程已恢复，但重新读取日程失败：${_shortError(e)}';
+            scheduleNotices.add(notice);
+            warnings.add(notice);
+          }
+        }
+        final notice = '日程数据已恢复，但未提供日程刷新回调，'
+            '界面需重启或重新打开日程列表后才一致';
+        scheduleNotices.add(notice);
+        warnings.add(notice);
+      }
+    }
+
     final requiresRestart = (parsed.conversations.isNotEmpty && !sessionsReloaded) ||
         ((parsed.prefs != null && prefsToWrite) && !prefsReloaded) ||
-        (externalPlan.toWrite.isNotEmpty && reloadExternalCalendar == null);
+        (externalPlan.toWrite.isNotEmpty && reloadExternalCalendar == null) ||
+        (schedulePlan.merged != null && !scheduleReloaded);
 
     // 0.2.3（R3-E）：合并执行记录。按 recordId 幂等去重，重复恢复不重复累计；
     // 已存在的本地记录一律保留（不覆盖）。合并失败只作为 warning，不影响会话恢复。
@@ -862,6 +1518,22 @@ class BackupService {
       restoredExternalCalendarFileCount: restoredExternalFiles,
       executionRecordCount: importedLedger?.records.length ?? 0,
       restoredExecutionRecordCount: restoredExecutionRecords,
+      ocrMaterialFileCount: parsed.ocrMaterialFiles.length,
+      restoredOcrMaterialFileCount: restoredOcrFiles,
+      skippedOcrMaterialFileCount: ocrPlan.identical.length,
+      conflictOcrMaterialPaths:
+          List<String>.unmodifiable(ocrPlan.conflicts),
+      missingOcrMaterialReferenceCount: ocrPlan.missingReferenceCount,
+      scheduleSectionPresent: parsed.schedule != null,
+      scheduleEventCount: parsed.schedule?.events.length ?? 0,
+      restoredScheduleEventCount: schedulePlan.restored,
+      skippedScheduleEventCount: schedulePlan.skipped,
+      conflictScheduleEventIds:
+          List<String>.unmodifiable(schedulePlan.conflicts),
+      unlinkedScheduleEventIds:
+          List<String>.unmodifiable(schedulePlan.unlinkedEventIds),
+      scheduleNotices: List<String>.unmodifiable(scheduleNotices),
+      scheduleReloaded: scheduleReloaded,
       backupPaths: committed
           .where((c) => c.promoted && c.backup != null)
           .map((c) => c.backup!.path)
@@ -1274,7 +1946,191 @@ class BackupService {
       defaultModelId: defaultModelId,
       externalCalendarFiles:
           _parseExternalCalendarFiles(decoded['externalCalendar']),
+      ocrMaterialFiles: _parseOcrMaterialFiles(decoded['ocrMaterials']),
+      schedule: _parseSchedule(decoded['schedules']),
       executionLedger: _parseExecutionLedger(decoded['executionLedger']),
+    );
+  }
+
+  /// 解析备份里的 OCR 来源数据段；旧备份没有该键 → 空列表（不恢复来源文件）。
+  ///
+  /// 逐项校验：路径白名单（`ocr_materials/<id>.json`）、长度、SHA-256、UTF-8 JSON
+  /// 结构；解码前先按 base64 长度估算总量，避免先解出巨量内存再拒绝。任何一项不符
+  /// 都整份拒绝导入（不留下“会话恢复、来源损坏”的混合状态）。
+  List<_OcrMaterialBackupFile> _parseOcrMaterialFiles(Object? raw) {
+    if (raw == null) return const <_OcrMaterialBackupFile>[];
+    if (raw is! Map) {
+      throw BackupException('备份文件的 OCR 来源数据结构不正确，已拒绝导入');
+    }
+    final j = Map<String, dynamic>.from(raw);
+    final version = (j['schemaVersion'] as num?)?.toInt() ?? 0;
+    if (version != ocrMaterialsSchemaVersion) {
+      throw BackupException('备份文件的 OCR 来源数据版本不受支持'
+          '（schemaVersion=$version，本程序支持 $ocrMaterialsSchemaVersion）');
+    }
+    final rawFiles = j['files'];
+    if (rawFiles == null) return const <_OcrMaterialBackupFile>[];
+    if (rawFiles is! List) {
+      throw BackupException('备份文件的 OCR 来源文件列表结构不正确，已拒绝导入');
+    }
+    final out = <_OcrMaterialBackupFile>[];
+    final seen = <String>{};
+    // base64 编码后长度的保守上限（4 字节/3 字节 + 填充），用于解码前限额。
+    final maxBase64Length = (maxOcrMaterialBytesLimit * 4) ~/ 3 + 8;
+    final maxBase64Total = (maxOcrMaterialsTotalBytesLimit * 4) ~/ 3 + 8;
+    var encodedTotal = 0;
+    var decodedTotal = 0;
+    for (final item in rawFiles) {
+      if (item is! Map) {
+        throw BackupException('备份文件的 OCR 来源条目结构不正确，已拒绝导入');
+      }
+      final entry = Map<String, dynamic>.from(item);
+      final path = entry['path'];
+      final content = entry['content'];
+      final rawLength = entry['byteLength'];
+      final digest = entry['sha256'];
+      if (path is! String || content is! String || digest is! String) {
+        throw BackupException('备份文件的 OCR 来源条目缺少路径、内容或校验值，已拒绝导入');
+      }
+      if (rawLength is! num) {
+        throw BackupException('备份文件的 OCR 来源条目缺少长度，已拒绝导入');
+      }
+      final relative = _safeOcrMaterialPath(path);
+      if (relative == null) {
+        throw BackupException('备份文件的 OCR 来源数据路径不合法：$path');
+      }
+      if (!seen.add(relative)) {
+        throw BackupException('备份文件中存在重复的 OCR 来源数据路径：$relative');
+      }
+      // 解码前限额（不先解出巨量内存）：base64 长度必须落在上限对应的范围内；
+      // 解码后再按真实字节数精确校验一次。
+      if (content.length > maxBase64Length) {
+        throw BackupException('备份文件中的 OCR 来源数据过大（$relative，'
+            '上限 ${formatByteCount(maxOcrMaterialBytesLimit)}），已拒绝导入');
+      }
+      encodedTotal += content.length;
+      if (encodedTotal > maxBase64Total) {
+        throw BackupException('备份文件中的 OCR 来源数据总量过大'
+            '（上限 ${formatByteCount(maxOcrMaterialsTotalBytesLimit)}），已拒绝导入');
+      }
+      List<int> bytes;
+      try {
+        bytes = base64Decode(content);
+      } catch (_) {
+        throw BackupException('备份文件的 OCR 来源内容损坏：$relative');
+      }
+      if (bytes.length != rawLength.toInt()) {
+        throw BackupException('备份文件的 OCR 来源数据大小不符（$relative）：'
+            '记录 ${rawLength.toInt()} 字节，实际 ${bytes.length} 字节，已拒绝导入');
+      }
+      if (bytes.length > maxOcrMaterialBytesLimit) {
+        throw BackupException('备份文件中的 OCR 来源数据过大（$relative），已拒绝导入');
+      }
+      decodedTotal += bytes.length;
+      if (decodedTotal > maxOcrMaterialsTotalBytesLimit) {
+        throw BackupException('备份文件中的 OCR 来源数据总量过大，已拒绝导入');
+      }
+      if (_sha256Hex(bytes) != digest.trim().toLowerCase()) {
+        throw BackupException('备份文件的 OCR 来源数据校验失败（SHA-256 不符）：$relative');
+      }
+      _validateOcrMaterialJson(relative, bytes);
+      out.add(_OcrMaterialBackupFile(relative, bytes));
+    }
+    return List<_OcrMaterialBackupFile>.unmodifiable(out);
+  }
+
+  /// 恢复前校验 OCR 来源文件本身是可解析、带页列表的来源 JSON（不判断语义）。
+  static void _validateOcrMaterialJson(String relative, List<int> bytes) {
+    Object? decoded;
+    try {
+      decoded = jsonDecode(utf8.decode(bytes, allowMalformed: false));
+    } catch (_) {
+      throw BackupException('OCR 来源数据不是有效的 UTF-8 JSON：$relative');
+    }
+    if (decoded is! Map) {
+      throw BackupException('OCR 来源数据顶层不是对象：$relative');
+    }
+    final map = Map<String, dynamic>.from(decoded);
+    final pages = map['pages'];
+    if (pages is! List) {
+      throw BackupException('OCR 来源数据缺少页列表：$relative');
+    }
+    for (final page in pages) {
+      if (page is! Map) {
+        throw BackupException('OCR 来源数据中存在结构不正确的页：$relative');
+      }
+    }
+    if (map['fileLabel'] is! String) {
+      throw BackupException('OCR 来源数据缺少文件标识：$relative');
+    }
+    // 纵深防御：来源文件由本程序写入，正常不含任何密钥字段；一旦出现就拒绝，
+    // 不让密钥有机会随备份离开本机（与会话段 `_scrub` 同一原则）。
+    _rejectSensitiveOcrFields(map, relative);
+  }
+
+  /// 递归拒绝键名命中 [_sensitiveKeys] 的字段（值不参与判断）。
+  static void _rejectSensitiveOcrFields(Object? value, String relative) {
+    if (value is Map) {
+      for (final entry in value.entries) {
+        if (_isSensitive(entry.key.toString())) {
+          throw BackupException('OCR 来源数据包含疑似密钥字段（${entry.key}）：$relative');
+        }
+        _rejectSensitiveOcrFields(entry.value, relative);
+      }
+    } else if (value is List) {
+      for (final item in value) {
+        _rejectSensitiveOcrFields(item, relative);
+      }
+    }
+  }
+
+  /// 解析备份里的全局日程段；旧备份没有该键 → null（绝不清空本地日程）。
+  ///
+  /// 严格校验段版本、大小、记录数、每条记录字段与重复 ID；任何一项不合法都整份
+  /// 拒绝导入，避免出现“会话已恢复、日程半份”的状态。
+  _ScheduleBackup? _parseSchedule(Object? raw) {
+    if (raw == null) return null;
+    if (raw is! Map) {
+      throw BackupException('备份文件的日程数据结构不正确，已拒绝导入');
+    }
+    final j = Map<String, dynamic>.from(raw);
+    final sectionBytes = utf8.encode(jsonEncode(j)).length;
+    if (sectionBytes > maxScheduleSectionBytesLimit) {
+      throw BackupException('备份文件中的日程数据过大（${formatByteCount(sectionBytes)}，'
+          '上限 ${formatByteCount(maxScheduleSectionBytesLimit)}），已拒绝导入');
+    }
+    final version = (j['schemaVersion'] as num?)?.toInt() ?? 0;
+    if (version != scheduleSchemaVersion) {
+      throw BackupException('备份文件的日程数据版本不受支持'
+          '（schemaVersion=$version，本程序支持 $scheduleSchemaVersion），已拒绝导入');
+    }
+    final revision = j['revision'];
+    if (revision is! int || revision < 0) {
+      throw BackupException('备份文件的日程 revision 不合法，已拒绝导入');
+    }
+    final rawEvents = j['events'];
+    if (rawEvents is! List) {
+      throw BackupException('备份文件的日程事件列表结构不正确，已拒绝导入');
+    }
+    if (rawEvents.length > maxScheduleEventsLimit) {
+      throw BackupException('备份文件中的日程记录过多（${rawEvents.length} 条，'
+          '上限 $maxScheduleEventsLimit），已拒绝导入');
+    }
+    final events = <ScheduleEvent>[];
+    final ids = <String>{};
+    for (var i = 0; i < rawEvents.length; i++) {
+      final event = ScheduleEvent.tryParse(rawEvents[i]);
+      if (event == null) {
+        throw BackupException('备份文件中第 ${i + 1} 条日程数据不合法，已拒绝导入');
+      }
+      if (!ids.add(event.id)) {
+        throw BackupException('备份文件中存在重复的日程 ID：${event.id}，已拒绝导入');
+      }
+      events.add(event);
+    }
+    return _ScheduleBackup(
+      revision: revision,
+      events: List<ScheduleEvent>.unmodifiable(events),
     );
   }
 
@@ -1476,6 +2332,34 @@ class BackupService {
     return normalized;
   }
 
+  /// OCR 来源数据的路径白名单：只允许 `ocr_materials/<id>.json`。
+  ///
+  /// 拒绝绝对路径、盘符、`..`、多级子目录、非 JSON 文件名，以及反斜杠/混合分隔符
+  /// （本程序导出的备份固定使用 `/`）。目录外内容与任意原路径文件都不会被读写。
+  static String? _safeOcrMaterialPath(String raw) {
+    if (raw.isEmpty || raw.length > 512) return null;
+    if (raw.contains('\\')) return null;
+    final safe = _safeRelativePath(raw);
+    if (safe == null) return null;
+    final parts = safe.split('/');
+    if (parts.length != 2 || parts.first != ocrMaterialsDirectoryName) {
+      return null;
+    }
+    final name = parts.last;
+    if (name.length <= 5 || !name.endsWith('.json')) return null;
+    if (!_idPattern.hasMatch(name.substring(0, name.length - 5))) return null;
+    return safe;
+  }
+
+  /// 符号链接 / Windows 联接点（junction）：`followLinks: false` 会把两者都报告为 link。
+  ///
+  /// 用于拒绝跟随重解析点读取或写入数据目录之外的内容。
+  static Future<bool> _isReparsePoint(String path) async =>
+      await FileSystemEntity.type(path, followLinks: false) ==
+      FileSystemEntityType.link;
+
+  static String _sha256Hex(List<int> bytes) => sha256.convert(bytes).toString();
+
   /// `<root>/external_calendar/` 内的文件 → 相对路径（posix 分隔符）；不在目录内返回 null。
   static String? _relativeInside(Directory dir, File file) {
     final base = dir.path.endsWith(Platform.pathSeparator)
@@ -1544,6 +2428,8 @@ class _ParsedBackup {
     this.defaultProfileId = '',
     this.defaultModelId = '',
     this.externalCalendarFiles = const <_ExternalCalendarBackupFile>[],
+    this.ocrMaterialFiles = const <_OcrMaterialBackupFile>[],
+    this.schedule,
     this.executionLedger,
   });
 
@@ -1556,6 +2442,12 @@ class _ParsedBackup {
 
   /// 备份文档里的外部日历文件（相对路径 + 原始字节）。
   final List<_ExternalCalendarBackupFile> externalCalendarFiles;
+
+  /// 备份文档里的 OCR 来源文件（相对路径 + 原始字节）；旧备份没有该段 → 空列表。
+  final List<_OcrMaterialBackupFile> ocrMaterialFiles;
+
+  /// 备份文档里的全局日程段；旧备份没有该键 → null（绝不清空本地日程）。
+  final _ScheduleBackup? schedule;
 
   /// 0.2.3（R3-E）：备份文档里的执行记录账本；旧备份没有该键 → null（不合并）。
   final ExecutionLedger? executionLedger;
@@ -1580,6 +2472,70 @@ class _ExternalCalendarRestorePlan {
   final List<_ExternalCalendarBackupFile> toWrite;
   final List<String> conflicts;
   final int total;
+}
+
+/// 备份/恢复中的一个 OCR 来源文件（路径为 `<root>/ocr_materials/` 下的相对路径）。
+class _OcrMaterialBackupFile {
+  const _OcrMaterialBackupFile(this.relativePath, this.bytes);
+
+  final String relativePath;
+  final List<int> bytes;
+}
+
+/// OCR 来源文件恢复计划：写入、幂等跳过、冲突（不覆盖）分别计数。
+class _OcrMaterialRestorePlan {
+  const _OcrMaterialRestorePlan({
+    this.toWrite = const <_OcrMaterialBackupFile>[],
+    this.identical = const <String>[],
+    this.conflicts = const <String>[],
+    this.total = 0,
+    this.directoryIsLink = false,
+    this.missingReferenceCount = 0,
+  });
+
+  final List<_OcrMaterialBackupFile> toWrite;
+  final List<String> identical;
+  final List<String> conflicts;
+  final int total;
+
+  /// 本地 `ocr_materials/` 目录是符号链接/联接点：拒绝任何写入，避免写到数据目录外。
+  final bool directoryIsLink;
+
+  /// 被附件引用、但备份与本地都没有的来源文件数。
+  final int missingReferenceCount;
+}
+
+/// 备份文档里的全局日程段（含删除标记的记录 + 源数据 revision）。
+class _ScheduleBackup {
+  const _ScheduleBackup({required this.revision, required this.events});
+
+  final int revision;
+  final List<ScheduleEvent> events;
+}
+
+/// 日程恢复计划：present=备份带日程段；merged=需要写入的合并快照（null=无需写）。
+class _ScheduleRestorePlan {
+  const _ScheduleRestorePlan({
+    this.present = false,
+    this.total = 0,
+    this.restored = 0,
+    this.skipped = 0,
+    this.conflicts = const <String>[],
+    this.unlinkedEventIds = const <String>[],
+    this.merged,
+    this.skipReason,
+  });
+
+  final bool present;
+  final int total;
+  final int restored;
+  final int skipped;
+  final List<String> conflicts;
+  final List<String> unlinkedEventIds;
+  final ScheduleSnapshot? merged;
+
+  /// 非空 = 本次无法合并日程（未启用日程服务/未打开/只读/数据目录不一致）。
+  final String? skipReason;
 }
 
 class _StagedFile {

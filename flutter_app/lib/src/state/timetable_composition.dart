@@ -18,6 +18,7 @@
 
 import '../model/calendar.dart';
 import '../model/external_calendar.dart';
+import 'schedule/schedule_busy.dart';
 import '../model/timetable.dart';
 
 /// 合成条目固定使用的匿名标题：不含任何真实外部事件标题。
@@ -331,4 +332,186 @@ List<_BusyRecord> _nonOverlappingExternal(List<_BusyRecord>? input) {
       ..add(record);
   }
   return kept;
+}
+
+// ------------------------------------------------- 本地全局日程（0.4.0）
+
+/// 本地日程合成占用的固定匿名标题：标题/备注/地点/关联绝不进入请求。
+const String kLocalScheduleAnonymousTitle = '本地日程';
+
+/// 本地日程占用条目 id（运行时合成，不含事件身份）。
+String localScheduleEntryId({
+  required String date,
+  required int start,
+  required int end,
+}) {
+  final compact = date.replaceAll('-', '');
+  return 'sch-$compact-$start-$end';
+}
+
+/// 把本地日程忙碌合成为运行时时间表（只读、匿名、不落盘）。
+///
+/// [manual] 是手工权威时间表，不会被修改；[busy] 来自 ScheduleBusySnapshot 的
+/// 本地日区间。没有忙晴时返回 [manual] 本身。
+Timetable composeScheduleBusy({
+  required Timetable manual,
+  required List<ScheduleBusyWallRange> busy,
+  required String timezoneId,
+  String title = kLocalScheduleAnonymousTitle,
+}) {
+  final records = <_BusyRecord>[];
+  for (final range in busy) {
+    final date = parseDateKey(range.date);
+    if (date == null) continue;
+    final start = range.start;
+    final end = range.end;
+    if (start < 0 || end <= start || end > kTimetableMinutesPerDay) continue;
+    records.add(_BusyRecord(
+      sourceId: null,
+      date: date,
+      start: start,
+      end: end,
+      title: title,
+    ));
+  }
+  if (records.isEmpty) return manual;
+
+  records.sort((a, b) {
+    final byDate = a.date.compareTo(b.date);
+    if (byDate != 0) return byDate;
+    final byStart = a.start.compareTo(b.start);
+    return byStart != 0 ? byStart : a.end.compareTo(b.end);
+  });
+  final unique = <_BusyRecord>[];
+  for (final record in records) {
+    final duplicate = unique.any((e) =>
+        e.date == record.date &&
+        e.start == record.start &&
+        e.end == record.end);
+    if (!duplicate) unique.add(record);
+  }
+
+  final manualByDate = <String, List<_BusyRecord>>{};
+  for (final entry in manual.dates) {
+    final date = entry.date;
+    if (date == null || date.isEmpty) continue;
+    manualByDate.putIfAbsent(date, () => <_BusyRecord>[]).add(_BusyRecord(
+          sourceId: null,
+          date: date,
+          start: entry.start,
+          end: entry.end,
+          entry: entry,
+        ));
+  }
+  final scheduleByDate = <String, List<_BusyRecord>>{};
+  for (final record in unique) {
+    final list = manualByDate[record.date];
+    if (list == null) {
+      scheduleByDate.putIfAbsent(record.date, () => <_BusyRecord>[]).add(record);
+      continue;
+    }
+    final cut = <_BusyRecord>[];
+    for (final manualRecord in list) {
+      cut.addAll(_cutRecord(manualRecord, record.start, record.end));
+    }
+    manualByDate[record.date] = cut;
+    scheduleByDate.putIfAbsent(record.date, () => <_BusyRecord>[]).add(record);
+  }
+  for (final list in scheduleByDate.values) {
+    list.sort((a, b) => a.start.compareTo(b.start));
+  }
+
+  final dates = <TimetableEntry>[];
+  final allDates = <String>{...manualByDate.keys, ...scheduleByDate.keys};
+  final sortedDates = allDates.toList()..sort();
+  for (final date in sortedDates) {
+    final dayRecords = <_BusyRecord>[
+      ...?manualByDate[date],
+      ..._nonOverlappingExternal(scheduleByDate[date]),
+    ];
+    dayRecords.sort((a, b) {
+      final byStart = a.start.compareTo(b.start);
+      return byStart != 0 ? byStart : a.end.compareTo(b.end);
+    });
+    for (final record in dayRecords) {
+      if (record.entry != null) {
+        dates.add(record.entry!);
+        continue;
+      }
+      dates.add(TimetableEntry(
+        id: localScheduleEntryId(
+          date: date,
+          start: record.start,
+          end: record.end,
+        ),
+        state: TimetableState.occupied,
+        start: record.start,
+        end: record.end,
+        date: date,
+        origin: TimetableOrigin.schedule,
+        title: record.title,
+        taskId: null,
+        reservationId: null,
+      ));
+    }
+  }
+
+  var dateFrom = manual.dateFrom;
+  var dateTo = manual.dateTo;
+  for (final record in unique) {
+    if (record.date.compareTo(dateFrom) < 0) dateFrom = record.date;
+    if (record.date.compareTo(dateTo) > 0) dateTo = record.date;
+  }
+  final tz = timezoneId.trim();
+  return manual.copyWith(
+    timezoneId: tz.isEmpty ? manual.timezoneId : tz,
+    dateFrom: dateFrom,
+    dateTo: dateTo,
+    dates: List<TimetableEntry>.unmodifiable(dates),
+  );
+}
+
+/// 把本地日程忙晴合成为排程/冲突用的 [CalendarSettings]（运行时，不落盘）。
+CalendarSettings composeScheduleSettings({
+  required CalendarSettings base,
+  required List<ScheduleBusyWallRange> busy,
+  String title = kLocalScheduleAnonymousTitle,
+}) {
+  if (busy.isEmpty) return base;
+  final extras = <CalendarOccupancy>[];
+  final seen = <String>{};
+  for (final range in busy) {
+    final date = parseDateKey(range.date);
+    if (date == null) continue;
+    final start = range.start;
+    final end = range.end;
+    if (start < 0 || end <= start || end > kTimetableMinutesPerDay) continue;
+    final id = localScheduleEntryId(date: date, start: start, end: end);
+    if (!seen.add(id)) continue;
+    extras.add(CalendarOccupancy(
+      id: id,
+      title: title,
+      kind: 'activity',
+      date: date,
+      ranges: <WallClockRange>[WallClockRange(start, end)],
+      provisional: false,
+      localSchedule: true,
+    ));
+  }
+  if (extras.isEmpty) return base;
+  return base.copyWith(
+    occupancies: List<CalendarOccupancy>.unmodifiable(
+      <CalendarOccupancy>[...base.occupancies, ...extras],
+    ),
+  );
+}
+
+/// 去掉 [settings] 里所有运行时本地日程占用（防止写回存储）。
+CalendarSettings withoutLocalScheduleOccupancies(CalendarSettings settings) {
+  if (!settings.occupancies.any((o) => o.localSchedule)) return settings;
+  return settings.copyWith(
+    occupancies: List<CalendarOccupancy>.unmodifiable(
+      settings.occupancies.where((o) => !o.localSchedule),
+    ),
+  );
 }

@@ -16,7 +16,7 @@ import 'dart:io';
 
 import '../model/session.dart';
 import 'session_repository.dart';
-import 'storage_migration.dart';
+import 'storage_json_write.dart';
 
 /// Raised when a file was written by a newer schema. The caller must show an
 /// explanation and must not overwrite it with this build's data.
@@ -325,56 +325,7 @@ class SessionStore implements SessionRepository {
     return null;
   }
 
-  /// 同一路径的写入串行化；每个写入使用唯一临时文件名。
-  ///
-  /// 不再有“rename 失败就直接覆盖主文件”的兜底：那会在杀毒/索引器短暂占用时
-  /// 把唯一的好副本换成半份数据。失败时保留主文件与 .bak，把错误交给调用方显示。
-  static final Map<String, Future<void>> _writeQueues = <String, Future<void>>{};
-  static int _writeSequence = 0;
-
-  Future<void> _writeJson(File file, Map<String, dynamic> data) {
-    final previous = _writeQueues[file.path] ?? Future<void>.value();
-    late final Future<void> next;
-    next = previous
-        .catchError((Object _) {})
-        .then((_) => _writeJsonNow(file, data))
-        .whenComplete(() {
-      if (identical(_writeQueues[file.path], next)) {
-        _writeQueues.remove(file.path);
-      }
-    });
-    _writeQueues[file.path] = next;
-    return next;
-  }
-
-  Future<void> _writeJsonNow(File file, Map<String, dynamic> data) async {
-    StorageWriteGate.beginOperation();
-    try {
-      final token =
-          '${DateTime.now().microsecondsSinceEpoch}-${_writeSequence++}';
-      final tmp = File('${file.path}.$token.tmp');
-      final bak = File('${file.path}.bak');
-      final payload = const JsonEncoder.withIndent('  ').convert(data);
-      await ensureLayout();
-      await tmp.writeAsString(payload, flush: true);
-      try {
-        if (await file.exists()) {
-          if (await bak.exists()) await bak.delete();
-          await file.rename(bak.path);
-        }
-        await tmp.rename(file.path);
-      } catch (e) {
-        // 清理半成品，但绝不再覆盖主文件；调用方负责告诉用户“未保存”。
-        try {
-          if (await tmp.exists()) await tmp.delete();
-        } catch (_) {}
-        rethrow;
-      } finally {
-        // Keep the .bak on purpose: it is the only recovery path if the main file is
-        // later truncated by a crash mid-write. It always holds the previous good copy.
-      }
-    } finally {
-      StorageWriteGate.endOperation();
-    }
-  }
+  /// 同路径串行化、临时文件与 `.bak` 的落盘协议见 [writeJsonAtomically]。
+  Future<void> _writeJson(File file, Map<String, dynamic> data) =>
+      writeJsonAtomically(file, data, prepareDirectory: ensureLayout);
 }
