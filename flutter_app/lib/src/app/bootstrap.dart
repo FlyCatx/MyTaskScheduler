@@ -1,5 +1,6 @@
 // 启动装配（组合根）：解析数据目录 → 打开 ts_bridge.dll → 载入设置 → 载入会话，
 // 再把控制权交给 AppShell。每一步失败都有独立提示，界面不影响其它步骤。
+import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
@@ -11,6 +12,9 @@ import '../state/execution/execution_store.dart';
 import '../state/execution/timer_controller.dart';
 import '../state/external_calendar_service.dart';
 import '../state/ocr/ocr_service.dart';
+import '../state/schedule/schedule_controller.dart';
+import '../state/schedule/schedule_reminders.dart';
+import '../state/schedule/schedule_store.dart';
 import '../state/external_calendar_store.dart';
 import '../state/ics/ics_expander.dart';
 import '../state/memory_session_repository.dart';
@@ -68,6 +72,8 @@ class _TsBootstrapState extends State<TsBootstrap> {
   String? _bootNotice;
   VoidCallback? _paletteListener;
   TimerController? _timer;
+  ScheduleController? _schedule;
+  ScheduleReminderService? _reminders;
 
   /// Applies the global palette for the committed preferences. Registered before any
   /// other settings listener so widgets rebuilding from this notification already see
@@ -222,6 +228,30 @@ class _TsBootstrapState extends State<TsBootstrap> {
     }
     _timer = timer;
 
+    // ---- 3c2. global schedule service (0.4.0, non-fatal) ------------------
+    /*
+     * 日程是全局真实来源（<dataRoot>/schedules/events.json），与执行记录同样
+     * 使用实例锁：第二实例只读并提示。载入失败不阻止启动，日程功能明确只读/
+     * 不可用；绝不写空库覆盖损坏文件。
+     */
+    try {
+      final scheduleStore = root.directory != null
+          ? ScheduleStore(root.directory!)
+          : ScheduleStore.memory();
+      final candidate = ScheduleController(store: scheduleStore);
+      final opened = await candidate.initialize();
+      _schedule = candidate;
+      final scheduleNotices = <String>[
+        if (opened.notice != null && opened.notice!.trim().isNotEmpty)
+          opened.notice!,
+      ];
+      if (scheduleNotices.isNotEmpty) {
+        _appendBootNotice('日程：${scheduleNotices.join('\n')}');
+      }
+    } catch (e) {
+      _appendBootNotice('全局日程不可用（本次不显示/不保存日程）：$e');
+    }
+
     // ---- 3d. local OCR service (0.2.3 R3-O, non-fatal) --------------------
     /*
      * 本地离线 OCR：helper 在 <exe>\data\ocr\ocr_host.exe，语言/可用性在真正使用
@@ -230,20 +260,33 @@ class _TsBootstrapState extends State<TsBootstrap> {
     final ocr = OcrService(dataRoot: root.directory);
 
     // ---- 4. controller ----------------------------------------------------
-    final controller = AppController(
-      engine: NativeScheduleEngine(gateway),
-      store: store,
-      gateway: gateway,
-      settings: settings,
-      externalCalendar: externalCalendar,
-      timer: _timer,
-      dataDirectory: root.directory,
-      ocr: ocr,
-      storageNotice: root.notice,
+    AppController createController(
+      SessionRepository sessionStore, {
+      required String storagePath,
+      required bool storageIsPersistent,
+      String? storageNotice,
+    }) =>
+        AppController(
+          engine: NativeScheduleEngine(gateway),
+          store: sessionStore,
+          gateway: gateway,
+          settings: settings,
+          externalCalendar: externalCalendar,
+          timer: _timer,
+          dataDirectory: root.directory,
+          ocr: ocr,
+          schedule: _schedule,
+          storageNotice: storageNotice,
+          storagePath: storagePath,
+          storageIsPersistent: storageIsPersistent,
+          storageRejected: root.rejected,
+          storageSource: root.source,
+        );
+    final controller = createController(
+      store,
       storagePath: root.describe,
       storageIsPersistent: !root.memoryOnly,
-      storageRejected: root.rejected,
-      storageSource: root.source,
+      storageNotice: root.notice,
     );
     try {
       await controller.initialize();
@@ -251,20 +294,11 @@ class _TsBootstrapState extends State<TsBootstrap> {
       // Initialization failures must not dead-end the app: fall back to an in-memory
       // store so the user can still analyze, and say what happened.
       final fallback = InMemorySessionRepository();
-      final retry = AppController(
-        engine: NativeScheduleEngine(gateway),
-        store: fallback,
-        gateway: gateway,
-        settings: settings,
-        externalCalendar: externalCalendar,
-        timer: _timer,
-        dataDirectory: root.directory,
-        ocr: ocr,
-        storageNotice: '读取本地会话失败，本次运行不会保存历史：$e',
+      final retry = createController(
+        fallback,
         storagePath: '（内存中）',
         storageIsPersistent: false,
-        storageRejected: root.rejected,
-        storageSource: root.source,
+        storageNotice: '读取本地会话失败，本次运行不会保存历史：$e',
       );
       await retry.initialize();
       if (!mounted) {
@@ -285,6 +319,30 @@ class _TsBootstrapState extends State<TsBootstrap> {
       settings.dispose();
       controller.dispose();
       return;
+    }
+    // 运行期日程提醒：组合根注入原生通知发送，UI 不直接调 FFI。
+    final scheduleController = _schedule;
+    if (scheduleController != null) {
+      final reminders = ScheduleReminderService(
+        controller: scheduleController,
+        store: scheduleController.store,
+        send: (title, body) async {
+          try {
+            return gateway.showSystemNotification(title, body);
+          } catch (_) {
+            return false;
+          }
+        },
+        onNotice: (message) {
+          AppNotices.instance.show(
+            kind: AppNoticeKind.info,
+            message: message,
+            dedupeKey: 'schedule-reminder',
+          );
+        },
+      );
+      _reminders = reminders;
+      unawaited(reminders.start());
     }
     setState(() {
       _gateway = gateway;
@@ -329,6 +387,13 @@ class _TsBootstrapState extends State<TsBootstrap> {
     _settings?.dispose();
     _controller?.dispose();
     _timer?.dispose();
+    // 提醒服务先停（停止新派发），再释放日程实例锁；失败不阻塞退出。
+    final reminders = _reminders;
+    _reminders = null;
+    reminders?.stop();
+    final schedule = _schedule;
+    _schedule = null;
+    schedule?.close();
     super.dispose();
   }
 
@@ -400,7 +465,7 @@ class _TsBootstrapState extends State<TsBootstrap> {
   /// 因此标题栏、主区、弹窗遮罩与菜单都被裁到同一条三次贝塞尔路径内，灰色描边也
   /// 画在它们之上（全屏遮罩盖不住）。原生侧用同一路径生成窗口 Region。
   ///
-  /// 0.3.0（提示词 02）：应用级通知宿主也挂在这里——位于 Navigator 之上，弹窗打开
+  /// 应用级通知宿主挂在这里——位于 Navigator 之上，弹窗打开
   /// 时通知仍可见可点；宿主只挂一次，AppShell 通过 [AppNoticeMountScope] 识别到
   /// 已挂载后不再自行渲染，避免“同一通知两份”。
   Widget _withWindowSurface(BuildContext context, Widget? child) {
@@ -423,6 +488,8 @@ class _TsBootstrapState extends State<TsBootstrap> {
       controller: controller,
       settings: settings,
       bootNotice: _bootNotice,
+      scheduleController: _schedule,
+      reminders: _reminders,
     );
   }
 }
