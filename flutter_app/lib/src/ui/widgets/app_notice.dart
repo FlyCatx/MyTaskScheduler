@@ -1,23 +1,7 @@
-// 应用级临时通知宿主（0.3.0 R4-B：所有应用内通知统一到窗口客户区左下角）。
-//
-// 为什么必须是应用级：
-//   * 之前 0.3.0 的附件反馈分别渲染在常驻侧栏、抽屉、工作区三处，其中侧栏那次是
-//     插在 `_SidebarBand` 之外的 Column 里，露出 `Scaffold` 的白色 surface —— 用户
-//     截图里的“卡片周围白色矩形”就是这一层（不是 AttachmentNotice 自己的 Padding；
-//     Padding 不画色）。三处都移除后侧栏/工作区的布局也不再被通知挤压。
-//   * SnackBar 走 ScaffoldMessenger，只覆盖当前 Scaffold，且在模态路由下面；本轮
-//     全部迁移到这个宿主，保证弹窗打开时也在窗口左下角显示一次、可点。
-//
-// 层级：生产环境挂载在 `MaterialApp.builder` 里（Navigator/Overlay 之外），因此
-// 通知卡片位于所有路由（含 Dialog/模态遮罩）之上；宿主只在卡片处命中指针，卡片外
-// 的区域落到下面的 Navigator —— 有模态时就是遮罩，不会穿过遮罩去点主界面。
-//
-// 背景：宿主、外层 Stack、Positioned、Align、滚动区都不画底色。只有卡片自身的
-// 圆角 ShapeDecoration 绘制浅色背景（附件卡片复用 AttachmentNotice 的 Container）。
-// 需要 Material 承接按钮时只用 `MaterialType.transparency`，不会为整行/整屏铺白。
-//
-// 主要类型：AppNotices（全局控制器/队列）、AppNoticeHost（只渲染一次的宿主）、
-// AppNoticeMountScope（标记生产环境已挂载，AppShell 据此避免二次挂载）。
+// 应用内通知显示在窗口左下角，弹出对话框时仍须可见。
+// 宿主挂在 MaterialApp.builder，位于 Navigator 和模态路由之上；只有通知卡片
+// 接收指针，卡片外仍由下层模态遮罩处理，不能点透到主界面。
+// 外层不绘制背景；按钮所需的 Material 使用透明类型。
 
 import 'dart:async';
 import 'dart:math' as math;
