@@ -1,8 +1,8 @@
 // Widget tests for the 0.0.4 settings pages and window.
 //
 // Scope (see docs/SETTINGS_0_0_4_SPEC.md §8 / §11):
-//   * 账户安全: no EDITABLE field and no enabled action (a disabled form cannot claim a
-//     sign-in), plus the explicit "no network / no password" statement;
+//   * 账户安全: no login/change-password form at all (the cancelled account service was
+//     deleted, not just disabled); only the local identity facts remain;
 //   * 通用: switches and the font-size slider write the draft and the UI reflects it;
 //   * 快捷键: exactly the five shortcuts that are really registered;
 //   * 通知: the 120-second reminder is explained and there is no system-notification
@@ -57,39 +57,29 @@ Widget _host(Widget page) => MaterialApp(
 
 void main() {
   group('账户安全', () {
-    testWidgets('只有禁用控件：不可编辑、无网络、无假登录', (tester) async {
+    testWidgets('只保留本地身份事实，已取消的登录/改密表单已删除', (tester) async {
       await tester.binding.setSurfaceSize(const Size(1000, 900));
       addTearDown(() => tester.binding.setSurfaceSize(null));
 
       await tester.pumpWidget(_host(const SettingsAccountPage()));
       await tester.pumpAndSettle();
 
-      final fields =
-          tester.widgetList<TextField>(find.byType(TextField)).toList();
-      expect(fields, isNotEmpty, reason: '占位表单应当存在（否则测试没有意义）');
-      for (final field in fields) {
-        expect(field.enabled, isFalse, reason: '账户页任何输入框都必须是禁用状态');
-      }
+      // 账户服务已取消：登录/改密表单连同只服务它们的占位组件一起删除，
+      // 不能再用“禁用控件”维持一个永远无法完成的流程。
+      expect(find.byType(TextField), findsNothing);
+      expect(find.byType(TextFormField), findsNothing);
+      expect(find.text('登录'), findsNothing);
+      expect(find.text('修改密码'), findsNothing);
+      expect(find.textContaining('未接入'), findsNothing);
+      expect(find.textContaining('账户服务'), findsNothing);
 
-      final login = tester.widget<FilledButton>(
-        find.widgetWithText(FilledButton, '登录'),
-      );
-      expect(login.onPressed, isNull, reason: '登录按钮必须禁用，不能伪造登录');
-      final changePassword = tester.widget<OutlinedButton>(
-        find.widgetWithText(OutlinedButton, '修改密码'),
-      );
-      expect(changePassword.onPressed, isNull,
-          reason: '修改密码按钮必须禁用');
-
-      // 0.09: 页首的说明段落已按要求删除；页内应只剩身份事实与禁用控件。
-      expect(find.textContaining('账户服务尚未接入'), findsNothing);
-      expect(find.textContaining('不会保存密码'), findsNothing);
-      expect(find.text('未登录云端'), findsOneWidget,
-          reason: '登录状态是事实，不附带括号说明');
-      expect(find.text('本地分析'), findsNothing,
-          reason: '重复的说明段落已按要求删除');
-      expect(find.text('未来能力'), findsNothing);
-      // No fake identity / fake success wording.
+      // 保留有用的本地身份事实；不伪造登录成功或云端账户。
+      expect(find.text('当前身份'), findsOneWidget);
+      expect(find.text('本地账户'), findsOneWidget);
+      expect(find.text(kLocalUserName), findsOneWidget);
+      expect(find.text('未登录云端'), findsOneWidget);
+      expect(find.text('不支持'), findsOneWidget);
+      expect(find.text('未保存任何密码'), findsOneWidget);
       expect(find.textContaining('登录成功'), findsNothing);
       expect(find.textContaining('已连接账户'), findsNothing);
     });
