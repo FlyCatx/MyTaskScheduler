@@ -1,4 +1,4 @@
-// R3-L 接线层的数据视图：预估与运行结果（UI 只依赖这两个小对象）。
+// 分块分析的界面视图：预估（不发起请求）与一次运行的结果。
 
 import 'chunked_coordinator.dart';
 
@@ -86,6 +86,7 @@ class ChunkedRunResult {
     this.pendingConfirmations = 0,
     this.factsCount = 0,
     this.coverageLines = const <String>[],
+    this.previewReady = false,
   });
 
   final bool ok;
@@ -100,4 +101,44 @@ class ChunkedRunResult {
   final int pendingConfirmations;
   final int factsCount;
   final List<String> coverageLines;
+
+  /// true = 分析已结束并产出预览，等待用户确认；此时没有提交任何版本。
+  final bool previewReady;
+}
+
+/// 分块分析的预览视图：任务/来源/待确认项是否可提交，全部来自账本重建结果。
+class ChunkedPreviewView {
+  const ChunkedPreviewView({
+    required this.preview,
+    required this.staleReason,
+    required this.excludedFactIds,
+    required this.excludedCandidateIds,
+    required this.committing,
+    this.coverageLines = const <String>[],
+  });
+
+  final DraftPlanPreview preview;
+
+  /// 覆盖清单的可读行（与 ChunkedRunResult.coverageLines 一致）。
+  final List<String> coverageLines;
+
+  /// 材料/时间表/计划版本/模型配置变化后的失效原因；null = 仍可提交。
+  final String? staleReason;
+
+  final Set<String> excludedFactIds;
+
+  /// 已被用户排除的候选任务 id（用于在预览里显示“已排除/恢复”）。
+  final Set<String> excludedCandidateIds;
+  final bool committing;
+
+  bool get stale => staleReason != null;
+
+  bool get hasCriticalPending => preview.pending.any((p) => p.critical);
+
+  /// 只有材料完整、无阻塞、无关键待确认项且基线未变时才允许确认生成计划。
+  bool get canCommit =>
+      !preview.partial &&
+      preview.blockers.isEmpty &&
+      !stale &&
+      !hasCriticalPending;
 }

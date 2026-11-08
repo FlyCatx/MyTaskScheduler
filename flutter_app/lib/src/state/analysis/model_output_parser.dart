@@ -120,6 +120,8 @@ class ParsedChunkOutput {
         'dependsOnHints': c.dependsOnHints,
         'confidence': c.confidence,
         'constraintText': c.constraintText,
+        if (c.sourceRefBySegment.isNotEmpty)
+          'sourceRefBySegment': c.sourceRefBySegment,
       };
 
   static FactCandidate _candidateFromJson(Map<String, dynamic> j) => FactCandidate(
@@ -139,7 +141,9 @@ class ParsedChunkOutput {
             .toList(growable: false),
         confidence: (j['confidence'] as num?)?.toDouble(),
         constraintText: j['constraintText'] as String?,
+        sourceRefBySegment: _sourceRefMap(j['sourceRefBySegment']),
       );
+
 }
 
 /// 归并结果中的一个“同事实”组。
@@ -423,6 +427,7 @@ class ModelOutputParser {
       dependsOnHints: List<String>.unmodifiable(dependsOn),
       confidence: confidence,
       constraintText: constraintText.isEmpty ? null : constraintText,
+      sourceRefBySegment: _sourceRefMap(item['sourceRefBySegment']),
     );
   }
 
@@ -533,6 +538,18 @@ class ModelOutputParser {
     }
     return '';
   }
+}
+
+/// 把 `{segmentId: 原始引用}` 形式的 JSON 读成 Map，忽略空键/空值。
+Map<String, String> _sourceRefMap(Object? raw) {
+  if (raw is! Map) return const <String, String>{};
+  final out = <String, String>{};
+  for (final entry in raw.entries) {
+    final key = entry.key.toString().trim();
+    final value = entry.value?.toString().trim() ?? '';
+    if (key.isNotEmpty && value.isNotEmpty) out[key] = value;
+  }
+  return out;
 }
 
 /// 便于测试/日志的候选事实摘要（不含全文）。

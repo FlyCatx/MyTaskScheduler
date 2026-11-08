@@ -1,8 +1,8 @@
 // 分块分析作业 — 作业 / 块 / 尝试的稳定 ID、状态机与本地恢复。
 //
-// 状态机（R3-L L5）：
-//   pending → running → succeeded | failed | needsConfirm
-//   作业整体：pending → running → succeeded | failed | cancelled | needsConfirm
+// 状态机：
+//   块：   pending → running → succeeded | failed | cancelled | needsConfirm
+//   作业：pending → running → succeeded | failed | cancelled | needsConfirm
 //
 // 规则：
 //   * 只有**通过结构校验**的阶段结果（ParsedChunkOutput）才会被写入块状态；
@@ -86,6 +86,7 @@ class JobBaseline {
     this.userRequestHash = '',
     this.timetableSignature,
     this.externalSources = const <Map<String, dynamic>>[],
+    this.scheduleFingerprint = '',
     this.promptVersion = 'chunk-extract-v1',
   });
 
@@ -114,6 +115,10 @@ class JobBaseline {
   /// 外部日历来源身份（id/revision/范围，不含事件内容）。来源变化 → 旧作业失效。
   final List<Map<String, dynamic>> externalSources;
 
+  /// 本地全局日程忙碌指纹（范围+时区+有效区间并集；为空 = 本次未携带时间表）。
+  /// 与外部日历指纹分开命名，不冒用 externalSourceIds。
+  final String scheduleFingerprint;
+
   final String promptVersion;
 
   /// 外部来源身份指纹（顺序无关）。
@@ -135,7 +140,7 @@ class JobBaseline {
         '${baseVersionId ?? ''}|$baseRevision|$calendarRevision|'
         '${_sortedMap(materialHashes)}|$modelConfigSignature|'
         '$userRequestHash|${timetableSignature ?? ''}|'
-        '$externalSourcesSignature|$promptVersion',
+        '$externalSourcesSignature|$scheduleFingerprint|$promptVersion',
       );
 
   /// 当前输入是否仍与作业基线一致（不一致 → 旧作业必须失效/重新确认）。
@@ -158,6 +163,7 @@ class JobBaseline {
         'userRequestHash': userRequestHash,
         'timetableSignature': timetableSignature,
         'externalSources': externalSources,
+        'scheduleFingerprint': scheduleFingerprint,
         'promptVersion': promptVersion,
       };
 
@@ -182,6 +188,7 @@ class JobBaseline {
         externalSources: ((j['externalSources'] as List<dynamic>?) ?? const [])
             .whereType<Map<String, dynamic>>()
             .toList(growable: false),
+        scheduleFingerprint: (j['scheduleFingerprint'] as String?) ?? '',
         promptVersion: (j['promptVersion'] as String?) ?? 'chunk-extract-v1',
       );
 }

@@ -1,7 +1,7 @@
 // 结构化事实账本 — 分块抽取的候选事实在这里被本地校验、归一、去重、
 // 关联与矛盾登记。模型只是“提出候选”，本账本决定哪些事实可作为计划依据。
 //
-// 关键规则（R3-L L3/L4）：
+// 关键规则：
 //   * 每条事实必须有来源：模型给的来源 ID 必须在本地片段索引里存在，并映射到
 //     精确页/段与原文区间；引用不存在的来源 ID → 标记 unresolved，绝不静默丢；
 //   * 引文（quote）必须能在来源片段里定位，否则事实保持 pending；
@@ -70,6 +70,7 @@ class FactSourceRef {
     required this.page,
     this.quoteSpan,
     this.verified = false,
+    this.sourceRef,
   });
 
   final String segmentId;
@@ -81,6 +82,10 @@ class FactSourceRef {
   /// 来源片段存在且（有引文时）引文可在片段中定位。
   final bool verified;
 
+  /// 模型原始引用（例如 `文段1:段落2`）。来源只精确到段落时如实保留该精度，
+  /// 不用片段前缀冒充模型引句；为空表示通道未提供模型引用。
+  final String? sourceRef;
+
   Map<String, dynamic> toJson() => <String, dynamic>{
         'segmentId': segmentId,
         'chunkId': chunkId,
@@ -88,6 +93,7 @@ class FactSourceRef {
         'page': page,
         'quoteSpan': quoteSpan?.toJson(),
         'verified': verified,
+        if (sourceRef != null) 'sourceRef': sourceRef,
       };
 
   factory FactSourceRef.fromJson(Map<String, dynamic> j) => FactSourceRef(
@@ -99,6 +105,7 @@ class FactSourceRef {
             ? QuoteSpan.fromJson(j['quoteSpan'] as Map<String, dynamic>)
             : null,
         verified: j['verified'] == true,
+        sourceRef: j['sourceRef'] as String?,
       );
 }
 
@@ -117,10 +124,14 @@ class FactCandidate {
     this.dependsOnHints = const <String>[],
     this.confidence,
     this.constraintText,
+    this.sourceRefBySegment = const <String, String>{},
   });
 
   final FactKind kind;
   final List<String> sourceIds;
+
+  /// segmentId → 模型原始引用（`文段K:段落M`）。仅用于如实保留来源精度。
+  final Map<String, String> sourceRefBySegment;
   final String taskHint;
 
   /// 同名不同对象的区分线索（例如项目 A / 项目 B）。
@@ -146,7 +157,7 @@ class FactCandidate {
   final String? constraintText;
 }
 
-/// 一条已进入账本的事实。字段对应第三轮任务书要求的 FactEntry。
+/// 一条已进入账本的事实。factId 由账本分配（`f:<chunkId>:<序号>`），在账本内唯一。
 class FactEntry {
   const FactEntry({
     required this.factId,
@@ -513,6 +524,11 @@ class FactLedger {
   final List<LedgerIssue> _issues = <LedgerIssue>[];
   final Map<String, List<String>> _dependencyLinks = <String, List<String>>{};
   final Set<String> _unknownSegmentIds = <String>{};
+
+  /// 用户人工排除的事实：factId → 理由。事实本身保留在账本里（可撤销、可追溯），
+  /// 只是不再作为可用任务/待确认项参与预览与提交。
+  final Map<String, String> _excluded = <String, String>{};
+
   int _factCounter = 0;
   bool _reconciled = false;
 
@@ -522,14 +538,40 @@ class FactLedger {
         for (final id in _order) _facts[id]!,
       ];
 
-  List<FactEntry> get confirmedFacts =>
-      facts.where((f) => f.status == FactStatus.confirmed).toList(growable: false);
+  List<FactEntry> get confirmedFacts => facts
+      .where((f) => !_excluded.containsKey(f.factId))
+      .where((f) => f.status == FactStatus.confirmed)
+      .toList(growable: false);
 
-  List<FactEntry> get pendingFacts =>
-      facts.where((f) => f.status == FactStatus.pending).toList(growable: false);
+  List<FactEntry> get pendingFacts => facts
+      .where((f) => !_excluded.containsKey(f.factId))
+      .where((f) => f.status == FactStatus.pending)
+      .toList(growable: false);
 
-  List<FactEntry> get taskFacts =>
-      facts.where((f) => f.kind == FactKind.task).toList(growable: false);
+  List<FactEntry> get taskFacts => facts
+      .where((f) => !_excluded.containsKey(f.factId))
+      .where((f) => f.kind == FactKind.task)
+      .toList(growable: false);
+
+  /// factId → 排除理由（人工处理历史；撤销用 [restoreFact]）。
+  Map<String, String> get excludedFacts => Map<String, String>.unmodifiable(_excluded);
+
+  bool isExcluded(String factId) => _excluded.containsKey(factId);
+
+  /// 人工排除一条事实：保留原始记录与理由，只从可用事实中移除。
+  ///
+  /// 这不是“隐藏提示”：预览任务、待确认项、依赖解析都会随之重算；调用方
+  /// 必须重新构建预览，不能只改 UI。
+  void excludeFact(String factId, {String reason = ''}) {
+    if (!_facts.containsKey(factId)) return;
+    _excluded[factId] = reason.trim().isEmpty ? '用户排除' : reason.trim();
+    _reconciled = false;
+  }
+
+  /// 撤销一次人工排除。
+  void restoreFact(String factId) {
+    if (_excluded.remove(factId) != null) _reconciled = false;
+  }
 
   List<FactContradiction> get contradictions =>
       List<FactContradiction>.unmodifiable(_contradictions);
@@ -601,6 +643,7 @@ class FactLedger {
         page: segment.page,
         quoteSpan: span,
         verified: quote == null || quote.isEmpty || span != null,
+        sourceRef: candidate.sourceRefBySegment[segment.segmentId],
       ));
     }
 
@@ -860,6 +903,11 @@ class FactLedger {
     final out = <PendingConfirmation>[];
     var index = 0;
     for (final contradiction in _contradictions) {
+      // 相关事实都被人工排除后，矛盾也随之解决（保留原始记录，不再提示）。
+      if (contradiction.factIds.isNotEmpty &&
+          contradiction.factIds.every(_excluded.containsKey)) {
+        continue;
+      }
       out.add(PendingConfirmation(
         id: 'pending:contradiction:${index++}',
         kind: 'contradiction',
@@ -896,6 +944,7 @@ class FactLedger {
       }
     }
     for (final dependency in _unresolvedDependencies) {
+      if (_excluded.containsKey(dependency.factId)) continue;
       out.add(PendingConfirmation(
         id: 'pending:dependency:${dependency.factId}:'
             '${_normalizeText(dependency.hint)}',

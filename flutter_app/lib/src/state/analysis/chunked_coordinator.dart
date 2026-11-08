@@ -1,6 +1,6 @@
 // 分块分析协调器 — 把超大材料变成有界、可恢复、可核查的多请求作业。
 //
-// 流程（R3-L L3/L4/L5）：
+// 流程：
 //   1. planning   固定作业基线（asOf/时区/计划版本/材料哈希/模型配置），
 //                 按请求预算分块，输出覆盖清单与预计请求数；
 //   2. extracting 有界 waves（并发上限 / 总请求数 / 失败阈值 / 退避重试上限），
@@ -28,8 +28,8 @@ import 'fact_ledger.dart';
 import 'material_chunker.dart';
 import 'model_output_parser.dart';
 
-/// 一次分块模型请求。`payload` 是可直接交给 NativeGateway.analyzeAsync 的请求 map
-/// （见文件末尾的接线示例注释）。
+/// 一次分块模型请求。`payload` 是可直接交给 NativeGateway.analyzeAsync 的分析请求，
+/// 由调用方注入的 transport 发出（生产接线见 app_controller.dart 的分块流程）。
 class ChunkRequest {
   const ChunkRequest({
     required this.jobId,
@@ -112,6 +112,7 @@ class AnalysisJobSpec {
     this.timetableJson,
     this.effectiveTimetableJson,
     this.externalSources = const <Map<String, dynamic>>[],
+    this.scheduleFingerprint = '',
     this.modelSelection,
     this.modelConfigSignature = '',
     this.documents = const <SourceDocument>[],
@@ -143,6 +144,9 @@ class AnalysisJobSpec {
 
   /// 外部日历来源身份（只含 id/revision/范围，不含事件内容）。
   final List<Map<String, dynamic>> externalSources;
+
+  /// 本地全局日程忙碌指纹（只含范围/时区/有效区间并集，不含标题等）。
+  final String scheduleFingerprint;
 
   /// 模型选择（透传给原生层），不是密钥。
   final Map<String, dynamic>? modelSelection;
@@ -202,6 +206,7 @@ class AnalysisJobSpec {
         userRequestHash: userRequestHash,
         timetableSignature: timetableSignature,
         externalSources: externalSources,
+        scheduleFingerprint: scheduleFingerprint,
         promptVersion: promptVersion,
       );
 }
@@ -1391,6 +1396,16 @@ class ChunkedCoordinator {
     ];
   }
 
+  /// 用当前账本重建预览（人工排除/恢复事实后调用；不重发任何模型请求）。
+  ///
+  /// [blockers] 必须沿用本次作业的阻塞清单：人工排除事实不等于材料已完整。
+  DraftPlanPreview buildPreview(
+    ChunkedJob job,
+    FactLedger ledger, {
+    List<String> blockers = const <String>[],
+  }) =>
+      _buildPreview(job, ledger, blockers);
+
   DraftPlanPreview _buildPreview(
     ChunkedJob job,
     FactLedger ledger,
@@ -1483,6 +1498,7 @@ class ChunkedCoordinator {
             if (candidateByFact[fact.factId] != null)
               candidateByFact[fact.factId]!,
           ],
+          if (ledger.isExcluded(fact.factId)) 'excluded': true,
         },
     ];
     final partial = blockers.isNotEmpty;
@@ -1556,47 +1572,9 @@ class _ParseOutcome {
 }
 
 // ---------------------------------------------------------------------------
-// app_controller 侧接线示例（本仓库不改 app_controller，仅说明调用方式）：
-//
-//   final coordinator = ChunkedCoordinator(
-//     spec: AnalysisJobSpec(
-//       conversationId: conversation.id,
-//       userRequest: draft,
-//       asOf: DateTime.now(),                    // 作业开始时固定一次
-//       timeZoneId: timetable.timezoneId,
-//       baseVersionId: version?.id,
-//       baseRevision: version?.revision ?? 0,
-//       calendarRevision: timetable.revision,
-//       timetableJson: timetable.toJson(),
-//       effectiveTimetableJson: deriveEffectiveTimetable(timetable),
-//       knownTasks: [...],                       // 与 buildAnalysisRequest 一致
-//       documents: conversation.attachments
-//           .map((a) => SourceDocument.fromExtractedDocument(
-//                 ... , docHash: a.contentHash, label: a.label))
-//           .toList(),
-//       modelSelection: selection?.toJson(),
-//     ),
-//     limits: const AnalysisLimits(),
-//     transport: (request) async {
-//       // 生产适配：NativeGateway.analyzeAsync(request.payload) → poll → result，
-//       // 必须把模型 JSON 原文作为 ChunkResponse.content 返回（不在这里解析）。
-//       final jobId = gateway.analyzeAsync(request.payload);
-//       final outcome = await _waitForOutcome(jobId); // 复用现有轮询
-//       return outcome.ok
-//           ? ChunkResponse.ok(outcome.rawContent!)
-//           : ChunkResponse.failure(
-//               errorKind: outcome.errorKind ?? 'unknown',
-//               error: outcome.error ?? '失败',
-//               httpStatus: outcome.httpStatus);
-//     },
-//   );
-//   final estimate = coordinator.estimate();      // 界面展示覆盖/请求数/费用未知
-//   final job = coordinator.createJob();
-//   final outcome = await coordinator.run(job);
-//   if (outcome.officialPlanAvailable) {
-//     // 先给用户预览；确认后再走现有 _commitResult 的本地校验/提交路径。
-//     final planJson = outcome.officialPlanJson!;
-//   } else {
-//     // 展示 outcome.blockers / preview.partial；可重试失败块或取消。
-//   }
+// 调用顺序：`estimate()` 只读预估，`createJob()` 之后 `run(job)` 执行；取消后
+// 到达的结果由协调器丢弃。生产接线在 app_controller：
+//   * transport 用 PlanChunkTransport 适配现有 analyze 通道（返回归一化计划）；
+//   * `outcome.officialPlanAvailable` 为 true 时把 officialPlanJson 交给既有
+//     本地校验/版本提交路径，否则展示 blockers 与预览草稿，不产出正式计划。
 // ---------------------------------------------------------------------------
