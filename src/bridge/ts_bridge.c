@@ -1,11 +1,10 @@
 /*
  * ts_bridge.c — Dart FFI ABI 实现：调用方线程只做有界拷贝，模型调用与文件读取在工作线程完成，
  * 进度由 Dart 侧轮询取回，事件与结果由本文件统一拥有。
- *
- * 主要函数：ts_bridge_create_ex、ts_bridge_analyze_async / constraints_async / probe_async、
- * ts_bridge_poll / result / release_job、ts_bridge_settings_get / save、ts_bridge_destroy。
+ * 主要函数：ts_bridge_create_ex、ts_bridge_analyze_async、ts_bridge_probe_async、
+ * ts_bridge_constraints_async、ts_bridge_poll、ts_bridge_result、ts_bridge_release_job、
+ * ts_bridge_settings_get / save、ts_bridge_destroy。
  */
-
 
 #include "ts_bridge.h"
 
@@ -231,9 +230,8 @@ static int error_json(TsBridgeBuffer *out, const char *code, const char *message
     return error_json_extra(out, code, message, NULL);
 }
 /*
- * 失败入口：填错误 JSON 并**返回非 0**。
- * 注意 error_json 的返回值是“缓冲区是否写成功”（0 = 写成功），
- * 直接 `return error_json(...)` 会被调用方当成“调用成功”，这是曾经踩过的坑。
+ * 失败入口始终返回非 0。error_json 的返回值只表示缓冲区写入是否成功，
+ * 不能作为本次桥接调用的结果。
  */
 static int fail_json(TsBridgeBuffer *out, const char *code, const char *message)
 {
