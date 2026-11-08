@@ -46,6 +46,7 @@ class ChunkedAnalysisDialog extends StatefulWidget {
 
 class _ChunkedAnalysisDialogState extends State<ChunkedAnalysisDialog> {
   bool _running = false;
+  bool _previewActionBusy = false;
   JobProgress? _progress;
   ChunkedRunResult? _result;
   String? _error;
@@ -151,18 +152,60 @@ class _ChunkedAnalysisDialogState extends State<ChunkedAnalysisDialog> {
               child: const Text('开始分块分析'),
             ),
           ],
+          if (!_running && _previewView != null) ...[
+            const SizedBox(width: 8),
+            FilledButton(
+              key: const Key('chunked-preview-confirm'),
+              style: TsButtons.solid(),
+              // 只有材料完整、无阻塞、无关键待确认项且基线未变时才可点。
+              onPressed: (_previewView!.canCommit && !_previewActionBusy)
+                  ? _confirmPreview
+                  : null,
+              child: Text(_previewActionBusy ? '正在提交…' : '确认生成计划'),
+            ),
+          ],
         ],
       ),
     );
   }
 
   /// 运行中：取消任务并保留弹窗（等待协调器回报结果）；否则关闭弹窗。
+  ///
+  /// 关闭预览不提交任何版本（预览只是草稿；正式版本只在确认后生成）。
   void _closeOrCancel() {
     if (_running) {
       widget.controller.cancelChunkedAnalysis();
       return;
     }
+    if (widget.controller.chunkedPreviewAvailable) {
+      widget.controller.discardChunkedPreview();
+    }
     Navigator.of(context).pop();
+  }
+
+  ChunkedPreviewView? get _previewView => widget.controller.chunkedPreview;
+
+  Future<void> _confirmPreview() async {
+    setState(() {
+      _previewActionBusy = true;
+      _error = null;
+    });
+    final result = await widget.controller.confirmChunkedPreview();
+    if (!mounted) return;
+    setState(() {
+      _previewActionBusy = false;
+      _result = result;
+      _error = result.ok ? null : result.message;
+    });
+  }
+
+  Future<void> _toggleTaskExcluded(String candidateId, bool excluded) async {
+    final result = widget.controller
+        .setChunkedPreviewTaskExcluded(candidateId, excluded: excluded);
+    if (!mounted) return;
+    setState(() {
+      _error = result.ok ? null : result.message;
+    });
   }
 
   Widget _content(ChunkedEstimateView estimate) {
@@ -268,12 +311,116 @@ class _ChunkedAnalysisDialogState extends State<ChunkedAnalysisDialog> {
                         fontSize: 12, color: TsColors.blocked)),
               ),
         ],
+        if (_previewView != null) _previewSection(),
         if (_error != null && _result == null) ...[
           const SizedBox(height: 10),
           Text(_error!,
               key: const Key('chunked-error'),
               style: TextStyle(fontSize: 12.5, color: TsColors.blocked)),
         ],
+      ],
+    );
+  }
+
+  /// 预览区：候选任务/来源/待确认项与人工排除；单独重建后才允许提交。
+  Widget _previewSection() {
+    final view = _previewView!;
+    final preview = view.preview;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const SizedBox(height: 12),
+        Text('待确认预览（尚未提交）',
+            key: const Key('chunked-preview-title'),
+            style: TextStyle(
+                fontSize: 12,
+                fontWeight: FontWeight.w600,
+                color: TsColors.textFaint)),
+        const SizedBox(height: 4),
+        Text(
+          '候选任务 ${preview.tasks.length} 个 · 待确认 ${preview.pending.length} 项'
+          ' · 已排除 ${view.excludedCandidateIds.length} 个',
+          style: TextStyle(fontSize: 12, color: TsColors.textSecondary),
+        ),
+        if (view.stale)
+          Padding(
+            padding: const EdgeInsets.only(top: 4),
+            child: Text(
+              '预览已失效：${view.staleReason}（请关闭后重新分析）',
+              key: const Key('chunked-preview-stale'),
+              style: TextStyle(fontSize: 12, color: TsColors.blocked),
+            ),
+          ),
+        if (preview.partial || preview.blockers.isNotEmpty)
+          Padding(
+            padding: const EdgeInsets.only(top: 4),
+            child: Text(
+              '材料未完整处理，不能生成正式计划',
+              key: const Key('chunked-preview-blocked'),
+              style: TextStyle(fontSize: 12, color: TsColors.blocked),
+            ),
+          ),
+        for (final task in preview.tasks)
+          Padding(
+            padding: const EdgeInsets.only(top: 4),
+            child: Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Expanded(
+                  child: Text(
+                    '${view.excludedCandidateIds.contains(task.candidateId) ? '（已排除）' : ''}'
+                    '${task.name}'
+                    '${task.estimatedHours == null ? '' : ' · 约 ${task.estimatedHours} 小时'}'
+                    '${task.deadline == null ? '' : ' · 截止 ${task.deadline}'}'
+                    '${task.sourceSegmentIds.isEmpty ? '' : ' · 来源 ${task.sourceSegmentIds.length} 处'}',
+                    key: Key('chunked-preview-task-${task.candidateId}'),
+                    style: TextStyle(
+                      fontSize: 12,
+                      height: 1.4,
+                      color: view.excludedCandidateIds.contains(task.candidateId)
+                          ? TsColors.textFaint
+                          : TsColors.textPrimary,
+                    ),
+                  ),
+                ),
+                TextButton(
+                  key: Key('chunked-preview-exclude-${task.candidateId}'),
+                  style: TsButtons.outline(),
+                  onPressed: view.committing
+                      ? null
+                      : () => _toggleTaskExcluded(
+                            task.candidateId,
+                            !view.excludedCandidateIds.contains(task.candidateId),
+                          ),
+                  child: Text(
+                      view.excludedCandidateIds.contains(task.candidateId)
+                          ? '恢复'
+                          : '排除'),
+                ),
+              ],
+            ),
+          ),
+        for (final line in view.coverageLines)
+          Text('· $line',
+              style: TextStyle(fontSize: 11.5, color: TsColors.textFaint)),
+        for (final pending in preview.pending.take(6))
+          Padding(
+            padding: const EdgeInsets.only(top: 2),
+            child: Text(
+              '${pending.critical ? '关键待确认' : '待确认'}：${pending.text}',
+              style: TextStyle(
+                fontSize: 12,
+                height: 1.35,
+                color: pending.critical ? TsColors.blocked : TsColors.textSecondary,
+              ),
+            ),
+          ),
+        for (final note in preview.notes.take(6))
+          Padding(
+            padding: const EdgeInsets.only(top: 2),
+            child: Text('· ${note.text}',
+                style: TextStyle(fontSize: 11.5, color: TsColors.textFaint)),
+          ),
       ],
     );
   }
