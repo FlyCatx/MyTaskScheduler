@@ -25,6 +25,7 @@ import 'package:flutter/material.dart';
 
 import '../../state/backup_service.dart';
 import '../../state/execution/execution_store.dart';
+import '../../state/schedule/schedule_store.dart';
 import '../../state/session_store.dart';
 import '../../state/storage_migration.dart';
 import '../../state/settings_controller.dart';
@@ -173,6 +174,12 @@ class SettingsStoragePage extends StatefulWidget {
   /// 为 null 时 [BackupService] 会如实提示“重启后生效”，不会假装已经刷新。
   final Future<void> Function()? reloadExternalCalendar;
 
+  /// 0.4.0：运行中的全局日程存储（备份/恢复必须复用同一个持锁实例）。
+  final ScheduleStore? scheduleStore;
+
+  /// 恢复备份后重新加载日程（生产传 ScheduleController.reloadFromDisk）。
+  final Future<void> Function()? reloadSchedule;
+
   const SettingsStoragePage({
     super.key,
     required this.controller,
@@ -184,6 +191,8 @@ class SettingsStoragePage extends StatefulWidget {
     this.onDataRestored,
     this.isAnalysisRunning,
     this.reloadExternalCalendar,
+    this.scheduleStore,
+    this.reloadSchedule,
   });
 
   @override
@@ -240,6 +249,9 @@ class _SettingsStoragePageState extends State<SettingsStoragePage> {
           // 备份里含 <root>/external_calendar/；恢复后让内存里的外部日历服务重新
           // 加载，否则界面上仍是恢复前的来源（重启才生效）。
           reloadExternalCalendar: widget.reloadExternalCalendar,
+          // 日程是全局数据：备份/恢复必须复用启动时创建、持有实例锁的 store。
+          scheduleStore: widget.scheduleStore,
+          reloadSchedule: widget.reloadSchedule,
         );
     _backupPath.text = _defaultBackupPath();
     _loadUsage();
@@ -386,11 +398,21 @@ class _SettingsStoragePageState extends State<SettingsStoragePage> {
     try {
       final result = await _backup.exportBackup(path);
       if (!mounted) return;
+      // 计数与真实警告都展示：缺失的 OCR 来源、内存模式日程等不能藏在返回值里
+      // 让用户以为备份已经完整。
+      final counts = <String>[
+        '大小 ${formatByteCount(result.byteLength)}',
+        '${result.conversationCount} 个会话',
+        '${result.profileCount} 个连接',
+        if (result.ocrMaterialFileCount > 0)
+          '${result.ocrMaterialFileCount} 个 OCR 来源文件',
+        if (result.scheduleEventCount > 0) '${result.scheduleEventCount} 条日程',
+      ];
+      final warning = result.warning;
       setState(() {
         _backupBusy = false;
-        _backupMessage = '备份完成：${result.path}\n'
-            '大小 ${formatByteCount(result.byteLength)} · '
-            '${result.conversationCount} 个会话 · ${result.profileCount} 个连接';
+        _backupMessage = '备份完成：${result.path}\n${counts.join(' · ')}'
+            '${warning == null ? '' : '\n$warning'}';
       });
       _refreshUsage();
     } on BackupException catch (e) {
@@ -505,6 +527,8 @@ class _SettingsStoragePageState extends State<SettingsStoragePage> {
     if (result.restoredProfileCount > 0) {
       lines.add('备份不含 API Key：恢复后的模型连接需要重新输入密钥。');
     }
+    // 日程计数已在 summary 里；这里补充原因（未启用日程服务/只读/关联解除等）。
+    lines.addAll(result.scheduleNotices);
     return lines.join('\n');
   }
 

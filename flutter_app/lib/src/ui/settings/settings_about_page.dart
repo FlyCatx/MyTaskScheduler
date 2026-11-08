@@ -1,6 +1,7 @@
 // 关于页：版本、许可、帮助入口与脱敏诊断文本。
 // 版本取自 kAppVersion；检查更新保持原位置但禁用（无更新后端），禁用原因只通过
 // 按钮 Tooltip 提示，不再重复常驻“更新服务未配置”卡片；
+// 未接入的“意见反馈”不再伪装成可点击动作：只显示不可用状态，原因放 Tooltip；
 // 帮助打开可执行文件旁的 README，缺失时如实说明；
 // “隐私协议”打开可读的说明弹窗：不再写“程序不上传材料与密钥”的绝对承诺，
 // 而是说明本机 OCR 本地完成、主动发起模型分析时文字会经配置连接发送、
@@ -107,9 +108,9 @@ class SettingsAboutPage extends StatelessWidget {
                   label: '隐私协议',
                   onTap: () => _showPrivacyPolicy(context),
                 ),
-                _FooterLink(
-                  label: '意见反馈',
-                  onTap: () => showSettingsMessage(context, '该功能尚未接入'),
+                const Tooltip(
+                  message: '意见反馈功能尚未接入',
+                  child: _FooterLink(label: '意见反馈'),
                 ),
               ],
             ),
@@ -270,23 +271,31 @@ class _DiagnosticsDisclosureState extends State<_DiagnosticsDisclosure> {
   }
 }
 
+/// 页脚链接；`onTap == null` 表示该功能未接入，只显示不可用状态、不接收点击。
 class _FooterLink extends StatelessWidget {
   final String label;
-  final VoidCallback onTap;
+  final VoidCallback? onTap;
 
-  const _FooterLink({required this.label, required this.onTap});
+  const _FooterLink({required this.label, this.onTap});
 
   @override
   Widget build(BuildContext context) {
+    final text = Text(
+      label,
+      style: TextStyle(fontSize: 11.5, color: TsColors.textFaint),
+    );
+    if (onTap == null) {
+      return Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 2, vertical: 2),
+        child: text,
+      );
+    }
     return InkWell(
       onTap: onTap,
       customBorder: const BezierRoundedRectangleBorder(radius: 6),
       child: Padding(
         padding: const EdgeInsets.symmetric(horizontal: 2, vertical: 2),
-        child: Text(
-          label,
-          style: TextStyle(fontSize: 11.5, color: TsColors.textFaint),
-        ),
+        child: text,
       ),
     );
   }

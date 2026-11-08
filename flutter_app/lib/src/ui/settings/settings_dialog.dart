@@ -33,6 +33,7 @@ import 'package:flutter/material.dart';
 import '../../app_info.dart';
 import '../../model/calendar.dart' show kDefaultTimezoneId;
 import '../../state/execution/execution_store.dart';
+import '../../state/schedule/schedule_store.dart';
 import '../../state/external_calendar_service.dart';
 import '../../state/settings_controller.dart';
 import '../widgets/bezier_ui.dart';
@@ -87,6 +88,8 @@ Future<void> showSettingsDialog(
   String? currentConversationTitle,
   VoidCallback? onExternalCalendarChanged,
   ExecutionStore? executionStore,
+  ScheduleStore? scheduleStore,
+  Future<void> Function()? reloadSchedule,
 }) {
   return showDialog<void>(
     context: context,
@@ -104,6 +107,8 @@ Future<void> showSettingsDialog(
       currentConversationTitle: currentConversationTitle,
       onExternalCalendarChanged: onExternalCalendarChanged,
       executionStore: executionStore,
+      scheduleStore: scheduleStore,
+      reloadSchedule: reloadSchedule,
     ),
   );
 }
@@ -133,6 +138,12 @@ class SettingsDialog extends StatefulWidget {
   /// 0.2.3（R3-E）：运行中的执行记录存储；备份/恢复要用同一实例（null = 未启用）。
   final ExecutionStore? executionStore;
 
+  /// 0.4.0：运行中的全局日程存储；备份/恢复要用同一实例（null = 未启用日程）。
+  final ScheduleStore? scheduleStore;
+
+  /// 恢复后重新加载日程；null 时备份服务会提示“需重启”。
+  final Future<void> Function()? reloadSchedule;
+
   const SettingsDialog({
     super.key,
     required this.controller,
@@ -144,6 +155,8 @@ class SettingsDialog extends StatefulWidget {
     this.currentConversationTitle,
     this.onExternalCalendarChanged,
     this.executionStore,
+    this.scheduleStore,
+    this.reloadSchedule,
   });
 
   @override
@@ -432,6 +445,8 @@ class _SettingsDialogState extends State<SettingsDialog> {
           storageSource: widget.storageSource,
           memoryOnly: widget.storageMemoryOnly,
           executionStore: widget.executionStore,
+          scheduleStore: widget.scheduleStore,
+          reloadSchedule: widget.reloadSchedule,
           // 备份恢复包含外部日历快照：恢复后立即重新加载，避免“重启后才生效”。
           reloadExternalCalendar: widget.externalCalendar == null
               ? null
