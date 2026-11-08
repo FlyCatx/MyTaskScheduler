@@ -572,8 +572,19 @@ class NativeGateway implements SettingsBridge {
 
   @override
   void release(int job) {
-    if (_disposed) return;
-    _bindings.release(_handle, job);
+    tryRelease(job);
+  }
+
+  /// 尝试释放已终结的 job。ABI 规定工作线程仍运行时返回非 0；调用方必须据此
+  /// 保留待回收身份，不能用“调用过一次”宣称已释放。桥接已关闭时返回 true
+  /// （句柄随 destroy 一起销毁）。
+  bool tryRelease(int job) {
+    if (_disposed) return true;
+    try {
+      return _bindings.release(_handle, job);
+    } catch (_) {
+      return false;
+    }
   }
 
   /// Validates + reschedules a local plan and returns the display snapshot.
@@ -724,4 +735,3 @@ class NativeGateway implements SettingsBridge {
     return raw ?? '未知错误';
   }
 }
-
