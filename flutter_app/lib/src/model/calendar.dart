@@ -348,6 +348,11 @@ class CalendarOccupancy {
   /// 0.2.2: 外部来源 id（仅 [external] 为 true 时有值）。
   final String? sourceId;
 
+  /// 0.4.0: 该占用来自本地全局日程（只读、运行时合成），用于冲突解释。
+  ///
+  /// 与 [external] 互斥；只用于本地解释层，C 协议不读取，绝不写回版本。
+  final bool localSchedule;
+
   const CalendarOccupancy({
     required this.id,
     required this.title,
@@ -360,6 +365,7 @@ class CalendarOccupancy {
     this.reservationId,
     this.external = false,
     this.sourceId,
+    this.localSchedule = false,
   });
 
   bool get isWeekly => date == null || date!.isEmpty;
@@ -401,6 +407,7 @@ class CalendarOccupancy {
         // 0.2.2: 只对本地解释层有意义；旧数据缺字段时读回 false/null。
         'external': external,
         'sourceId': sourceId,
+        'localSchedule': localSchedule,
       };
 
   factory CalendarOccupancy.fromJson(Map<String, dynamic> j) => CalendarOccupancy(
@@ -425,6 +432,7 @@ class CalendarOccupancy {
         sourceId: (j['sourceId'] as String?)?.trim().isEmpty == true
             ? null
             : j['sourceId'] as String?,
+        localSchedule: j['localSchedule'] == true,
       );
 }
 

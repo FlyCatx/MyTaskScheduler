@@ -66,7 +66,13 @@ enum TimetableOrigin {
   /// 只出现在「运行时合成时间表」里（见 state/timetable_composition.dart）：
   /// 合成结果**绝不落盘**，手工时间表（session/version.timetable）里永远没有
   /// 该来源。C 侧只校验 origin 是字符串，因此新增枚举值不改变协议。
-  external('external');
+  external('external'),
+
+  /// 本地全局日程忙碌（只读，运行时合成）。
+  ///
+  /// 与 [external] 一样只出现在运行时合成时间表里，绝不写回手工时间表/版本；
+  /// 与外部日历区分是为了冲突解释与隐私边界（日程标题不进请求）。
+  schedule('schedule');
 
   const TimetableOrigin(this.wireName);
 
@@ -76,6 +82,7 @@ enum TimetableOrigin {
         'default' => TimetableOrigin.defaultRule,
         'model' => TimetableOrigin.model,
         'external' => TimetableOrigin.external,
+        'schedule' => TimetableOrigin.schedule,
         _ => TimetableOrigin.manual,
       };
 }
