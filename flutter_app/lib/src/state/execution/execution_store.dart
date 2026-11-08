@@ -1,4 +1,4 @@
-// 执行记录账本的本地存储（R3-E3/E4 落盘部分）。
+// 执行记录账本的本地存储。
 //
 // 布局（`<dataRoot>/execution/`，与 index.json / conversations/ 同级，可纳入备份）：
 //   ledger.json     — 全部执行记录 + 完成事件（含 schemaVersion）
@@ -6,9 +6,7 @@
 //   checkpoint.json — 活动计时检查点（小而频繁写，默认 15 秒一次）
 //   instance.lock   — 多实例互斥锁文件（只创建，从不删除）
 //
-// 可靠性写法与 SessionStore 一致：
-//   * 新内容先写唯一临时文件 `<file>.<token>.tmp` 并 flush，旧主文件改名 `.bak`，
-//     再改名成主文件；失败时保留主文件与 `.bak`，绝不“直接覆盖主文件”；
+// 写入走 storage_json_write.dart，与会话和外部日历共用。读取时：
 //   * 主文件损坏/缺失 → 回退 `.bak`；两者都不可解析 → 把损坏文件改名为
 //     `ledger.json.corrupt-<时间戳>` 保留证据后以空账本启动，并给出明确提示；
 //   * 读到 schema 比本构建更新的账本 → **只读**，避免用旧结构覆盖新数据。
@@ -20,7 +18,7 @@
 import 'dart:convert';
 import 'dart:io';
 
-import '../storage_migration.dart';
+import '../storage_json_write.dart';
 import 'execution_ledger.dart';
 import 'execution_models.dart';
 
@@ -104,9 +102,7 @@ class ExecutionStore {
   /// 进程内锁注册表：同一路径在同一个进程里也只允许一个写实例。
   static final Map<String, Object> _inProcessLocks = <String, Object>{};
 
-  /// 同一路径的写入串行化；每个写入使用唯一临时文件名。
-  static final Map<String, Future<void>> _writeQueues = <String, Future<void>>{};
-  static int _writeSequence = 0;
+  /// 本类的写入统一走 [writeJsonAtomically]（同路径串行化、唯一临时文件）。
 
   bool get isMemoryOnly => _memoryOnly;
 
@@ -418,59 +414,13 @@ class ExecutionStore {
     return (data: null, existed: await file.exists());
   }
 
+  /// 检查点用 `keepBackup: false`：允许丢一个写入周期，不需要 `.bak`。
   Future<void> _writeJson(
     File file,
     Map<String, dynamic> data, {
     bool keepBackup = true,
-  }) {
-    final previous = _writeQueues[file.path] ?? Future<void>.value();
-    late final Future<void> next;
-    next = previous
-        .catchError((Object _) {})
-        .then((_) => _writeJsonNow(file, data, keepBackup: keepBackup))
-        .whenComplete(() {
-      if (identical(_writeQueues[file.path], next)) {
-        _writeQueues.remove(file.path);
-      }
-    });
-    _writeQueues[file.path] = next;
-    return next;
-  }
-
-  Future<void> _writeJsonNow(
-    File file,
-    Map<String, dynamic> data, {
-    required bool keepBackup,
-  }) async {
-    StorageWriteGate.beginOperation();
-    try {
-      final token =
-          '${DateTime.now().microsecondsSinceEpoch}-${_writeSequence++}';
-      final tmp = File('${file.path}.$token.tmp');
-      final bak = File('${file.path}.bak');
-      final payload = const JsonEncoder.withIndent('  ').convert(data);
-      await file.parent.create(recursive: true);
-      await tmp.writeAsString(payload, flush: true);
-      try {
-        if (await file.exists() && keepBackup) {
-          if (await bak.exists()) await bak.delete();
-          await file.rename(bak.path);
-        }
-        if (await file.exists() && !keepBackup) {
-          // 检查点不需要 .bak：直接替换，崩溃时最多丢一个检查点周期。
-          await file.delete();
-        }
-        await tmp.rename(file.path);
-      } catch (e) {
-        try {
-          if (await tmp.exists()) await tmp.delete();
-        } catch (_) {}
-        rethrow;
-      }
-    } finally {
-      StorageWriteGate.endOperation();
-    }
-  }
+  }) =>
+      writeJsonAtomically(file, data, keepBackup: keepBackup);
 
   /// 仅测试用：清空进程内锁注册表（正常情况下 close() 会释放）。
   static void resetInstanceLocksForTest() {
