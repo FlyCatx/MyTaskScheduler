@@ -1,4 +1,4 @@
-﻿# Builds the shippable Windows package for the Flutter UI.
+# Builds the shippable Windows package for the Flutter UI.
 #
 # ASCII-only on purpose: Windows PowerShell 5.1 reads .ps1 files as ANSI, so
 # non-ASCII text here would be garbled. Chinese user-facing text lives in
@@ -20,7 +20,7 @@
 
 [CmdletBinding()]
 param(
-    [string]$Version = '0.3.0',
+    [string]$Version = '0.4.0',
     [string]$ApiKey = '',
     [string]$Model = 'deepseek-flash',
     [string]$Endpoint = 'https://api.deepseek.com/chat/completions',
@@ -42,12 +42,12 @@ if ([string]::IsNullOrWhiteSpace($ApiKey)) { $ApiKey = $env:TS_RELEASE_API_KEY }
 if ([string]::IsNullOrWhiteSpace($ApiKey) -and -not $NoApiKey) {
     throw 'API key is required: pass -ApiKey, set $env:TS_RELEASE_API_KEY, or use -NoApiKey for a key-free package'
 }
-# Product version and pubspec/build version must agree: 0.05 == 0.0.5, 0.06 == 0.0.6, 0.07 == 0.0.7, 0.08 == 0.0.8, 0.09 == 0.0.9, 0.1.0 == 0.1.0, 0.1.1 == 0.1.1, 0.1.2 == 0.1.2, 0.2.0 == 0.2.0, 0.2.1 == 0.2.1, 0.2.2 == 0.2.2, 0.2.3 == 0.2.3, 0.3.0 == 0.3.0.
+# Product version and pubspec/build version must agree: 0.05 == 0.0.5, 0.06 == 0.0.6, 0.07 == 0.0.7, 0.08 == 0.0.8, 0.09 == 0.0.9, 0.1.0 == 0.1.0, 0.1.1 == 0.1.1, 0.1.2 == 0.1.2, 0.2.0 == 0.2.0, 0.2.1 == 0.2.1, 0.2.2 == 0.2.2, 0.2.3 == 0.2.3, 0.3.0 == 0.3.0, 0.3.1 == 0.3.1, 0.4.0 == 0.4.0.
 # Keep the +build suffix for VERSION.txt traceability; compare only the semver part.
 $pubFull = (Select-String -Path (Join-Path $appDir 'pubspec.yaml') -Pattern '^version:\s*([0-9]+\.[0-9]+\.[0-9]+(?:\+[0-9]+)?)' |
     Select-Object -First 1).Matches.Groups[1].Value
 $pubVersion = ($pubFull -split '\+')[0]
-$versionAliases = @{ '0.05' = '0.0.5'; '0.06' = '0.0.6'; '0.07' = '0.0.7'; '0.08' = '0.0.8'; '0.09' = '0.0.9'; '0.1.0' = '0.1.0'; '0.1.1' = '0.1.1'; '0.1.2' = '0.1.2'; '0.2.0' = '0.2.0'; '0.2.1' = '0.2.1'; '0.2.2' = '0.2.2'; '0.2.3' = '0.2.3'; '0.3.0' = '0.3.0' }
+$versionAliases = @{ '0.05' = '0.0.5'; '0.06' = '0.0.6'; '0.07' = '0.0.7'; '0.08' = '0.0.8'; '0.09' = '0.0.9'; '0.1.0' = '0.1.0'; '0.1.1' = '0.1.1'; '0.1.2' = '0.1.2'; '0.2.0' = '0.2.0'; '0.2.1' = '0.2.1'; '0.2.2' = '0.2.2'; '0.2.3' = '0.2.3'; '0.3.0' = '0.3.0'; '0.3.1' = '0.3.1'; '0.4.0' = '0.4.0' }
 if ($versionAliases.ContainsKey($Version) -and $pubVersion -ne $versionAliases[$Version]) {
     throw "version mismatch: product $Version requires pubspec $($versionAliases[$Version]) (found $pubVersion)"
 }
