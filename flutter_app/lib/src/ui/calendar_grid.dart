@@ -22,6 +22,8 @@ import '../model/calendar.dart';
 import '../model/external_calendar.dart';
 import '../model/timetable.dart';
 import '../model/settings.dart';
+import '../state/ics/ics_timezones.dart';
+import '../state/schedule/schedule_expander.dart' show ScheduleOccurrence;
 import 'edit_commands.dart';
 import 'theme.dart';
 import 'widgets/bezier_ui.dart';
@@ -263,6 +265,53 @@ List<TimetableCell> crossedGridCells(Offset from, Offset to) {
   return out;
 }
 
+/// 网格里一个日程显示段：一条实例按展示时区的自然日拆开后的其中一天。
+///
+/// 跨日日程在两（或多）个日期各有一段；每段有当天的墙钟起止分钟。重叠的段按
+/// 贪心分到不同子列（[lane]/[laneCount]），因此同一个时间段里的两条日程各自
+/// 拥有独立的横向命中区域，不会只剩最后一条。
+class _ScheduleSegment {
+  _ScheduleSegment({
+    required this.occurrence,
+    required this.dayIndex,
+    required this.dateKey,
+    required this.startMinute,
+    required this.endMinute,
+  });
+
+  final ScheduleOccurrence occurrence;
+  final int dayIndex;
+  final String dateKey;
+
+  /// 当天墙钟开始分钟 [0, 1439]。
+  final int startMinute;
+
+  /// 当天墙钟结束分钟 (startMinute, 1440]；1440 即当天 24:00。
+  final int endMinute;
+
+  int lane = 0;
+  int laneCount = 1;
+
+  /// 稳定显示身份：同一实例同一天只显示一段。
+  String get displayKey => '${occurrence.occurrenceKey}@$dateKey';
+}
+
+/// 当天分钟的显示文案：1440 写成 24:00，而不是 00:00。
+String _scheduleMinuteLabel(int minute) =>
+    minute >= kTimetableMinutesPerDay ? '24:00' : WallClockRange.formatMinute(minute);
+
+/// 定时块的文字标签：标题 + 时段（+「不占用」标记）。
+String scheduleBlockLabel(
+  ScheduleOccurrence occurrence,
+  int startMinute,
+  int endMinute,
+) {
+  final range =
+      '${_scheduleMinuteLabel(startMinute)}-${_scheduleMinuteLabel(endMinute)}';
+  final marker = occurrence.blocksScheduling ? '' : ' · 不占用';
+  return '${occurrence.title} $range$marker';
+}
+
 /// 网格的编辑命令目标：撤销/重做接日程事务，其他文本命令不适用。
 ///
 /// 网格自己的撤销栈是时间表事务（一笔拖动 = 一笔），因此重做也必须走同一套
@@ -340,6 +389,22 @@ class TimetableGrid extends StatefulWidget {
   /// 外部来源 id → 名称（仅供悬停/点选信息显示，本地使用，不进入模型请求）。
   final Map<String, String> externalSourceNames;
 
+  /// 全局日程叠层（来自 ScheduleController 的范围展开）。
+  ///
+  /// 这些实例**不进入** [TimetableDraft]：全天日程画在日期表头，定时日程按展示
+  /// 时区拆成自然日显示段画在各自时段；点击只回调 [onScheduleTap]，不绘制/擦除/
+  /// 选中/绑定，也不产生撤销事务。为空时渲染与未接入叠层时完全一致。
+  final List<ScheduleOccurrence> scheduleOccurrences;
+
+  /// 点击某条日程（定时块或全天条）时回调；为 null 时不拦截原有绘制手势。
+  final ValueChanged<ScheduleOccurrence>? onScheduleTap;
+
+  /// “添加日程”入口；为 null 时状态条不出现该按钮（旧调用零变化）。
+  final VoidCallback? onAddSchedule;
+
+  /// 日程叠层投影用的展示时区（IANA）；为 null 时逐条按日程自身时区投影。
+  final String? scheduleTimezoneId;
+
   const TimetableGrid({
     super.key,
     required this.controller,
@@ -355,6 +420,10 @@ class TimetableGrid extends StatefulWidget {
     this.onSelectionChanged,
     this.externalBusy = const <ExternalBusyInstance>[],
     this.externalSourceNames = const <String, String>{},
+    this.scheduleOccurrences = const <ScheduleOccurrence>[],
+    this.onScheduleTap,
+    this.onAddSchedule,
+    this.scheduleTimezoneId,
   });
 
   static const double timeAxisWidth = 54;
@@ -391,6 +460,13 @@ class _TimetableGridState extends State<TimetableGrid> {
   String? _hoverText;
   double _gridWidth = 7 * 120;
   bool _disposed = false;
+
+  /// 本次 build 计算出的日程显示段（供绘制、命中与悬停共用同一份布局）。
+  List<_ScheduleSegment> _scheduleSegments = const <_ScheduleSegment>[];
+
+  /// 当前可见周里，日期 → 覆盖该日的全天日程（画在日期表头）。
+  Map<String, List<ScheduleOccurrence>> _allDayByDate =
+      const <String, List<ScheduleOccurrence>>{};
 
   late final EditTarget _editTarget = TimetableGridEditTarget(
     controller: widget.controller,
@@ -457,6 +533,315 @@ class _TimetableGridState extends State<TimetableGrid> {
 
   List<TimetableDay> get _days =>
       _draft.timetable.weekDays(weekStart: widget.weekStart);
+
+  // ------------------------------------------------- 日程叠层（只读展示）
+  //
+  // 日程实例不写进 TimetableDraft：这里只把 occurrences 换算成“可见周的显示段”。
+  // 定时实例按展示时区的自然日拆分（跨日 → 每天一段），全天实例覆盖到日期表头。
+  // 展示时区默认用 widget.scheduleTimezoneId，缺省用实例自身时区，保持墙钟语义。
+
+  String _scheduleTimezoneOf(ScheduleOccurrence occurrence) {
+    final override = widget.scheduleTimezoneId?.trim();
+    if (override != null && override.isNotEmpty) return override;
+    return occurrence.timezoneId;
+  }
+
+  List<_ScheduleSegment> _layoutScheduleSegments(List<TimetableDay> days) {
+    if (days.isEmpty || widget.scheduleOccurrences.isEmpty) {
+      return const <_ScheduleSegment>[];
+    }
+    final indexByDate = <String, int>{
+      for (var i = 0; i < days.length; i++) days[i].date: i,
+    };
+    final resolver = IcsTimeZoneResolver();
+    final segments = <_ScheduleSegment>[];
+    for (final occurrence in widget.scheduleOccurrences) {
+      if (occurrence.allDay) continue;
+      final startUtc = occurrence.startUtc;
+      final endUtc = occurrence.endUtc;
+      if (startUtc == null || endUtc == null || !endUtc.isAfter(startUtc)) {
+        continue;
+      }
+      final tzid = _scheduleTimezoneOf(occurrence);
+      final startWall = resolver.utcToWall(tzid, startUtc);
+      final endWall = resolver.utcToWall(tzid, endUtc);
+      if (startWall == null || endWall == null) continue;
+      final firstDate = WallClock.formatDateKey(
+        startWall.year,
+        startWall.month,
+        startWall.day,
+      );
+      final lastDate =
+          WallClock.formatDateKey(endWall.year, endWall.month, endWall.day);
+      final firstMinute = startWall.hour * 60 + startWall.minute;
+      final lastMinute = endWall.hour * 60 + endWall.minute;
+      var date = firstDate;
+      var guard = 0;
+      while (date.compareTo(lastDate) <= 0 && guard++ < 400) {
+        final dayIndex = indexByDate[date];
+        if (dayIndex != null) {
+          final startMinute = date == firstDate ? firstMinute : 0;
+          final endMinute =
+              date == lastDate ? lastMinute : kTimetableMinutesPerDay;
+          if (endMinute > startMinute) {
+            segments.add(_ScheduleSegment(
+              occurrence: occurrence,
+              dayIndex: dayIndex,
+              dateKey: date,
+              startMinute: startMinute,
+              endMinute: endMinute,
+            ));
+          }
+        }
+        final next = addDaysToDateKey(date, 1);
+        if (next == date) break;
+        date = next;
+      }
+    }
+    _assignScheduleLanes(segments);
+    return segments;
+  }
+
+  Map<String, List<ScheduleOccurrence>> _layoutAllDay(List<TimetableDay> days) {
+    if (days.isEmpty) return const <String, List<ScheduleOccurrence>>{};
+    final out = <String, List<ScheduleOccurrence>>{};
+    for (final occurrence in widget.scheduleOccurrences) {
+      if (!occurrence.allDay) continue;
+      final startDate = occurrence.startDate;
+      final endExclusive = occurrence.endDateExclusive;
+      if (startDate == null || endExclusive == null) continue;
+      if (endExclusive.compareTo(startDate) <= 0) continue;
+      for (final day in days) {
+        if (day.date.compareTo(startDate) < 0) continue;
+        if (day.date.compareTo(endExclusive) >= 0) continue;
+        out.putIfAbsent(day.date, () => <ScheduleOccurrence>[]).add(occurrence);
+      }
+    }
+    return out;
+  }
+
+  /// 贪心分列：同一自然日里重叠的段放进不同子列；[laneCount] 取重叠簇的列数，
+  /// 于是两条同时段日程各占半列、分别可命中，不会只剩最后一条。
+  void _assignScheduleLanes(List<_ScheduleSegment> segments) {
+    final byDate = <String, List<_ScheduleSegment>>{};
+    for (final segment in segments) {
+      byDate.putIfAbsent(segment.dateKey, () => <_ScheduleSegment>[]).add(segment);
+    }
+    for (final group in byDate.values) {
+      group.sort((a, b) {
+        final byStart = a.startMinute.compareTo(b.startMinute);
+        if (byStart != 0) return byStart;
+        final byEnd = b.endMinute.compareTo(a.endMinute);
+        if (byEnd != 0) return byEnd;
+        return a.displayKey.compareTo(b.displayKey);
+      });
+      final laneEnds = <int>[];
+      final lanes = <int>[];
+      for (final segment in group) {
+        var lane = laneEnds.indexWhere((end) => end <= segment.startMinute);
+        if (lane < 0) {
+          lane = laneEnds.length;
+          laneEnds.add(segment.endMinute);
+        } else {
+          laneEnds[lane] = segment.endMinute;
+        }
+        lanes.add(lane);
+      }
+      var i = 0;
+      while (i < group.length) {
+        var clusterEnd = group[i].endMinute;
+        final members = <int>[i];
+        var j = i + 1;
+        while (j < group.length && group[j].startMinute < clusterEnd) {
+          members.add(j);
+          if (group[j].endMinute > clusterEnd) {
+            clusterEnd = group[j].endMinute;
+          }
+          j++;
+        }
+        var count = 1;
+        for (final member in members) {
+          if (lanes[member] + 1 > count) count = lanes[member] + 1;
+        }
+        for (final member in members) {
+          group[member].lane = lanes[member];
+          group[member].laneCount = count;
+        }
+        i = j;
+      }
+    }
+  }
+
+  /// 命中计算沿用网格自己的画布坐标（[TimetableGridGeometry.toGrid]）：指针先
+  /// 落到“第几天 + 连续格坐标”，再按子列与分钟区间判断，不再另算一套像素偏移。
+  _ScheduleSegment? _scheduleAt(Offset viewportPoint) {
+    if (_scheduleSegments.isEmpty) return null;
+    final point = _geometry.toGrid(viewportPoint);
+    if (point == null) return null;
+    final day = point.dx.floor();
+    final minute = point.dy * kTimetableSlotMinutes;
+    for (var i = _scheduleSegments.length - 1; i >= 0; i--) {
+      final segment = _scheduleSegments[i];
+      if (segment.dayIndex != day) continue;
+      if (minute < segment.startMinute || minute >= segment.endMinute) continue;
+      final left = day + segment.lane / segment.laneCount;
+      final right = day + (segment.lane + 1) / segment.laneCount;
+      if (point.dx < left || point.dx >= right) continue;
+      return segment;
+    }
+    return null;
+  }
+
+  String _scheduleHoverLabel(_ScheduleSegment segment) {
+    final occurrence = segment.occurrence;
+    final range =
+        '${_scheduleMinuteLabel(segment.startMinute)}-${_scheduleMinuteLabel(segment.endMinute)}';
+    final busy = occurrence.blocksScheduling ? '占用排程时间' : '不占用排程时间';
+    return '${segment.dateKey} $range · 日程：${occurrence.title} · $busy'
+        ' · 只读叠层（不写入手工时间表）';
+  }
+
+  double _allDayChipHeight() {
+    final scale = MediaQuery.textScalerOf(context).scale(1).clamp(1.0, 1.6);
+    return 14 * scale;
+  }
+
+  int _allDayRowCount() {
+    if (_allDayByDate.isEmpty) return 0;
+    var maxRows = 0;
+    for (final items in _allDayByDate.values) {
+      final rows = items.length <= 2 ? items.length : 2;
+      if (rows > maxRows) maxRows = rows;
+    }
+    return maxRows;
+  }
+
+  /// 全天日程条：日期表头里的一行，条目本身可点（只回调）。
+  Widget _allDayChip(
+    ScheduleOccurrence occurrence,
+    String date, {
+    required bool overflow,
+    int hidden = 0,
+  }) {
+    final scale = MediaQuery.textScalerOf(context).scale(1).clamp(1.0, 1.6);
+    final label = overflow
+        ? '+$hidden 条'
+        : '${occurrence.title}${occurrence.blocksScheduling ? '' : ' · 不占用'}';
+    final chip = Container(
+      height: _allDayChipHeight() - 2,
+      margin: const EdgeInsets.symmetric(horizontal: 2, vertical: 1),
+      padding: const EdgeInsets.symmetric(horizontal: 3),
+      decoration: BoxDecoration(
+        color: TsColors.pendingSoft,
+        border: Border.all(
+          color: TsColors.pending.withValues(alpha: overflow ? 0.35 : 0.75),
+        ),
+        borderRadius: const BorderRadius.all(Radius.circular(3)),
+      ),
+      alignment: Alignment.centerLeft,
+      child: Text(
+        label,
+        maxLines: 1,
+        softWrap: false,
+        overflow: TextOverflow.ellipsis,
+        style: TextStyle(
+          fontSize: 8.5 * scale,
+          height: 1,
+          color: TsColors.pending,
+        ),
+      ),
+    );
+    if (overflow) return chip;
+    return Tooltip(
+      message: occurrence.blocksScheduling
+          ? '${occurrence.title} · 全天 · 占用排程时间（只读叠层）'
+          : '${occurrence.title} · 全天 · 不占用排程时间（只读叠层）',
+      child: GestureDetector(
+        key: Key('timetable-schedule-allday-${occurrence.occurrenceKey}-$date'),
+        behavior: HitTestBehavior.opaque,
+        onTap: widget.onScheduleTap == null
+            ? null
+            : () => widget.onScheduleTap!(occurrence),
+        child: chip,
+      ),
+    );
+  }
+
+  Widget _allDayColumn(List<ScheduleOccurrence> items, String date) {
+    final rows = items.length <= 2 ? items.length : 2;
+    final widgets = <Widget>[];
+    for (var i = 0; i < rows; i++) {
+      if (i == rows - 1 && items.length > 2) {
+        widgets.add(_allDayChip(
+          items.first,
+          date,
+          overflow: true,
+          hidden: items.length - 1,
+        ));
+        break;
+      }
+      widgets.add(_allDayChip(items[i], date, overflow: false));
+    }
+    return Column(children: widgets);
+  }
+
+  /// 定时日程块：叠在手工时间表之上，只展示与命中，不接收绘制/擦除/选中手势。
+  Widget _scheduleBlockWidget(_ScheduleSegment segment, double dayWidth) {
+    final laneWidth = dayWidth / segment.laneCount;
+    final left = segment.dayIndex * dayWidth + laneWidth * segment.lane + 1;
+    final width = math.max(6.0, laneWidth - 2);
+    final top = TimetableGrid.topInset +
+        segment.startMinute / 60 * 4 * TimetableGrid.rowHeight +
+        1;
+    final height = math.max(
+      10.0,
+      (segment.endMinute - segment.startMinute) /
+              60 *
+              4 *
+              TimetableGrid.rowHeight -
+          2,
+    );
+    final scale = MediaQuery.textScalerOf(context).scale(1).clamp(1.0, 1.6);
+    final label = scheduleBlockLabel(
+      segment.occurrence,
+      segment.startMinute,
+      segment.endMinute,
+    );
+    return Positioned(
+      key: Key('timetable-schedule-${segment.displayKey}'),
+      left: left,
+      top: top,
+      width: width,
+      height: height,
+      child: Tooltip(
+        message: _scheduleHoverLabel(segment),
+        waitDuration: const Duration(milliseconds: 500),
+        child: Container(
+          decoration: BoxDecoration(
+            color: TsColors.pendingSoft,
+            border: Border.all(
+              color: TsColors.pending.withValues(alpha: 0.75),
+            ),
+            borderRadius: const BorderRadius.all(Radius.circular(3)),
+          ),
+          padding: const EdgeInsets.symmetric(horizontal: 2, vertical: 1),
+          alignment: Alignment.topLeft,
+          clipBehavior: Clip.hardEdge,
+          child: Text(
+            label,
+            maxLines: 2,
+            softWrap: false,
+            overflow: TextOverflow.clip,
+            style: TextStyle(
+              fontSize: 9 * scale,
+              height: 1.05,
+              color: TsColors.pending,
+            ),
+          ),
+        ),
+      ),
+    );
+  }
 
   TimetableGridGeometry get _geometry => TimetableGridGeometry(
         gridWidth: _gridWidth,
@@ -575,6 +960,13 @@ class _TimetableGridState extends State<TimetableGrid> {
     if (local == null) return;
     final cell = _geometry.hit(local);
     if (cell == null) return;
+    // 日程叠层只回调，不落笔/擦除/选中/绑定，也不产生撤销事务；没有回调时
+    // （旧调用）保持原有绘制手势不变。
+    final schedule = _scheduleAt(local);
+    if (schedule != null && widget.onScheduleTap != null) {
+      widget.onScheduleTap!(schedule.occurrence);
+      return;
+    }
     // 外部日历占用是只读的：点选只显示信息，不绘制/擦除/选中/绑定。
     final external = _externalAt(cell);
     if (external != null) {
@@ -766,6 +1158,15 @@ class _TimetableGridState extends State<TimetableGrid> {
       }
       return;
     }
+    final scheduleHit = local == null ? null : _scheduleAt(local);
+    if (scheduleHit != null) {
+      final scheduleText = _scheduleHoverLabel(scheduleHit);
+      if (scheduleText != _hoverText) {
+        setState(() => _hoverText = scheduleText);
+        widget.onHover?.call(scheduleText);
+      }
+      return;
+    }
     final d = _days[cell.day];
     final minute = cell.slot * kTimetableSlotMinutes;
     final interval = d.at(minute);
@@ -815,8 +1216,15 @@ class _TimetableGridState extends State<TimetableGrid> {
   @override
   Widget build(BuildContext context) {
     final days = _days;
-    // 日期表头随文字缩放增高，1.5 倍字号下两行标签不会纵向溢出。
-    final headerHeight = _scaledHeaderHeight(context);
+    // 叠层布局在 build 里算一次：绘制块、命中和悬停共用同一份显示段，避免
+    // 三处各自换算导致“看得见却点不中”。
+    _scheduleSegments = _layoutScheduleSegments(days);
+    _allDayByDate = _layoutAllDay(days);
+    // 日期表头随文字缩放增高，1.5 倍字号下两行标签不会纵向溢出；有全天日程时
+    // 额外留出表头里的全天条高度（没有全天日程时高度与旧版完全一致）。
+    final allDayRows = _allDayRowCount();
+    final headerHeight = _scaledHeaderHeight(context) +
+        (allDayRows == 0 ? 0 : allDayRows * _allDayChipHeight() + 2);
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
@@ -852,6 +1260,17 @@ class _TimetableGridState extends State<TimetableGrid> {
                     TimetableGrid.timeAxisWidth -
                     TimetableGrid.scrollbarGutter,
               );
+              // 画笔必须用本次布局后的 gridWidth 构造（放在 LayoutBuilder 里，不能
+              // 用 outer build 的旧值，否则第一帧会用默认宽度画出错的列宽）。
+              final painter = _GridPainter(
+                days: days,
+                width: _gridWidth,
+                rowHeight: TimetableGrid.rowHeight,
+                topInset: TimetableGrid.topInset,
+                selected: _selectionRanges(),
+                externalBusy: widget.externalBusy,
+                externalSourceNames: widget.externalSourceNames,
+              );
               return MouseRegion(
                 cursor: SystemMouseCursors.precise,
                 onHover: _handleHover,
@@ -880,18 +1299,23 @@ class _TimetableGridState extends State<TimetableGrid> {
                               SizedBox(
                                 width: _gridWidth,
                                 height: TimetableGrid.contentHeight,
-                                child: CustomPaint(
-                                  painter: _GridPainter(
-                                    days: days,
-                                    width: _gridWidth,
-                                    rowHeight: TimetableGrid.rowHeight,
-                                    topInset: TimetableGrid.topInset,
-                                    selected: _selectionRanges(),
-                                    externalBusy: widget.externalBusy,
-                                    externalSourceNames:
-                                        widget.externalSourceNames,
-                                  ),
-                                ),
+                                // 无日程时保持原控件树（逐像素零回归）；有日程时在
+                                // 同一画布上叠一层只读显示块，命中仍走网格坐标。
+                                child: _scheduleSegments.isEmpty
+                                    ? CustomPaint(painter: painter)
+                                    : Stack(
+                                        clipBehavior: Clip.hardEdge,
+                                        children: [
+                                          Positioned.fill(
+                                            child: CustomPaint(painter: painter),
+                                          ),
+                                          for (final segment in _scheduleSegments)
+                                            _scheduleBlockWidget(
+                                              segment,
+                                              _gridWidth / 7,
+                                            ),
+                                        ],
+                                      ),
                               ),
                             ],
                           ),
@@ -923,6 +1347,16 @@ class _TimetableGridState extends State<TimetableGrid> {
         ? '本周可用 ${_durationLabel(timetable.freeMinutesInWeek(widget.weekStart))}'
             ' · 每周模板 ${_durationLabel(timetable.freeMinutesPerWeek)}'
         : null;
+    // “添加日程”只由宿主注入回调时出现；为 null 时状态条与旧版完全一致。
+    final addButton = widget.onAddSchedule == null
+        ? null
+        : TextButton.icon(
+            key: const Key('timetable-add-schedule'),
+            style: TsButtons.inline(fontSize: 11),
+            onPressed: widget.onAddSchedule,
+            icon: const Icon(Icons.event_available_outlined, size: 13),
+            label: const Text('添加日程'),
+          );
     // 状态条在滚动区之外：长提示省略、窄窗口换行，最后一个格不会被它遮挡。
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 5),
@@ -938,7 +1372,12 @@ class _TimetableGridState extends State<TimetableGrid> {
           overflow: TextOverflow.ellipsis,
           style: TextStyle(fontSize: 10.5, color: TsColors.textFaint),
         );
-        if (stats == null) return hintText;
+        if (stats == null) {
+          if (addButton == null) return hintText;
+          return Row(
+            children: [Expanded(child: hintText), addButton],
+          );
+        }
         final statsText = Text(
           stats,
           style: TextStyle(fontSize: 10.5, color: TsColors.textFaint),
@@ -946,12 +1385,19 @@ class _TimetableGridState extends State<TimetableGrid> {
         if (narrow) {
           return Column(
             crossAxisAlignment: CrossAxisAlignment.start,
-            children: [hintText, const SizedBox(height: 2), statsText],
+            children: [
+              hintText,
+              if (addButton != null)
+                Align(alignment: Alignment.centerLeft, child: addButton),
+              const SizedBox(height: 2),
+              statsText,
+            ],
           );
         }
         return Row(
           children: [
             Expanded(child: hintText),
+            if (addButton != null) ...[addButton, const SizedBox(width: 8)],
             const SizedBox(width: 8),
             statsText,
           ],
@@ -977,50 +1423,65 @@ class _TimetableGridState extends State<TimetableGrid> {
               ),
             ),
           ),
-          for (final d in days)
-            Expanded(
-              child: Container(
-                alignment: Alignment.center,
-                decoration: BoxDecoration(
-                  color: TsColors.surfaceAlt,
-                  border: Border(
-                    left: BorderSide(
-                        color: TsColors.border.withValues(alpha: 0.7)),
-                    bottom: BorderSide(color: TsColors.border),
-                  ),
-                ),
-                child: Column(
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  children: [
-                    Text(
-                      _weekdayName(d.weekday),
-                      // 窄到单列只有几十像素时星期/日期宁可省略也不能换行撑高
-                      // 表头（否则表头 Column 会纵向溢出）。
-                      maxLines: 1,
-                      softWrap: false,
-                      overflow: TextOverflow.ellipsis,
-                      style: TextStyle(
-                        fontSize: 10.5,
-                        color: TsColors.textSecondary,
-                      ),
-                    ),
-                    Text(
-                      '${_int(d.date.substring(5, 7))}/${_int(d.date.substring(8))}',
-                      maxLines: 1,
-                      softWrap: false,
-                      overflow: TextOverflow.ellipsis,
-                      style: TextStyle(
-                        fontSize: 11.5,
-                        fontWeight: FontWeight.w600,
-                        color: TsColors.textPrimary,
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-            ),
+          for (final d in days) Expanded(child: _dayHeaderCell(d)),
           // 与右侧滚动条沟槽同宽，保证表头 7 列和网格 7 列严格对齐。
           const SizedBox(width: TimetableGrid.scrollbarGutter),
+        ],
+      ),
+    );
+  }
+
+  /// 日期表头单元；有全天日程时在日期下方加浅色全天条（只回调，不绘制）。
+  Widget _dayHeaderCell(TimetableDay day) {
+    final decoration = BoxDecoration(
+      color: TsColors.surfaceAlt,
+      border: Border(
+        left: BorderSide(color: TsColors.border.withValues(alpha: 0.7)),
+        bottom: BorderSide(color: TsColors.border),
+      ),
+    );
+    final labels = Column(
+      mainAxisAlignment: MainAxisAlignment.center,
+      children: [
+        Text(
+          _weekdayName(day.weekday),
+          // 窄到单列只有几十像素时星期/日期宁可省略也不能换行撑高
+          // 表头（否则表头 Column 会纵向溢出）。
+          maxLines: 1,
+          softWrap: false,
+          overflow: TextOverflow.ellipsis,
+          style: TextStyle(
+            fontSize: 10.5,
+            color: TsColors.textSecondary,
+          ),
+        ),
+        Text(
+          '${_int(day.date.substring(5, 7))}/${_int(day.date.substring(8))}',
+          maxLines: 1,
+          softWrap: false,
+          overflow: TextOverflow.ellipsis,
+          style: TextStyle(
+            fontSize: 11.5,
+            fontWeight: FontWeight.w600,
+            color: TsColors.textPrimary,
+          ),
+        ),
+      ],
+    );
+    final allDay = _allDayByDate[day.date];
+    if (allDay == null || allDay.isEmpty) {
+      return Container(
+        alignment: Alignment.center,
+        decoration: decoration,
+        child: labels,
+      );
+    }
+    return Container(
+      decoration: decoration,
+      child: Column(
+        children: [
+          Expanded(child: Center(child: labels)),
+          _allDayColumn(allDay, day.date),
         ],
       ),
     );

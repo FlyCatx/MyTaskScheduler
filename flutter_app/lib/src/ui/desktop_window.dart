@@ -9,9 +9,15 @@
 // 才推送，因此 Flutter 的裁剪/描边与真实窗口形状永远描述同一个状态：
 //   普通还原窗口 → 18 DIP 圆角；最大化 / 系统 Snap → 直角（半径 0）。
 //
+// 会话/电源事件：runner 通过**同一个** taskscheduler/window 通道上报锁屏/解锁与
+// 睡眠/恢复两类独立原因（powerStateChanged 事件与 powerState 查询）。[DesktopWindow]
+// 把两类原因聚合成"离开"（锁屏 || 睡眠），去重并串行转交 [onExecutionAwayChanged]；
+// 原生注册失败也随状态上报，界面可以明确提示。最小化、失焦、窗口外形变化都不是
+// 离开原因。
+//
 // 在测试或缺少原生实现的环境里，所有调用都安全降级（no-op），不会阻塞界面。
 //
-// 主要类型：WindowShape、DesktopWindow。
+// 主要类型：WindowShape、WindowPowerState、DesktopWindow。
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
@@ -118,6 +124,96 @@ class WindowShape {
       'snap=$snapped, min=$minimized, dpi=$dpi, ${width}x$height, seq=$sequence)';
 }
 
+/// 原生会话/电源状态：锁屏与睡眠是两类独立原因。
+///
+/// "离开"= 锁屏 || 睡眠。睡眠恢复时若仍处于锁屏，用户还没回来，不能提前恢复。
+/// [lockEventsRegistered]/[suspendEventsRegistered] 表达原生监听是否注册成功
+/// （失败时带 Windows 错误码）；"没收到事件"不能当成"用户一直在"。
+@immutable
+class WindowPowerState {
+  const WindowPowerState({
+    this.locked = false,
+    this.suspended = false,
+    this.lockEventsRegistered = true,
+    this.suspendEventsRegistered = true,
+    this.lockEventsError = 0,
+    this.suspendEventsError = 0,
+    this.sequence = 0,
+  });
+
+  final bool locked;
+  final bool suspended;
+
+  /// 是否成功注册了锁屏/解锁（WM_WTSSESSION_CHANGE）与睡眠/恢复（WM_POWERBROADCAST）
+  /// 监听。
+  final bool lockEventsRegistered;
+  final bool suspendEventsRegistered;
+
+  /// 注册失败时的 Windows 错误码（GetLastError），0 表示没有错误。
+  final int lockEventsError;
+  final int suspendEventsError;
+
+  /// 原生单调递增的状态序号：查询结果不得覆盖更晚的事件。
+  final int sequence;
+
+  /// 锁屏或睡眠任一项成立即为离开。
+  bool get away => locked || suspended;
+
+  bool get hasRegistrationFailure =>
+      !lockEventsRegistered || !suspendEventsRegistered;
+
+  static bool _bool(Object? value, bool fallback) =>
+      value is bool ? value : fallback;
+
+  static int _int(Object? value, int fallback) {
+    if (value is int) return value;
+    if (value is num) return value.toInt();
+    return fallback;
+  }
+
+  /// 从 `taskscheduler/window` 的原生 map 解析；缺字段时用 [fallback]。
+  static WindowPowerState fromMap(
+    Object? raw, {
+    WindowPowerState fallback = const WindowPowerState(),
+  }) {
+    if (raw is! Map) return fallback;
+    return WindowPowerState(
+      locked: _bool(raw['locked'], fallback.locked),
+      suspended: _bool(raw['suspended'], fallback.suspended),
+      lockEventsRegistered:
+          _bool(raw['lockEventsRegistered'], fallback.lockEventsRegistered),
+      suspendEventsRegistered: _bool(
+          raw['suspendEventsRegistered'], fallback.suspendEventsRegistered),
+      lockEventsError: _int(raw['lockEventsError'], fallback.lockEventsError),
+      suspendEventsError:
+          _int(raw['suspendEventsError'], fallback.suspendEventsError),
+      sequence: _int(raw['sequence'], fallback.sequence),
+    );
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      other is WindowPowerState &&
+      other.locked == locked &&
+      other.suspended == suspended &&
+      other.lockEventsRegistered == lockEventsRegistered &&
+      other.suspendEventsRegistered == suspendEventsRegistered &&
+      other.lockEventsError == lockEventsError &&
+      other.suspendEventsError == suspendEventsError &&
+      other.sequence == sequence;
+
+  @override
+  int get hashCode => Object.hash(locked, suspended, lockEventsRegistered,
+      suspendEventsRegistered, lockEventsError, suspendEventsError, sequence);
+
+  @override
+  String toString() => 'WindowPowerState(locked=$locked, suspended=$suspended, '
+      'lockRegistered=$lockEventsRegistered, '
+      'suspendRegistered=$suspendEventsRegistered, '
+      'lockError=$lockEventsError, suspendError=$suspendEventsError, '
+      'seq=$sequence)';
+}
+
 class DesktopWindow {
   /// 生产环境只有一个窗口端口（同一个 MethodChannel 只能有一个回调处理器）。
   /// 不传 [channel] 时返回进程内共享实例；测试传入假 channel 时得到独立实例。
@@ -144,24 +240,57 @@ class DesktopWindow {
     const WindowShape(),
   );
 
+  /// 原生会话/电源状态（锁屏、睡眠与监听注册结果）。
+  final ValueNotifier<WindowPowerState> power =
+      ValueNotifier<WindowPowerState>(const WindowPowerState());
+
   /// 原生侧收到关闭请求（标题栏关闭按钮 / 菜单退出 / Alt+F4）。
   VoidCallback? onCloseRequested;
 
+  Future<void> Function(bool away)? _onExecutionAwayChanged;
+
+  /// 聚合后的离开状态变化：原生只报告锁屏/睡眠两类独立原因，这里去重并按到达
+  /// 顺序串行回调。赋值时会把当前聚合状态补给新监听者（启动即锁屏也不会漏掉）。
+  Future<void> Function(bool away)? get onExecutionAwayChanged =>
+      _onExecutionAwayChanged;
+  set onExecutionAwayChanged(Future<void> Function(bool away)? callback) {
+    _onExecutionAwayChanged = callback;
+    _publishExecutionAway();
+  }
+
   bool _attached = false;
   bool _available = true;
+  bool _disposed = false;
 
   /// 已应用的最新状态序号：初始化查询的迟到结果不得覆盖更新的事件。
   int _sequence = 0;
 
-  /// 注册原生事件并读取初始状态（形状 + 最大化）。
+  /// 电源状态序号（与 [WindowShape.sequence] 独立）。
+  int _powerSequence = 0;
+
+  /// 最近一次投递出去的聚合离开状态；重复事件不重复回调。
+  bool _awayDelivered = false;
+
+  /// 离开/恢复回调串行队列：前一个事件处理完才轮到下一个。
+  Future<void> _awayQueue = Future<void>.value();
+
+  /// 当前聚合离开状态（锁屏 || 睡眠）。
+  bool get executionAway => power.value.away;
+
+  /// 注册原生事件并读取初始状态（形状 + 最大化 + 会话/电源）。
   Future<void> attach() async {
     if (_attached) return;
     _attached = true;
+    _disposed = false;
+    // 每次重新绑定都以本次查询为准：解绑期间残留的序号不能把新状态挡掉。
+    _powerSequence = -1;
     _channel.setMethodCallHandler(_handleCall);
     final initial = await _invoke<dynamic>('windowShape');
     if (initial != null) _applyShape(initial, fromQuery: true);
     final initialMax = await _invoke<bool>('isMaximized');
     if (initialMax != null) maximized.value = initialMax;
+    final initialPower = await _invoke<dynamic>('powerState');
+    if (initialPower != null) _applyPower(initialPower);
   }
 
   void _applyShape(Object? raw, {bool fromQuery = false}) {
@@ -174,12 +303,39 @@ class DesktopWindow {
     if (maximized.value != parsed.maximized) maximized.value = parsed.maximized;
   }
 
+  void _applyPower(Object? raw) {
+    final parsed = WindowPowerState.fromMap(raw, fallback: power.value);
+    // 查询结果与事件共用一个序号：迟到的查询结果不得覆盖更晚的事件。
+    if (parsed.sequence < _powerSequence) return;
+    _powerSequence = parsed.sequence;
+    if (power.value != parsed) power.value = parsed;
+    _publishExecutionAway();
+  }
+
+  /// 把聚合后的"离开"状态串行投递给监听者；状态没变就不重复回调。
+  void _publishExecutionAway() {
+    final callback = _onExecutionAwayChanged;
+    if (callback == null || _disposed) return;
+    final away = power.value.away;
+    if (away == _awayDelivered) return;
+    _awayDelivered = away;
+    _awayQueue = _awayQueue.then((_) async {
+      if (_disposed) return;
+      await callback(away);
+    }).catchError((Object error, StackTrace stack) {
+      // 一次回调失败（例如控制器已释放）不能卡住后续的离开/恢复事件。
+      debugPrint('execution away callback failed: $error');
+    });
+  }
+
   Future<dynamic> _handleCall(MethodCall call) async {
     switch (call.method) {
       case 'windowShapeChanged':
         _applyShape(call.arguments);
       case 'maximizedChanged':
         maximized.value = call.arguments == true;
+      case 'powerStateChanged':
+        _applyPower(call.arguments);
       case 'closeRequested':
         onCloseRequested?.call();
     }
@@ -210,18 +366,6 @@ class DesktopWindow {
         'bottom': rect.bottom.round(),
       });
 
-  /// 诊断用：临时关闭/恢复原生窗口区域（验收探针证明 GPU 表面没有逐像素 alpha）。
-  Future<void> setRegionEnabledForDiagnostics(bool enabled) =>
-      _invoke<void>('setRegionEnabled', {'enabled': enabled});
-
-  /// 重新查询当前窗口状态（探针/诊断使用）。
-  Future<WindowShape?> queryShape() async {
-    final raw = await _invoke<dynamic>('windowShape');
-    if (raw == null) return null;
-    _applyShape(raw, fromQuery: true);
-    return shape.value;
-  }
-
   Future<T?> _invoke<T>(String method, [dynamic arguments]) async {
     if (!_available) return null;
     try {
@@ -236,6 +380,10 @@ class DesktopWindow {
   }
 
   void dispose() {
+    // 解绑后不再向已销毁的界面投递；重新 attach 的端口从当前查询结果重新同步。
+    _disposed = true;
+    _onExecutionAwayChanged = null;
+    _awayDelivered = false;
     if (_attached) {
       _channel.setMethodCallHandler(null);
       _attached = false;
@@ -243,5 +391,6 @@ class DesktopWindow {
     if (isShared) return; // 共享端口由进程复用，不销毁 notifier。
     maximized.dispose();
     shape.dispose();
+    power.dispose();
   }
 }

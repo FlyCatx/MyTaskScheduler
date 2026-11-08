@@ -18,6 +18,7 @@ import '../model/settings.dart';
 import '../model/timetable.dart';
 import '../state/calendar_constraints.dart';
 import '../state/external_calendar_service.dart';
+import '../state/schedule/schedule_expander.dart' show ScheduleOccurrence;
 import '../state/time_ranges.dart';
 import './calendar_grid.dart';
 import './external_calendar_dialog.dart';
@@ -110,6 +111,15 @@ Future<CalendarSettingsResult?> showCalendarSettingsDialog(
   /// 外部日历导入成功后的通知（应用层据此刷新只读占用/冲突视图）。
   /// 编辑器自身已经监听 service 的 ChangeNotifier；这个回调是给宿主窗口的可选接线。
   VoidCallback? onExternalCalendarChanged,
+
+  /// 全局日程叠层（可选）：只读展示，不写入手工时间表；默认空 = 旧行为。
+  List<ScheduleOccurrence> scheduleOccurrences =
+      const <ScheduleOccurrence>[],
+  ValueChanged<ScheduleOccurrence>? onScheduleTap,
+  VoidCallback? onAddSchedule,
+
+  /// 叠层投影时区；null 时使用本对话框 settings.timezoneId（时间表时区）。
+  String? scheduleTimezoneId,
   Future<bool> Function(CalendarSettingsResult result)? onApply,
 }) {
   return showDialog<CalendarSettingsResult>(
@@ -129,6 +139,10 @@ Future<CalendarSettingsResult?> showCalendarSettingsDialog(
       externalSourceIds: externalSourceIds,
       externalCalendarPickFiles: externalCalendarPickFiles,
       onExternalCalendarChanged: onExternalCalendarChanged,
+      scheduleOccurrences: scheduleOccurrences,
+      onScheduleTap: onScheduleTap,
+      onAddSchedule: onAddSchedule,
+      scheduleTimezoneId: scheduleTimezoneId,
       onApply: onApply,
     ),
   );
@@ -228,6 +242,14 @@ class _CalendarSettingsDialog extends StatefulWidget {
   /// 外部日历导入成功后的可选通知（宿主窗口刷新只读占用/冲突视图）。
   final VoidCallback? onExternalCalendarChanged;
 
+  /// 全局日程叠层（只读）；默认空列表 = 不显示叠层。
+  final List<ScheduleOccurrence> scheduleOccurrences;
+  final ValueChanged<ScheduleOccurrence>? onScheduleTap;
+  final VoidCallback? onAddSchedule;
+
+  /// 叠层投影时区；null 时用本对话框的 settings.timezoneId。
+  final String? scheduleTimezoneId;
+
   final Future<bool> Function(CalendarSettingsResult result)? onApply;
 
   const _CalendarSettingsDialog({
@@ -245,6 +267,10 @@ class _CalendarSettingsDialog extends StatefulWidget {
     this.externalSourceIds = const <String>{},
     this.externalCalendarPickFiles,
     this.onExternalCalendarChanged,
+    this.scheduleOccurrences = const <ScheduleOccurrence>[],
+    this.onScheduleTap,
+    this.onAddSchedule,
+    this.scheduleTimezoneId,
     this.onApply,
   });
 
@@ -2370,6 +2396,12 @@ class _CalendarSettingsDialogState extends State<_CalendarSettingsDialog> {
               verticalController: _gridScroll,
               externalBusy: externalBusy,
               externalSourceNames: externalNames,
+              // 日程叠层只读展示：不进入 _draft，点击只回调宿主，不写手工时间表。
+              scheduleOccurrences: widget.scheduleOccurrences,
+              onScheduleTap: widget.onScheduleTap,
+              onAddSchedule: widget.onAddSchedule,
+              scheduleTimezoneId:
+                  widget.scheduleTimezoneId ?? widget.settings.timezoneId,
               canEditDate: (date) =>
                   date.compareTo(timetable.dateFrom) >= 0 &&
                   date.compareTo(timetable.dateTo) <= 0,

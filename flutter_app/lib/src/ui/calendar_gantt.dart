@@ -18,6 +18,7 @@ import '../model/settings.dart';
 import '../model/timetable.dart';
 import '../state/calendar_planner.dart';
 import '../state/conflict_suggestions.dart';
+import '../state/schedule/schedule_expander.dart' show ScheduleOccurrence;
 import '../state/task_interaction.dart';
 import './widgets/bezier_ui.dart';
 import './widgets/bezier_menu.dart';
@@ -49,6 +50,14 @@ class CalendarActions {
   final Future<bool> Function(CalendarSettings settings, Timetable timetable,
       {required bool reschedule})? applyTimetable;
 
+  /// 全局日程叠层（只读）：为空时甘特图与 0.3.x 完全一致。
+  ///
+  /// 放在 actions 上而不是只做成 widget 参数，是为了让 AppShell（唯一构造本对象
+  /// 的生产层）不必改动 GanttPanel/本文件的调用链就能把日程传到日历视图。
+  final List<ScheduleOccurrence> scheduleOccurrences;
+  final ValueChanged<ScheduleOccurrence>? onScheduleTap;
+  final VoidCallback? onAddSchedule;
+
   const CalendarActions({
     required this.commit,
     required this.autoSchedule,
@@ -62,6 +71,9 @@ class CalendarActions {
     this.defaultUnavailableRanges = const <UnavailableRange>[],
     this.taskNames = const <String, String>{},
     this.applyTimetable,
+    this.scheduleOccurrences = const <ScheduleOccurrence>[],
+    this.onScheduleTap,
+    this.onAddSchedule,
   });
 
   static CalendarActions readOnly() => CalendarActions(
@@ -76,6 +88,28 @@ class CalendarActions {
 enum CalendarScale { day, week }
 
 enum _DragMode { move, resizeStart, resizeEnd }
+
+/// 甘特图上的一个日程显示条：跨日日程按设置墙钟的自然日拆开，重叠时错行。
+class _ScheduleBar {
+  _ScheduleBar({
+    required this.occurrence,
+    required this.dateKey,
+    required this.start,
+    required this.end,
+  });
+
+  final ScheduleOccurrence occurrence;
+  final String dateKey;
+
+  /// 本段的 UTC 起止（已裁剪到排程范围）。
+  final DateTime start;
+  final DateTime end;
+
+  int lane = 0;
+  int laneCount = 1;
+
+  String get displayKey => '${occurrence.occurrenceKey}@$dateKey';
+}
 
 class _DragSession {
   final String segmentId;
@@ -122,6 +156,16 @@ class CalendarGanttView extends StatefulWidget {
   /// 与 日/周/今天/可用时间/自动安排/重排全部 同处一行（宽度不足才整组换行）。
   final ValueChanged<String>? onModeSelected;
 
+  /// 全局日程叠层（只读）。为空且 [actions] 上也没传时，视图保持旧行为。
+  ///
+  /// 日程**不进入** [CalendarSchedule]：这里只把实例画在任务行上方的独立
+  /// “日程”带里；点击只回调 [onScheduleTap]，不移动/取消任务片段，也不提交计划。
+  final List<ScheduleOccurrence> scheduleOccurrences;
+  final ValueChanged<ScheduleOccurrence>? onScheduleTap;
+
+  /// “添加日程”入口；为 null 时工具带不出现该按钮。
+  final VoidCallback? onAddSchedule;
+
   const CalendarGanttView({
     super.key,
     required this.snapshot,
@@ -132,6 +176,9 @@ class CalendarGanttView extends StatefulWidget {
     this.clock,
     this.proposalSource,
     this.onModeSelected,
+    this.scheduleOccurrences = const <ScheduleOccurrence>[],
+    this.onScheduleTap,
+    this.onAddSchedule,
   });
 
   @override
@@ -305,6 +352,276 @@ class _CalendarGanttViewState extends State<CalendarGanttView> {
         ? ((wallMs + unit - 1) ~/ unit) * unit
         : (wallMs ~/ unit) * unit;
     return DateTime.fromMillisecondsSinceEpoch(snapped - offsetMs, isUtc: true);
+  }
+
+  // ------------------------------------------------------------ 日程叠层
+  //
+  // 日程不进入 CalendarSchedule：这里只把实例换算成时间轴上的只读显示条。
+  // 全天实例按 [startDate, endDateExclusive) 拆到自然日；定时实例按设置墙钟的
+  // 自然日拆段（跨日 → 每天一条），都裁剪到排程范围。点击只回调，不拖动不改计划。
+
+  List<ScheduleOccurrence> get _scheduleOccurrences =>
+      widget.scheduleOccurrences.isNotEmpty
+          ? widget.scheduleOccurrences
+          : widget.actions.scheduleOccurrences;
+
+  ValueChanged<ScheduleOccurrence>? get _scheduleTap =>
+      widget.onScheduleTap ?? widget.actions.onScheduleTap;
+
+  VoidCallback? get _scheduleAdd =>
+      widget.onAddSchedule ?? widget.actions.onAddSchedule;
+
+  List<_ScheduleBar> _scheduleBars() {
+    final occurrences = _scheduleOccurrences;
+    if (occurrences.isEmpty) return const <_ScheduleBar>[];
+    final rangeStart = _rangeStart;
+    final rangeEnd = _settings.endInstant;
+    if (!rangeEnd.isAfter(rangeStart)) return const <_ScheduleBar>[];
+    final clock = _settings.clock;
+    final bars = <_ScheduleBar>[];
+
+    void addVisible(
+      ScheduleOccurrence occurrence,
+      String dateKey,
+      DateTime start,
+      DateTime end,
+    ) {
+      final visibleStart = start.isBefore(rangeStart) ? rangeStart : start;
+      final visibleEnd = end.isAfter(rangeEnd) ? rangeEnd : end;
+      if (!visibleEnd.isAfter(visibleStart)) return;
+      bars.add(_ScheduleBar(
+        occurrence: occurrence,
+        dateKey: dateKey,
+        start: visibleStart,
+        end: visibleEnd,
+      ));
+    }
+
+    for (final occurrence in occurrences) {
+      if (occurrence.allDay) {
+        final startDate = occurrence.startDate;
+        final endExclusive = occurrence.endDateExclusive;
+        if (startDate == null || endExclusive == null) continue;
+        if (endExclusive.compareTo(startDate) <= 0) continue;
+        var date = startDate;
+        var guard = 0;
+        while (date.compareTo(endExclusive) < 0 && guard++ < 400) {
+          final dayStart = clock.dayStartUtcForDateKey(date);
+          addVisible(
+            occurrence,
+            date,
+            dayStart,
+            dayStart.add(const Duration(days: 1)),
+          );
+          final next = addDaysToDateKey(date, 1);
+          if (next == date) break;
+          date = next;
+        }
+        continue;
+      }
+      final startUtc = occurrence.startUtc;
+      final endUtc = occurrence.endUtc;
+      if (startUtc == null || endUtc == null || !endUtc.isAfter(startUtc)) {
+        continue;
+      }
+      var date = clock.dateKey(startUtc);
+      // 结束是排他边界：恰好 24:00 结束时最后一段落在前一天。
+      final lastDate =
+          clock.dateKey(endUtc.subtract(const Duration(seconds: 1)));
+      var guard = 0;
+      while (date.compareTo(lastDate) <= 0 && guard++ < 400) {
+        final dayStart = clock.dayStartUtcForDateKey(date);
+        final segmentStart = startUtc.isAfter(dayStart) ? startUtc : dayStart;
+        final segmentEnd = endUtc.isBefore(dayStart.add(const Duration(days: 1)))
+            ? endUtc
+            : dayStart.add(const Duration(days: 1));
+        addVisible(occurrence, date, segmentStart, segmentEnd);
+        final next = addDaysToDateKey(date, 1);
+        if (next == date) break;
+        date = next;
+      }
+    }
+    _assignScheduleBarLanes(bars);
+    return bars;
+  }
+
+  /// 贪心分行 + 重叠簇列数：同一时段的日程各占一行，分别可点。
+  void _assignScheduleBarLanes(List<_ScheduleBar> bars) {
+    bars.sort((a, b) {
+      final byStart = a.start.compareTo(b.start);
+      if (byStart != 0) return byStart;
+      final byEnd = b.end.compareTo(a.end);
+      if (byEnd != 0) return byEnd;
+      return a.displayKey.compareTo(b.displayKey);
+    });
+    final laneEnds = <DateTime>[];
+    final lanes = <int>[];
+    for (final bar in bars) {
+      var lane = laneEnds.indexWhere((end) => !end.isAfter(bar.start));
+      if (lane < 0) {
+        lane = laneEnds.length;
+        laneEnds.add(bar.end);
+      } else {
+        laneEnds[lane] = bar.end;
+      }
+      lanes.add(lane);
+    }
+    var i = 0;
+    while (i < bars.length) {
+      var clusterEnd = bars[i].end;
+      final members = <int>[i];
+      var j = i + 1;
+      while (j < bars.length && bars[j].start.isBefore(clusterEnd)) {
+        members.add(j);
+        if (bars[j].end.isAfter(clusterEnd)) clusterEnd = bars[j].end;
+        j++;
+      }
+      var count = 1;
+      for (final member in members) {
+        if (lanes[member] + 1 > count) count = lanes[member] + 1;
+      }
+      for (final member in members) {
+        bars[member].lane = lanes[member];
+        bars[member].laneCount = count;
+      }
+      i = j;
+    }
+  }
+
+  double _scheduleTrackHeight(List<_ScheduleBar> bars) {
+    var lanes = 1;
+    for (final bar in bars) {
+      if (bar.lane + 1 > lanes) lanes = bar.lane + 1;
+    }
+    final factor = MediaQuery.textScalerOf(context).scale(1.0).clamp(1.0, 2.0);
+    return math.max(40.0 * factor, 8 + lanes * (laneHeight + laneGap));
+  }
+
+  String _scheduleBarLabel(_ScheduleBar bar) {
+    final occurrence = bar.occurrence;
+    final marker = occurrence.blocksScheduling ? '' : ' · 不占用';
+    if (occurrence.allDay) return '${occurrence.title} · 全天$marker';
+    final startWall = _wall.toWall(bar.start);
+    final endWall = _wall.toWall(bar.end);
+    return '${occurrence.title} '
+        '${_two(startWall.hour)}:${_two(startWall.minute)}-'
+        '${_two(endWall.hour)}:${_two(endWall.minute)}$marker';
+  }
+
+  String _scheduleBarTooltip(_ScheduleBar bar) {
+    final occurrence = bar.occurrence;
+    final busy = occurrence.blocksScheduling ? '占用排程时间' : '不占用排程时间';
+    return '${bar.dateKey} · 日程：${occurrence.title} · $busy'
+        ' · 只读叠层（不改动任务安排）';
+  }
+
+  Widget _scheduleTrackLabel(List<_ScheduleBar> bars) {
+    return SizedBox(
+      height: _scheduleTrackHeight(bars),
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(6, 4, 6, 2),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            const Text(
+              '日程 · 全局叠层',
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(
+                fontSize: 12,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+            Text(
+              '${bars.length} 条显示段 · 不占用时已标注',
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(fontSize: 10, color: TsColors.textFaint),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _scheduleTrack(List<_ScheduleBar> bars) {
+    return SizedBox(
+      height: _scheduleTrackHeight(bars),
+      child: Stack(
+        clipBehavior: Clip.none,
+        children: [
+          Positioned.fill(
+            child: DecoratedBox(
+              decoration: BoxDecoration(
+                color: TsColors.surfaceAlt.withValues(alpha: 0.55),
+                border: Border(bottom: BorderSide(color: TsColors.border)),
+              ),
+            ),
+          ),
+          for (final bar in bars) _scheduleBarWidget(bar),
+        ],
+      ),
+    );
+  }
+
+  Widget _scheduleBarWidget(_ScheduleBar bar) {
+    final left = _xFor(bar.start);
+    final width = math.max(6.0, _xFor(bar.end) - left);
+    final top = 4 + bar.lane * (laneHeight + laneGap);
+    return Positioned(
+      key: Key('gantt-schedule-${bar.displayKey}'),
+      left: left,
+      top: top,
+      width: width,
+      height: laneHeight,
+      child: Tooltip(
+        message: _scheduleBarTooltip(bar),
+        child: MouseRegion(
+          cursor: SystemMouseCursors.click,
+          child: GestureDetector(
+            behavior: HitTestBehavior.opaque,
+            onTap: _scheduleTap == null
+                ? null
+                : () => _scheduleTap!(bar.occurrence),
+            child: Container(
+              decoration: bezierDecoration(
+                color: TsColors.pendingSoft,
+                radius: 5,
+                border: Border.all(
+                  color: TsColors.pending.withValues(alpha: 0.8),
+                ),
+              ),
+              clipBehavior: Clip.antiAlias,
+              padding: const EdgeInsets.symmetric(horizontal: 4),
+              alignment: Alignment.centerLeft,
+              child: Row(
+                children: [
+                  if (width > 40)
+                    Padding(
+                      padding: const EdgeInsets.only(right: 3),
+                      child: Icon(
+                        Icons.event_note_outlined,
+                        size: 10,
+                        color: TsColors.pending,
+                      ),
+                    ),
+                  Expanded(
+                    child: Text(
+                      _scheduleBarLabel(bar),
+                      maxLines: 1,
+                      softWrap: false,
+                      overflow: TextOverflow.clip,
+                      style: TextStyle(fontSize: 9.5, color: TsColors.pending),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
   }
 
   void _onHorizontal() {
@@ -498,10 +815,13 @@ class _CalendarGanttViewState extends State<CalendarGanttView> {
   @override
   Widget build(BuildContext context) {
     final snapshot = widget.snapshot;
-    if (snapshot.tasks.isEmpty) {
+    final occurrences = _scheduleOccurrences;
+    // 没有任务也没有日程时保持旧的空态；只有日程时仍显示日程叠层（不伪造任务）。
+    if (snapshot.tasks.isEmpty && occurrences.isEmpty) {
       return const Center(child: Text('还没有任务'));
     }
     final rows = _buildRows();
+    final scheduleBars = _scheduleBars();
     final conflicts = _conflicts(rows);
     final conflictCount = conflicts.length;
 
@@ -536,7 +856,7 @@ class _CalendarGanttViewState extends State<CalendarGanttView> {
                     children: [
                       _axisHeader(),
                       const Divider(height: 1, thickness: 1),
-                      Expanded(child: _body(rows, conflicts)),
+                      Expanded(child: _body(rows, conflicts, scheduleBars)),
                     ],
                   ),
                 ),
@@ -600,6 +920,7 @@ class _CalendarGanttViewState extends State<CalendarGanttView> {
   Widget _toolbar(List<CalendarConflict> conflicts) {
     final canEdit = widget.actions.canEdit;
     final onModeSelected = widget.onModeSelected;
+    final addSchedule = _scheduleAdd;
     // One compact height for the whole group (segments + every tool button), so the row
     // is a single line of equally tall controls instead of mixed 26/28 px boxes.
     const toolbarHeight = 30.0;
@@ -641,6 +962,14 @@ class _CalendarGanttViewState extends State<CalendarGanttView> {
             height: toolbarHeight,
             onTap: () => _scrollToFocus(),
           ),
+          if (addSchedule != null)
+            _ToolButton(
+              key: const Key('gantt-add-schedule'),
+              label: '添加日程',
+              icon: Icons.event_available_outlined,
+              height: toolbarHeight,
+              onTap: addSchedule,
+            ),
           _ToolButton(
             label: '可用时间',
             icon: Icons.schedule_outlined,
@@ -792,7 +1121,11 @@ class _CalendarGanttViewState extends State<CalendarGanttView> {
     );
   }
 
-  Widget _body(List<_CalendarRow> rows, List<CalendarConflict> conflicts) {
+  Widget _body(
+    List<_CalendarRow> rows,
+    List<CalendarConflict> conflicts,
+    List<_ScheduleBar> scheduleBars,
+  ) {
     return Scrollbar(
       controller: _vertical,
       child: SingleChildScrollView(
@@ -803,7 +1136,11 @@ class _CalendarGanttViewState extends State<CalendarGanttView> {
             SizedBox(
               width: labelWidth,
               child: Column(
-                children: [for (final row in rows) _labelCell(row)],
+                children: [
+                  if (scheduleBars.isNotEmpty)
+                    _scheduleTrackLabel(scheduleBars),
+                  for (final row in rows) _labelCell(row),
+                ],
               ),
             ),
             Expanded(
@@ -848,6 +1185,8 @@ class _CalendarGanttViewState extends State<CalendarGanttView> {
                         width: _timelineWidth,
                         child: Column(
                           children: [
+                            if (scheduleBars.isNotEmpty)
+                              _scheduleTrack(scheduleBars),
                             for (final row in rows)
                               _timelineCell(row, conflicts),
                           ],
@@ -1389,6 +1728,10 @@ class _CalendarGanttViewState extends State<CalendarGanttView> {
       defaultUnavailableRanges: widget.actions.defaultUnavailableRanges,
       taskNames: widget.actions.taskNames,
       taskEstimatedHours: taskEstimatedHours,
+      // 时间表编辑器里的网格也显示同一份日程叠层（只读，不写入手工时间表）。
+      scheduleOccurrences: _scheduleOccurrences,
+      onScheduleTap: _scheduleTap,
+      onAddSchedule: _scheduleAdd,
       onApply: applyTimetable == null
           ? null
           : (r) => applyTimetable(
@@ -2061,6 +2404,7 @@ class _ToolButton extends StatelessWidget {
   final double height;
 
   const _ToolButton({
+    super.key,
     required this.label,
     required this.icon,
     this.onTap,

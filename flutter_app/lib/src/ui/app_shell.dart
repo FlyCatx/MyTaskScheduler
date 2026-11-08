@@ -16,13 +16,18 @@ import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
+import '../model/calendar.dart';
 import '../model/display.dart';
 import '../model/session.dart';
 import '../model/shortcuts.dart';
 import '../state/app_controller.dart';
 import '../state/execution/effort_review_service.dart';
 import '../state/execution/effort_stats.dart';
+import '../state/schedule/schedule_controller.dart';
+import '../state/schedule/schedule_expander.dart';
+import '../state/schedule/schedule_reminders.dart';
 import '../state/settings_controller.dart';
+import 'schedule/schedule_list_dialog.dart';
 import 'analysis/chunked_analysis_dialog.dart';
 import 'calendar_gantt.dart';
 import 'calendar_settings_dialog.dart';
@@ -103,11 +108,25 @@ class AppShell extends StatefulWidget {
   /// bar; the shell does not own the controller's copy so it cannot be dismissed.
   final String? bootNotice;
 
+  /// 窗口端口。生产环境为空，使用进程内共享实例（bootstrap 已在 runApp 前
+  /// attach）；测试可注入带假 channel 的独立端口，避免共享实例的残留状态。
+  final DesktopWindow? window;
+
+  /// 全局日程服务（由组合根注入）。为空时入口保留但明确提示“未初始化”，
+  /// 旧测试/旧调用不必关心日程；日程数据全局共享，与当前会话无关。
+  final ScheduleController? scheduleController;
+
+  /// 应用运行期日程提醒（由 bootstrap 创建并启动；空 = 未启用）。
+  final ScheduleReminderService? reminders;
+
   const AppShell({
     super.key,
     required this.controller,
     required this.settings,
     this.bootNotice,
+    this.window,
+    this.scheduleController,
+    this.reminders,
   });
 
   @override
@@ -151,8 +170,11 @@ class _AppShellState extends State<AppShell> {
   Timer? _notificationPoll;
   String? _notifiedConversationId;
 
+  /// 最近一次分析完成系统通知的时间；用于点击时分清“分析”与“日程提醒”。
+  DateTime? _analysisNotificationAt;
+
   /// 自绘标题栏使用的窗口端口；原生不可用时所有调用安全降级。
-  final DesktopWindow _window = DesktopWindow();
+  late final DesktopWindow _window;
 
   /// 关闭流程去重：保存进行中再次点击关闭不会启动第二份流程。
   bool _closing = false;
@@ -177,6 +199,7 @@ class _AppShellState extends State<AppShell> {
   @override
   void initState() {
     super.initState();
+    _window = widget.window ?? DesktopWindow();
     c.addListener(_onControllerChanged);
     s.addListener(_onSettingsChanged);
     // Hover / pin state lives in TaskInteraction, which is NOT part of
@@ -205,6 +228,17 @@ class _AppShellState extends State<AppShell> {
       if (gw == null) return;
       try {
         if (!gw.takeNotificationClick()) return;
+        // 原生只有“点击过”一个布尔标志，无法区分是哪条通知；按最近一次
+        // “被系统接受”的通知类型回落：歧义时打开全局日程列表（任务书要求）。
+        final reminders = widget.reminders;
+        final scheduleAt = reminders?.lastAcceptedAt;
+        final analysisAt = _analysisNotificationAt;
+        final scheduleIsLatest = scheduleAt != null &&
+            (analysisAt == null || scheduleAt.isAfter(analysisAt));
+        if (scheduleIsLatest) {
+          unawaited(_openScheduleList());
+          return;
+        }
         final id = _notifiedConversationId;
         if (id != null && c.summaries.any((s) => s.id == id)) {
           c.openConversation(id);
@@ -213,6 +247,8 @@ class _AppShellState extends State<AppShell> {
         // Older DLL / notification unavailable: stay silent instead of crashing.
       }
     });
+    // 锁屏/睡眠由原生上报独立原因，窗口端口聚合去重后串行转交控制器。
+    _window.onExecutionAwayChanged = _handleExecutionAway;
     // 原生关闭（标题栏 X、菜单退出、Alt+F4、任务栏关闭）统一走保存流程。
     _window.onCloseRequested = _handleWindowClose;
     // 本地 OCR 的文件选择器：直接使用原生对话框；不可用时对话框会明确说明。
@@ -222,7 +258,12 @@ class _AppShellState extends State<AppShell> {
       return gw.pickTextFiles(title: '选择扫描 PDF 或图片（本地 OCR）');
     };
     _window.attach().then((_) {
-      if (mounted) _window.setCloseGuard(true);
+      if (!mounted) return;
+      _window.setCloseGuard(true);
+      // 首帧后通知宿主会清掉上一实例的残留通知，报告排在其后才能保留。
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) _reportPowerMonitoringIssue();
+      });
     });
   }
 
@@ -248,12 +289,44 @@ class _AppShellState extends State<AppShell> {
         if (choice == _CloseChoice.discard) break;
         // retry: loop and flush again.
       }
+      // 先停提醒（停止新派发并等待在途保存），再落盘计时/草稿。
+      await widget.reminders?.stop();
       // 计时检查点必须在窗口销毁前落盘（活动计时保存后暂停，不把退出期间算成工作）。
       await c.shutdown();
       await _window.confirmClose();
     } finally {
       _closing = false;
     }
+  }
+
+  /// 锁屏/睡眠聚合后的离开/恢复：由窗口端口串行投递，这里只转交控制器。
+  ///
+  /// 控制器在离开时暂停计时并留下待校正区间；恢复时只提示校正，不自动续跑。
+  /// 事件可能晚于窗口关闭到达，卸载后不再调用控制器。
+  Future<void> _handleExecutionAway(bool away) async {
+    if (!mounted) return;
+    if (away) {
+      await c.onAppSuspended();
+    } else {
+      await c.onAppResumed();
+    }
+  }
+
+  /// 原生注册锁屏/睡眠监听失败时给用户可见说明；成功时静默。
+  void _reportPowerMonitoringIssue() {
+    final state = _window.power.value;
+    if (!state.hasRegistrationFailure) return;
+    _showNotice(
+      kind: AppNoticeKind.warning,
+      message: '无法接收系统锁屏或睡眠事件，离开期间计时可能不会自动暂停',
+      details: <String>[
+        if (!state.lockEventsRegistered)
+          '锁屏/解锁事件注册失败（Windows 错误码 ${state.lockEventsError}）',
+        if (!state.suspendEventsRegistered)
+          '睡眠/恢复事件注册失败（Windows 错误码 ${state.suspendEventsError}）',
+      ],
+      dedupeKey: 'window-power-monitoring',
+    );
   }
 
   Future<_CloseChoice?> _askCloseAfterFailure() {
@@ -301,6 +374,7 @@ class _AppShellState extends State<AppShell> {
     _lastAttachmentFeedback = null;
     _draft.dispose();
     _notificationPoll?.cancel();
+    _window.onExecutionAwayChanged = null;
     _window.onCloseRequested = null;
     _window.dispose();
     _rootFocus.dispose();
@@ -585,6 +659,7 @@ class _AppShellState extends State<AppShell> {
         final sent = gw?.showSystemNotification(title, body) ?? false;
         if (sent) {
           _notifiedConversationId = conversationId;
+          _analysisNotificationAt = DateTime.now();
         } else {
           systemNoticeFailed = true;
         }
@@ -889,16 +964,28 @@ class _AppShellState extends State<AppShell> {
                       children: [
                         if (residentSidebar)
                           SidebarBottomBand(
-                            child: UserMenuButton(
-                              onOpenSettings: _openSettings,
+                            child: Column(
+                              mainAxisSize: MainAxisSize.min,
+                              crossAxisAlignment:
+                                  CrossAxisAlignment.stretch,
+                              children: [
+                                _ScheduleEntryButton(
+                                  onOpen: _openScheduleList,
+                                ),
+                                UserMenuButton(
+                                  onOpenSettings: _openSettings,
+                                ),
+                              ],
                             ),
                           )
                         else
                           // 折叠形态的底部带：账户入口有真实语义（打开设置/账户页），
-                          // 保留；它不是一个重复的侧栏展开开关。
+                          // 保留；它不是一个重复的侧栏展开开关。日程入口同样保留，
+                          // 因为它是全局功能而不是会话级动作。
                           _CollapsedSidebarFooterBand(
                             key: const Key('sidebar-collapsed-footer'),
                             onOpenSettings: _openSettings,
+                            onOpenSchedule: _openScheduleList,
                           ),
                         Expanded(
                           child: ComposerBand(
@@ -1130,6 +1217,10 @@ class _AppShellState extends State<AppShell> {
                                                         reschedule: reschedule),
                                                 ensureReady: c.ensureCalendarReady,
                                                 taskNotes: c.calendarTaskNotes,
+                                                scheduleOccurrences:
+                                                    _calendarScheduleOccurrences(),
+                                                onScheduleTap: _openScheduleOccurrence,
+                                                onAddSchedule: _openScheduleList,
                                                 timetable: c.viewVersion?.timetable ??
                                                     c.conversation?.calendarDraft,
                                                 weekStartsOn: c.weekStartsOn,
@@ -1153,6 +1244,10 @@ class _AppShellState extends State<AppShell> {
                                                     false,
                                                 ensureReady: c.ensureCalendarReady,
                                                 taskNotes: c.calendarTaskNotes,
+                                                scheduleOccurrences:
+                                                    _calendarScheduleOccurrences(),
+                                                onScheduleTap: _openScheduleOccurrence,
+                                                onAddSchedule: _openScheduleList,
                                               ),
                                       ),
                               ),
@@ -1344,11 +1439,129 @@ class _AppShellState extends State<AppShell> {
       currentConversationTitle: conv?.generatedTitle,
       // 0.2.3（R3-E）：备份/恢复执行记录必须复用运行中的存储实例。
       executionStore: c.executionTimer?.store,
+      // 0.4.0：日程备份/恢复同样复用启动时创建、持锁的 store；恢复后刷新叠层，
+      // 并抑制“恢复前旧提醒”的补报。
+      scheduleStore: c.scheduleStore,
+      reloadSchedule: c.schedule == null
+          ? null
+          : () async {
+              widget.reminders?.suppressNextCatchUp();
+              await c.schedule!.reloadFromDisk();
+              if (mounted) setState(() {});
+            },
       // 外部日历来源变化后刷新只读占用/排程等界面（不重新规划、不改手工时间表）。
       onExternalCalendarChanged: () {
         if (mounted) setState(() {});
       },
     );
+    if (mounted) _rootFocus.requestFocus();
+  }
+
+  /// 全局日程入口：无会话也能打开；会话列表只作为“关联/筛选”候选注入，
+  /// 不改变日程的作用域（仍对所有会话的排程生效）。
+  Future<void> _openScheduleList() async {
+    final schedule = widget.scheduleController;
+    if (schedule == null) {
+      _showNotice(
+        kind: AppNoticeKind.warning,
+        message: '日程服务尚未初始化，暂时无法打开日程；请重启应用后再试。',
+        autoDismiss: null,
+      );
+      return;
+    }
+    if (schedule.readOnly) {
+      _showNotice(
+        kind: AppNoticeKind.warning,
+        message: schedule.notice ?? '日程为只读，本次运行不能修改日程。',
+        autoDismiss: null,
+      );
+    }
+    await showScheduleListDialog(
+      context,
+      controller: schedule,
+      // 与时间表/排程一致的显示时区；日程自身时区仍在事件上保存。
+      timezoneId: c.calendar.settings.timezoneId,
+      weekStartsOn: c.weekStartsOn,
+      conversations: _scheduleConversations(),
+      currentConversationId: c.conversation?.id,
+      onOpenConversation: (id) => c.openConversation(id),
+    );
+    if (mounted) _rootFocus.requestFocus();
+  }
+
+  /// 会话下拉候选：只用于关联/导航，不改变日程的全局作用域。
+  List<ScheduleConversationOption> _scheduleConversations() =>
+      <ScheduleConversationOption>[
+        for (final summary in c.summaries)
+          ScheduleConversationOption(
+            id: summary.id,
+            title: summary.displayTitle,
+            statusLabel: summary.isDeleted
+                ? '最近删除'
+                : summary.isArchived
+                    ? '已归档'
+                    : null,
+          ),
+      ];
+
+  /// 某本地日期区间内可见的日程实例（只读叠层数据）。
+  List<ScheduleOccurrence> _scheduleOccurrencesFor({
+    required String dateFrom,
+    required String dateTo,
+    required String timezoneId,
+    required int timezoneOffsetMinutes,
+  }) {
+    final schedule = widget.scheduleController;
+    if (schedule == null) return const <ScheduleOccurrence>[];
+    final from = parseDateKey(dateFrom);
+    final to = parseDateKey(dateTo);
+    if (from == null || to == null || to.compareTo(from) < 0) {
+      return const <ScheduleOccurrence>[];
+    }
+    final clock = WallClock(timezoneOffsetMinutes);
+    final fromUtc = clock.dayStartUtcForDateKey(from);
+    final toUtc = clock.dayStartUtcForDateKey(to).add(const Duration(days: 1));
+    return schedule
+        .occurrencesInRange(
+          fromUtc: fromUtc,
+          toUtc: toUtc,
+          timezoneId: timezoneId,
+        )
+        .occurrences;
+  }
+
+  /// 当前排程范围的日程叠层（甘特/设置弹窗用）。
+  List<ScheduleOccurrence> _calendarScheduleOccurrences() {
+    final settings = c.calendar.settings;
+    final from = parseDateKey(settings.planningStartDate);
+    final days = settings.planningDays < 1 ? 1 : settings.planningDays;
+    if (from == null) return const <ScheduleOccurrence>[];
+    return _scheduleOccurrencesFor(
+      dateFrom: from,
+      dateTo: addDaysToDateKey(from, days - 1),
+      timezoneId: settings.timezoneId,
+      timezoneOffsetMinutes: settings.clock.offsetMinutes,
+    );
+  }
+
+  /// 点击叠层日程：打开该实例的编辑弹窗（单次/系列范围由弹窗处理）。
+  Future<void> _openScheduleOccurrence(ScheduleOccurrence occurrence) async {
+    final schedule = widget.scheduleController;
+    if (schedule == null) return;
+    final event = schedule.eventById(occurrence.eventId);
+    if (event == null) {
+      _showSnack('该日程已删除');
+      return;
+    }
+    final outcome = await showScheduleEditorDialog(
+      context,
+      controller: schedule,
+      timezoneId: occurrence.timezoneId,
+      event: event,
+      occurrence: occurrence,
+      conversations: _scheduleConversations(),
+    );
+    if (outcome != null && mounted) setState(() {});
     if (mounted) _rootFocus.requestFocus();
   }
 
@@ -1412,6 +1625,20 @@ class _AppShellState extends State<AppShell> {
       // 外部日历只读展示：编辑器可看到斜纹占用与来源，但绝不会写回手工时间表。
       externalCalendar: c.externalCalendar,
       externalSourceIds: c.currentExternalSourceIds,
+      // 日程叠层：只读展示，点击打开实例编辑；不写入手工时间表。
+      scheduleOccurrences: settings.hasValidStart
+          ? _scheduleOccurrencesFor(
+              dateFrom: settings.planningStartDate,
+              dateTo: addDaysToDateKey(
+                  settings.planningStartDate,
+                  (settings.planningDays < 1 ? 1 : settings.planningDays) - 1),
+              timezoneId: settings.timezoneId,
+              timezoneOffsetMinutes: settings.clock.offsetMinutes,
+            )
+          : const <ScheduleOccurrence>[],
+      scheduleTimezoneId: settings.timezoneId,
+      onScheduleTap: _openScheduleOccurrence,
+      onAddSchedule: _openScheduleList,
       onApply: (r) => c.applyTimetableSettings(
         r.settings,
         r.timetable ?? timetable,
@@ -1686,7 +1913,7 @@ class _AppShellState extends State<AppShell> {
   Future<void> _addFile() async {
     final gw = c.gateway;
     if (gw == null) {
-      // 提示词 02：附件类反馈走侧栏通知区，不再用底部浮动 SnackBar。
+      // 附件类反馈走侧栏通知区，不再用底部浮动 SnackBar。
       c.reportAttachmentFeedback(
         added: 0,
         failed: 0,
@@ -2578,9 +2805,11 @@ class _CollapsedSidebarFooterBand extends StatelessWidget {
   const _CollapsedSidebarFooterBand({
     super.key,
     required this.onOpenSettings,
+    required this.onOpenSchedule,
   });
 
   final VoidCallback onOpenSettings;
+  final VoidCallback onOpenSchedule;
 
   @override
   Widget build(BuildContext context) {
@@ -2593,12 +2822,66 @@ class _CollapsedSidebarFooterBand extends StatelessWidget {
       padding: const EdgeInsets.fromLTRB(5, 0, 5, 10),
       child: Align(
         alignment: Alignment.bottomCenter,
-        child: IconButton(
-          key: const Key('sidebar-collapsed-account'),
-          tooltip: '账户与设置',
-          onPressed: onOpenSettings,
-          style: TsButtons.icon(size: 28),
-          icon: const Icon(Icons.person_outline, size: 16),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            IconButton(
+              key: const Key('open-schedule-list'),
+              tooltip: '全局日程管理',
+              onPressed: onOpenSchedule,
+              style: TsButtons.icon(size: 28),
+              icon: const Icon(Icons.event_note_outlined, size: 16),
+            ),
+            const SizedBox(height: 2),
+            IconButton(
+              key: const Key('sidebar-collapsed-account'),
+              tooltip: '账户与设置',
+              onPressed: onOpenSettings,
+              style: TsButtons.icon(size: 28),
+              icon: const Icon(Icons.person_outline, size: 16),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// 常驻侧栏底部的“日程”入口：与账户入口上下相邻的全局工具动作。
+class _ScheduleEntryButton extends StatelessWidget {
+  const _ScheduleEntryButton({required this.onOpen});
+
+  final VoidCallback onOpen;
+
+  @override
+  Widget build(BuildContext context) {
+    return Tooltip(
+      message: '全局日程管理（所有会话共享）',
+      child: TextButton(
+        key: const Key('open-schedule-list'),
+        style: TsButtons.inline(fontSize: 12.5).copyWith(
+          alignment: Alignment.centerLeft,
+          padding: const WidgetStatePropertyAll(
+            EdgeInsets.symmetric(horizontal: 10),
+          ),
+          minimumSize: const WidgetStatePropertyAll(
+            Size(double.infinity, TsSizes.buttonHeight),
+          ),
+        ),
+        onPressed: onOpen,
+        child: Row(
+          children: [
+            Icon(Icons.event_note_outlined, size: 16, color: TsColors.textSecondary),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Text(
+                '日程',
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(fontSize: 12.5, color: TsColors.textPrimary),
+              ),
+            ),
+          ],
         ),
       ),
     );
