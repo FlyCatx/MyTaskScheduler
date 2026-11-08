@@ -38,6 +38,13 @@ target_link_libraries(${BINARY_NAME} PRIVATE "dwmapi.lib")
 target_link_libraries(${BINARY_NAME} PRIVATE "comctl32.lib")
 # CreatePolygonRgn / SetWindowRgn (rounded window outline, window_region.h).
 target_link_libraries(${BINARY_NAME} PRIVATE "gdi32.lib")
+# WTSRegisterSessionNotification / WTSUnRegisterSessionNotification
+# (WM_WTSSESSION_CHANGE lock/unlock monitoring).
+target_link_libraries(${BINARY_NAME} PRIVATE "wtsapi32.lib")
+# RegisterSuspendResumeNotification / UnregisterSuspendResumeNotification
+# (WM_POWERBROADCAST suspend/resume). user32 is part of the default Windows
+# libraries; spelling it out keeps the power-event dependency visible here.
+target_link_libraries(${BINARY_NAME} PRIVATE "user32.lib")
 target_include_directories(${BINARY_NAME} PRIVATE "${CMAKE_SOURCE_DIR}")
 
 # Run the Flutter tool portions of the build. This must not be removed.

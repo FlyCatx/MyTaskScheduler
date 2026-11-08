@@ -109,6 +109,38 @@ class FlutterWindow : public Win32Window {
   bool close_guard_ = false;
   bool allow_close_ = false;
 
+  /*
+   * Session lock / power suspend monitoring (execution away events).
+   *
+   * WM_WTSSESSION_CHANGE reports lock/unlock for this session and
+   * WM_POWERBROADCAST reports suspend/resume. The two reasons are tracked
+   * independently and pushed to Dart as one state map over the existing
+   * taskscheduler/window channel, so the state layer can combine them: resuming
+   * while the session is still locked must not look like the user is back.
+   * Minimize/deactivate/display changes are deliberately not mapped to "away".
+   *
+   * Registration failures are recorded (with GetLastError) and reported in the
+   * same map instead of being ignored; the app keeps running without them.
+   */
+  void RegisterAwayNotifications();
+  void UnregisterAwayNotifications();
+  void HandleSessionChange(WPARAM wparam);
+  void HandlePowerBroadcast(WPARAM wparam);
+
+  // Pushes the full away state (locked/suspended + registration result) to Dart.
+  // Called only after a real state change, so repeated broadcasts are idempotent.
+  void NotifyPowerState();
+  flutter::EncodableValue PowerStateInfo() const;
+
+  bool session_locked_ = false;
+  bool system_suspended_ = false;
+  bool session_notifications_registered_ = false;
+  bool suspend_notifications_registered_ = false;
+  long session_register_error_ = 0;
+  long suspend_register_error_ = 0;
+  HPOWERNOTIFY suspend_notification_ = nullptr;
+  int power_sequence_ = 0;
+
   // Client-area rectangle (physical pixels) that Windows treats as the caption,
   // reported by Dart after layout. Excludes menus and caption buttons.
   RECT drag_region_ = {0, 0, 0, 0};
@@ -145,10 +177,6 @@ class FlutterWindow : public Win32Window {
   int shape_sequence_ = 0;
   int last_pushed_sequence_ = 0;
 
-  // Diagnostics switch (`setRegionEnabled`): when false the native region is
-  // cleared and not rebuilt, so the acceptance probe can capture what the GPU
-  // surface itself presents at the corners. Never used in normal operation.
-  bool region_diagnostics_enabled_ = true;
 };
 
 #endif  // RUNNER_FLUTTER_WINDOW_H_

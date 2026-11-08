@@ -2,6 +2,7 @@
 
 #include <commctrl.h>
 #include <dwmapi.h>
+#include <wtsapi32.h>
 #include <flutter/standard_method_codec.h>
 #include <flutter_windows.h>
 #include <windowsx.h>
@@ -77,22 +78,7 @@ void WindowLog(const char* message, HWND window, WPARAM wparam, LPARAM lparam) {
 }  // namespace
 
 FlutterWindow::FlutterWindow(const flutter::DartProject& project)
-    : project_(project) {
-  /*
-   * Acceptance experiment only: TASKSCHEDULER_DISABLE_REGION=1 starts the app
-   * without the native window region. The probe then captures what the Flutter
-   * GPU surface itself presents at the corners, which is the evidence for
-   * "the embedder's HWND surface has no per-pixel alpha, so a ClipPath cannot
-   * make the native window edge transparent". Normal runs never set this.
-   */
-  char disable_region[8] = {0};
-  const DWORD disabled = GetEnvironmentVariableA(
-      "TASKSCHEDULER_DISABLE_REGION", disable_region,
-      static_cast<DWORD>(sizeof(disable_region)));
-  if (disabled > 0 && disable_region[0] == '1') {
-    region_diagnostics_enabled_ = false;
-  }
-}
+    : project_(project) {}
 
 FlutterWindow::~FlutterWindow() {}
 
@@ -133,6 +119,8 @@ bool FlutterWindow::OnCreate() {
       [this](const flutter::MethodCall<flutter::EncodableValue>& call,
              std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>>
                  result) { HandleWindowMethod(call, std::move(result)); });
+
+  RegisterAwayNotifications();
 
   SetChildContent(flutter_controller_->view()->GetNativeWindow());
 
@@ -188,6 +176,7 @@ bool FlutterWindow::OnCreate() {
 }
 
 void FlutterWindow::OnDestroy() {
+  UnregisterAwayNotifications();
   window_channel_.reset();
   if (flutter_controller_) {
     flutter_controller_ = nullptr;
@@ -253,35 +242,10 @@ void FlutterWindow::HandleWindowMethod(
     // Current window state for Dart: shape (state/radius), real size and DPI.
     // Dart uses it once on startup; events carry the same map afterwards.
     result->Success(WindowShapeInfo(shape_sequence_));
-  } else if (method == "setRegionEnabled") {
-    /*
-     * Diagnostics only (acceptance evidence for the anti-aliasing section):
-     * turning the native region off lets a probe capture what the GPU surface
-     * actually presents at the corners, proving whether the top-level surface
-     * carries per-pixel alpha or is opaque (in which case a ClipPath cannot
-     * produce a transparent native edge).
-     */
-    const auto* arguments = std::get_if<flutter::EncodableMap>(call.arguments());
-    bool enabled = true;
-    if (arguments != nullptr) {
-      auto it = arguments->find(flutter::EncodableValue("enabled"));
-      if (it != arguments->end()) {
-        if (const bool* value = std::get_if<bool>(&it->second)) {
-          enabled = *value;
-        }
-      }
-    }
-    region_diagnostics_enabled_ = enabled;
-    if (!enabled) {
-      region_updating_ = true;
-      SetWindowRgn(window, nullptr, TRUE);
-      region_applied_ = false;
-      region_updating_ = false;
-    } else {
-      UpdateWindowRegion(/*force=*/true);
-      NotifyWindowShape(window);
-    }
-    result->Success(WindowShapeInfo(shape_sequence_));
+  } else if (method == "powerState") {
+    // Initial away state (lock/suspend + registration result). Later changes
+    // arrive as powerStateChanged events carrying the same map.
+    result->Success(PowerStateInfo());
   } else {
     result->NotImplemented();
   }
@@ -298,6 +262,110 @@ bool FlutterWindow::IsWindowMaximized(HWND window) const {
   return window != nullptr && IsZoomed(window) != 0;
 }
 
+void FlutterWindow::RegisterAwayNotifications() {
+  HWND window = GetHandle();
+  if (window == nullptr) return;
+
+  // Lock/unlock of the current session -> WM_WTSSESSION_CHANGE.
+  session_notifications_registered_ =
+      WTSRegisterSessionNotification(window, NOTIFY_FOR_THIS_SESSION) != FALSE;
+  session_register_error_ = session_notifications_registered_
+                                ? 0
+                                : static_cast<long>(GetLastError());
+
+  // Suspend/resume -> WM_POWERBROADCAST (PBT_APMSUSPEND / PBT_APMRESUMEAUTOMATIC).
+  suspend_notification_ = RegisterSuspendResumeNotification(
+      reinterpret_cast<HANDLE>(window), DEVICE_NOTIFY_WINDOW_HANDLE);
+  suspend_notifications_registered_ = suspend_notification_ != nullptr;
+  suspend_register_error_ = suspend_notifications_registered_
+                                ? 0
+                                : static_cast<long>(GetLastError());
+}
+
+void FlutterWindow::UnregisterAwayNotifications() {
+  if (session_notifications_registered_) {
+    WTSUnRegisterSessionNotification(GetHandle());
+    session_notifications_registered_ = false;
+  }
+  if (suspend_notification_ != nullptr) {
+    UnregisterSuspendResumeNotification(suspend_notification_);
+    suspend_notification_ = nullptr;
+  }
+  suspend_notifications_registered_ = false;
+}
+
+void FlutterWindow::HandleSessionChange(WPARAM wparam) {
+  bool locked = session_locked_;
+  switch (wparam) {
+    case WTS_SESSION_LOCK:
+      locked = true;
+      break;
+    case WTS_SESSION_UNLOCK:
+      locked = false;
+      break;
+    default:
+      // Console connect/disconnect, logon/logoff and remote-session changes are
+      // not away reasons for the execution timer.
+      return;
+  }
+  if (locked == session_locked_) return;
+  session_locked_ = locked;
+  NotifyPowerState();
+}
+
+void FlutterWindow::HandlePowerBroadcast(WPARAM wparam) {
+  bool suspended = system_suspended_;
+  switch (wparam) {
+    case PBT_APMSUSPEND:
+      // Best effort: the event is only posted to Dart and this handler never
+      // waits for a Dart-side write. A sudden power loss still relies on the
+      // timer checkpoint / drift recovery after the next start.
+      suspended = true;
+      break;
+    case PBT_APMRESUMEAUTOMATIC:
+    case PBT_APMRESUMESUSPEND:
+    case PBT_APMRESUMECRITICAL:
+      // Several resume variants can arrive for one wake-up; the state
+      // comparison below makes the repeated ones a no-op.
+      suspended = false;
+      break;
+    default:
+      // Power setting/capability changes (for example display state) are not
+      // away reasons and must not pause a running timer.
+      return;
+  }
+  if (suspended == system_suspended_) return;
+  system_suspended_ = suspended;
+  NotifyPowerState();
+}
+
+void FlutterWindow::NotifyPowerState() {
+  if (!window_channel_) return;
+  ++power_sequence_;
+  window_channel_->InvokeMethod(
+      "powerStateChanged",
+      std::make_unique<flutter::EncodableValue>(PowerStateInfo()));
+}
+
+flutter::EncodableValue FlutterWindow::PowerStateInfo() const {
+  flutter::EncodableMap map;
+  map[flutter::EncodableValue("locked")] =
+      flutter::EncodableValue(session_locked_);
+  map[flutter::EncodableValue("suspended")] =
+      flutter::EncodableValue(system_suspended_);
+  map[flutter::EncodableValue("lockEventsRegistered")] =
+      flutter::EncodableValue(session_notifications_registered_);
+  map[flutter::EncodableValue("suspendEventsRegistered")] =
+      flutter::EncodableValue(suspend_notifications_registered_);
+  map[flutter::EncodableValue("lockEventsError")] =
+      flutter::EncodableValue(static_cast<int>(session_register_error_));
+  map[flutter::EncodableValue("suspendEventsError")] =
+      flutter::EncodableValue(static_cast<int>(suspend_register_error_));
+  map[flutter::EncodableValue("sequence")] =
+      flutter::EncodableValue(power_sequence_);
+  return flutter::EncodableValue(map);
+}
+
 void FlutterWindow::UpdateWindowRegion(bool force) {
   HWND window = GetHandle();
   if (window == nullptr) return;
@@ -305,9 +373,6 @@ void FlutterWindow::UpdateWindowRegion(bool force) {
   // A minimized window has no meaningful client rectangle; skipping keeps the
   // last real region instead of replacing it with a degenerate one.
   if (IsIconic(window) != 0) return;
-
-  // Diagnostics mode: the region was deliberately cleared by the probe.
-  if (!region_diagnostics_enabled_) return;
 
   /*
    * Re-entrancy: SetWindowRgn sends WM_WINDOWPOSCHANGING/WM_WINDOWPOSCHANGED and
@@ -495,8 +560,6 @@ flutter::EncodableValue FlutterWindow::WindowShapeInfo(int sequence) const {
       flutter::EncodableValue(static_cast<int>(region_last_error_));
   map[flutter::EncodableValue("minimized")] =
       flutter::EncodableValue(minimized);
-  map[flutter::EncodableValue("regionDiagnosticsEnabled")] =
-      flutter::EncodableValue(region_diagnostics_enabled_);
   return flutter::EncodableValue(map);
 }
 
@@ -589,6 +652,16 @@ FlutterWindow::MessageHandler(HWND hwnd, UINT const message,
 
     case WM_FONTCHANGE:
       flutter_controller_->engine()->ReloadSystemFonts();
+      break;
+
+    case WM_WTSSESSION_CHANGE:
+      // Lock/unlock only; other session notifications are ignored by the handler.
+      HandleSessionChange(wparam);
+      break;
+
+    case WM_POWERBROADCAST:
+      // Suspend/resume only; display/power-setting changes are ignored.
+      HandlePowerBroadcast(wparam);
       break;
 
     case WM_SIZE:
