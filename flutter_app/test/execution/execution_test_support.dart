@@ -10,11 +10,12 @@ import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart' show TestFailure;
 import 'package:taskscheduler_flutter/src/model/plan.dart' show Completion;
-import 'package:taskscheduler_flutter/src/state/execution/effort_clock.dart';
 import 'package:taskscheduler_flutter/src/state/execution/effort_stats.dart';
 import 'package:taskscheduler_flutter/src/state/execution/execution_models.dart';
 import 'package:taskscheduler_flutter/src/state/execution/execution_store.dart';
 import 'package:taskscheduler_flutter/src/state/execution/timer_controller.dart';
+
+import 'fake_effort_clock.dart';
 
 /// 固定 +08:00（测试断言不受机器时区/DST 影响）。
 const EffortLocalTime shanghaiLocalTime = FixedOffsetEffortLocalTime(

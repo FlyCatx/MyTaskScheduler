@@ -3,6 +3,8 @@
 import 'package:flutter_test/flutter_test.dart';
 import 'package:taskscheduler_flutter/src/state/execution/effort_clock.dart';
 
+import 'fake_effort_clock.dart';
+
 void main() {
   test('正常流逝同时推进墙钟与单调时钟', () {
     final clock = FakeEffortClock(startUtc: DateTime.utc(2026, 11, 4, 1));

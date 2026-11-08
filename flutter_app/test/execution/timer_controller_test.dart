@@ -9,11 +9,11 @@
 //   * 手工补记校验、重叠默认不计入、用户明确保留才计入、删除可撤销。
 
 import 'package:flutter_test/flutter_test.dart';
-import 'package:taskscheduler_flutter/src/state/execution/effort_clock.dart';
 import 'package:taskscheduler_flutter/src/state/execution/effort_stats.dart';
 import 'package:taskscheduler_flutter/src/state/execution/execution_models.dart';
 
 import 'execution_test_support.dart';
+import 'fake_effort_clock.dart';
 
 void main() {
   group('开始/暂停/继续/停止', () {
