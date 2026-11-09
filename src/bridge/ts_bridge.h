@@ -368,6 +368,8 @@ TS_BRIDGE_API int ts_bridge_export(TsBridge *bridge,
  * 失败返回非 0，out_error 为可读原因（JSON）。
  *
  * title_utf8 可为 NULL（默认“选择文本文件”）。
+ *
+ * 兼容入口：等价于 filter_kind = 0（见 ts_bridge_pick_file_filtered）。
  */
 TS_BRIDGE_API int ts_bridge_pick_file(TsBridge *bridge,
                                       const char *title_utf8,
@@ -375,13 +377,114 @@ TS_BRIDGE_API int ts_bridge_pick_file(TsBridge *bridge,
                                       TsBridgeBuffer *out_error);
 
 /*
+ * 0.5.0：带筛选用途的系统文件对话框（ABI 2 追加导出，旧函数行为不变）。
+ *
+ * filter_kind：
+ *   0 = 通用文档（与 0.4.0 的 ts_bridge_pick_file 完全一致：TXT/MD/PDF/DOCX/PPTX
+ *       + ICS/ICAL + 所有文件）；
+ *   1 = OCR 专用（显示名明确列出 PDF / PNG / JPEG；扩展名 .pdf/.png/.jpg/.jpeg
+ *       + 所有文件）；
+ *   2 = 日历（.ics/.ical + 所有文件）。
+ *
+ * 返回值与 out_path / out_error 语义同 ts_bridge_pick_file：
+ * 0=成功或用户取消；非 0=失败。未知 filter_kind 立即失败（不弹窗）。
+ *
+ * “所有文件”与手输路径仍可能返回不支持的类型：**扩展名校验由应用入口完成**
+ * （大小写不敏感），原生层只负责让系统面板的默认筛选与显示名一致。
+ */
+TS_BRIDGE_API int ts_bridge_pick_file_filtered(TsBridge *bridge,
+                                               const char *title_utf8,
+                                               int filter_kind,
+                                               TsBridgeBuffer *out_path,
+                                               TsBridgeBuffer *out_error);
+
+/*
  * 显示一个 Windows 通知（托盘气泡）。返回 1 表示系统接受；0 表示不可用/被策略阻止。
  * 点击气泡后 ts_bridge_notification_clicked 返回 1 一次，供 UI 定位会话。
+ *
+ * 保留给日程提醒等只读提示使用；需要“延长时间/结束任务”动作与任务身份的任务
+ * 执行通知请使用下面的 execution_notification 系列。
  */
 TS_BRIDGE_API int ts_bridge_show_notification(TsBridge *bridge,
                                               const char *title_utf8,
                                               const char *body_utf8);
 TS_BRIDGE_API int ts_bridge_notification_clicked(TsBridge *bridge);
+
+/* ------------------------------------------------------------------ */
+/* 0.5.0 可操作执行通知（任务 13）                                      */
+/* ------------------------------------------------------------------ */
+
+/*
+ * 准备可操作通知通道（同步、无网络、幂等）。0 = 可用；非 0 = 不可用（但
+ * out_status_json 仍会写明原因，供 Dart 记录并降级为前台等价操作）。
+ *
+ * 具体动作：
+ *   - 在开始菜单创建带 System.AppUserModel.ID 的快捷方式（Toast 身份）；
+ *   - 注册 HKCU\Software\Classes\taskscheduler（URL Protocol → "<exe>" "%1"）；
+ *   - 启动命名管道服务线程并取走启动前的待处理激活；
+ *   - 探测 WinRT Toast 能力与系统通知开关。
+ *
+ * aumid_utf8 必填，必须与 runner 的 SetCurrentProcessExplicitAppUserModelID 一致
+ * （当前约定 "TaskScheduler.Desktop"）。
+ * exe_path_utf8 为空时用当前进程模块路径。
+ *
+ * out_status_json 字段：
+ *   { ok, aumid, exePath,
+ *     shortcutReady, shortcutPath,
+ *     protocolReady, protocolScheme,
+ *     toastSupported, toastSettingEnabled, toastSetting, channel,
+ *     pipeReady, pipeOwner, pipeName, pipeError, pendingFile,
+ *     errorKind?, error? }
+ */
+TS_BRIDGE_API int ts_bridge_prepare_notifications(TsBridge *bridge,
+                                                  const char *aumid_utf8,
+                                                  const char *exe_path_utf8,
+                                                  TsBridgeBuffer *out_status_json);
+
+/*
+ * 显示一条**可操作**执行通知（真实 WinRT Toast）。1 = 系统接受；0 = 失败。
+ *
+ * title_utf8 / body_utf8：通知标题与正文。
+ * payload_json：任务身份（必填）：
+ *   { "taskId": "…", "executionId": "…", "deadline": "…" | 1234567890 }
+ * deadline 由 Dart 决定语义（推荐 epoch 毫秒），原生只作为**不透明身份令牌**
+ * 原样拼进激活 URI、原样回传，不做时区换算。
+ *
+ * 通知行为（Windows 决定按钮视觉）：
+ *   - 正文点击 → taskscheduler://open?<身份>   （打开对应任务）
+ *   - 按钮 1   → taskscheduler://extend?<身份> （延长时间）
+ *   - 按钮 2   → taskscheduler://finish?<身份> （结束任务）
+ *
+ * out_result_json 字段：
+ *   成功 { ok:true, accepted:true, channel:"winrt", aumid, atMs }
+ *   失败 { ok:false, accepted:false, errorKind:"argument|notPrepared|policy|disabled|
+ *          winrt|internal", error:"可读原因", channel:"winrt" }
+ * 失败时 Dart 必须走前台等价操作，并记录投递结果。
+ */
+TS_BRIDGE_API int ts_bridge_show_execution_notification(TsBridge *bridge,
+                                                        const char *title_utf8,
+                                                        const char *body_utf8,
+                                                        const char *payload_json,
+                                                        TsBridgeBuffer *out_result_json);
+
+/*
+ * 取走一条待处理的执行通知动作。0 = 没有；1 = 有并写 out_action_json。
+ *
+ * 动作来源（身份均来自被点击的那条通知自身）：
+ *   - 应用运行中：第二实例经命名管道转发；
+ *   - 应用未运行：系统启动本应用前的待处理激活文件。
+ *
+ * out_action_json：
+ *   { "action":"open|extend|finish",
+ *     "taskId":"…", "executionId":"…", "deadline":"…" }
+ *
+ * 调用方必须按 taskId + executionId + deadline 校验是否为**当前有效**的执行/期限，
+ * 过期动作直接丢弃（原生层不做业务判断，绝不猜“最后一次通知”）。
+ */
+TS_BRIDGE_API int ts_bridge_take_execution_action(TsBridge *bridge,
+                                                  TsBridgeBuffer *out_action_json);
+
+/* ABI 2 就绪：以上三个导出为 0.5.0 追加，旧调用方与结构体布局不变。 */
 
 /* ------------------------------------------------------------------ */
 /* 关闭                                                                */

@@ -9,6 +9,9 @@
 #include "ts_bridge.h"
 
 #include "ts_file_list.h"
+#include "ts_pick_filter.h"
+#include "ts_activation.h"
+#include "ts_toast.h"
 #include "../domain/analysis/analyze.h"
 #include "../domain/analysis/constraints.h"
 #include "../platform/credential.h"
@@ -158,6 +161,14 @@ struct TsBridge {
     TsJobId next_job;
     BridgeJob *analyze_job;                       /* 单活动分析槽 */
     BridgeJob *probe_jobs[TS_BRIDGE_MAX_PROBE_JOBS]; /* 最多 4 个并发探针 */
+
+    /*
+     * 0.5.0 可操作执行通知（任务 13）：动作队列 + Toast 系统集成状态。
+     * toast 内部有管道服务线程，入队的是 Dart 可直接取走的动作 JSON；
+     * destroy 时先停 toast 线程再释放队列。
+     */
+    TsActivationQueue *activation;
+    TsToastState *toast;
 };
 
 typedef struct WorkerArg {
@@ -1561,6 +1572,15 @@ int ts_bridge_create_ex(const char *config_path_utf8,
 
     bridge_lock_init(b);
 
+    /*
+     * 0.5.0：通知动作队列与 Toast 状态。创建失败不阻断分析/设置功能，
+     * 只是 execution notification 不可用（对应导出会返回明确失败）。
+     */
+    b->activation = ts_activation_queue_create();
+    if (b->activation != NULL) {
+        b->toast = ts_toast_create(b->activation);
+    }
+
     errbuf[0] = '\0';
     if (config_path_utf8 != NULL && config_path_utf8[0] != '\0') {
         if (ts_config_load(config_path_utf8, &b->cfg, errbuf, sizeof(errbuf)) != 0) {
@@ -1651,6 +1671,14 @@ int ts_bridge_create_ex(const char *config_path_utf8,
 
 failed:
     ts_free(derived_dir);
+    if (b->toast != NULL) {
+        ts_toast_destroy(b->toast);
+        b->toast = NULL;
+    }
+    if (b->activation != NULL) {
+        ts_activation_queue_destroy(b->activation);
+        b->activation = NULL;
+    }
     if (b->profiles_ready) ts_profile_list_free(&b->profiles);
     if (b->cfg_ready) ts_config_free(&b->cfg);
     ts_free(b->config_path);
@@ -3220,11 +3248,18 @@ static wchar_t *dup_utf8_to_wide(const char *s)
     return w;
 }
 
-int ts_bridge_pick_file(TsBridge *bridge,
-                        const char *title_utf8,
-                        TsBridgeBuffer *out_path,
-                        TsBridgeBuffer *out_error)
+/*
+ * 带筛选用途的文件对话框（0.5.0 追加导出）。
+ * filter_kind 的过滤器定义集中在 ts_pick_filter.c，便于 C 测试逐项核对；
+ * 旧 ts_bridge_pick_file 只是转发 filter_kind=0，行为与 0.4.0 一致。
+ */
+int ts_bridge_pick_file_filtered(TsBridge *bridge,
+                                 const char *title_utf8,
+                                 int filter_kind,
+                                 TsBridgeBuffer *out_path,
+                                 TsBridgeBuffer *out_error)
 {
+    const TsPickFilterSpec *spec;
     OPENFILENAMEW ofn;
     /*
      * 多选时系统会把“目录 + 每个文件名”连续写进这个缓冲区，所以必须远大于单个路径。
@@ -3240,26 +3275,29 @@ int ts_bridge_pick_file(TsBridge *bridge,
     if (out_error != NULL) { out_error->data = NULL; out_error->length = 0; }
     if (bridge == NULL || out_path == NULL) return 1;
 
+    /* 未知 kind：立即失败，绝不退化成“所有文件”让用户误以为筛选生效。 */
+    spec = ts_pick_filter_spec(filter_kind);
+    if (spec == NULL) {
+        error_json(out_error, "argument", "未知的文件筛选用途");
+        return 1;
+    }
+
     title_wide = dup_utf8_to_wide(title_utf8);
-    /* 默认标题：未传或转换失败时使用。 */
-    title = (title_wide != NULL) ? title_wide : L"选择文本文件";
+    /* 默认标题：未传或转换失败时使用该 kind 的默认标题。 */
+    title = (title_wide != NULL) ? title_wide : spec->default_title;
 
     memset(file_buf, 0, sizeof(file_buf));
     memset(&ofn, 0, sizeof(ofn));
     ofn.lStructSize = sizeof(ofn);
     ofn.hwndOwner = find_owner_window();
-    /*
-     * 过滤器：只列文本；同时保留“所有文件”，这样用户仍能看到 .log 等文件，
-     * 真正的类型校验在 App 侧完成（会给出明确提示）。
-     */
-        ofn.lpstrFilter = L"文档 (*.txt;*.md;*.pdf;*.docx;*.pptx)\0*.txt;*.md;*.pdf;*.docx;*.pptx\0日历文件 (*.ics;*.ical)\0*.ics;*.ical\0所有文件 (*.*)\0*.*\0\0";
+    ofn.lpstrFilter = spec->filter;
     ofn.lpstrFile = file_buf;
     ofn.nMaxFile = (DWORD)(sizeof(file_buf) / sizeof(file_buf[0]));
     ofn.lpstrTitle = title;
     /* OFN_ALLOWMULTISELECT：允许一次选多个文件（配合 OFN_EXPLORER 才按目录+文件名返回）。 */
     ofn.Flags = OFN_EXPLORER | OFN_ALLOWMULTISELECT | OFN_FILEMUSTEXIST |
                 OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR | OFN_HIDEREADONLY;
-    ofn.lpstrDefExt = L"txt";
+    ofn.lpstrDefExt = spec->default_ext;
 
     ok = GetOpenFileNameW(&ofn);
     ts_free(title_wide);
@@ -3292,6 +3330,15 @@ int ts_bridge_pick_file(TsBridge *bridge,
     out_path->data = utf8;
     out_path->length = strlen(utf8);
     return 0;
+}
+
+int ts_bridge_pick_file(TsBridge *bridge,
+                        const char *title_utf8,
+                        TsBridgeBuffer *out_path,
+                        TsBridgeBuffer *out_error)
+{
+    return ts_bridge_pick_file_filtered(bridge, title_utf8,
+                                        TS_PICK_FILTER_DOCUMENT, out_path, out_error);
 }
 
 /* ------------------------------------------------------------------ */
@@ -3382,6 +3429,76 @@ int ts_bridge_notification_clicked(TsBridge *bridge)
 {
     (void)bridge;
     return (int)InterlockedExchange(&g_notify_clicked, 0);
+}
+
+/* ------------------------------------------------------------------ */
+/* 0.5.0 可操作执行通知（任务 13）                                      */
+/* ------------------------------------------------------------------ */
+
+int ts_bridge_prepare_notifications(TsBridge *bridge,
+                                    const char *aumid_utf8,
+                                    const char *exe_path_utf8,
+                                    TsBridgeBuffer *out_status_json)
+{
+    if (out_status_json != NULL) {
+        out_status_json->data = NULL;
+        out_status_json->length = 0;
+    }
+    if (bridge == NULL) {
+        (void)error_json(out_status_json, "argument", "bridge 为 NULL");
+        return 1;
+    }
+    if (bridge->toast == NULL) {
+        (void)error_json(out_status_json, "internal", "通知状态未初始化");
+        return 1;
+    }
+    return ts_toast_prepare(bridge->toast, aumid_utf8, exe_path_utf8, out_status_json);
+}
+
+int ts_bridge_show_execution_notification(TsBridge *bridge,
+                                          const char *title_utf8,
+                                          const char *body_utf8,
+                                          const char *payload_json,
+                                          TsBridgeBuffer *out_result_json)
+{
+    if (out_result_json != NULL) {
+        out_result_json->data = NULL;
+        out_result_json->length = 0;
+    }
+    if (bridge == NULL || bridge->toast == NULL) {
+        /* 与 Dart 契约一致：失败结果永远是 {ok:false, accepted:false, errorKind, error}。 */
+        cJSON *extra = cJSON_CreateObject();
+        if (extra != NULL) {
+            cJSON_AddBoolToObject(extra, "accepted", 0);
+            cJSON_AddStringToObject(extra, "channel", "winrt");
+            (void)error_json_extra(out_result_json, "argument",
+                                   "bridge 为 NULL 或通知状态未初始化", extra);
+        } else {
+            (void)error_json(out_result_json, "argument",
+                             "bridge 为 NULL 或通知状态未初始化");
+        }
+        return 0;
+    }
+    return ts_toast_show(bridge->toast, title_utf8, body_utf8, payload_json,
+                         out_result_json);
+}
+
+int ts_bridge_take_execution_action(TsBridge *bridge,
+                                    TsBridgeBuffer *out_action_json)
+{
+    char *json;
+    if (out_action_json != NULL) {
+        out_action_json->data = NULL;
+        out_action_json->length = 0;
+    }
+    if (bridge == NULL || bridge->activation == NULL || out_action_json == NULL) {
+        return 0;
+    }
+    json = ts_activation_queue_take(bridge->activation);
+    if (json == NULL) return 0;
+    out_action_json->data = json;
+    out_action_json->length = strlen(json);
+    return 1;
 }
 
 /* ------------------------------------------------------------------ */
@@ -3499,6 +3616,16 @@ void ts_bridge_destroy(TsBridge *bridge)
 
     for (i = 0; i < n; i++) {
         job_free(all[i]);
+    }
+
+    /* 0.5.0：先停通知管道线程（它只向动作队列写），再释放队列。 */
+    if (bridge->toast != NULL) {
+        ts_toast_destroy(bridge->toast);
+        bridge->toast = NULL;
+    }
+    if (bridge->activation != NULL) {
+        ts_activation_queue_destroy(bridge->activation);
+        bridge->activation = NULL;
     }
 
     if (bridge->profiles_ready) {
