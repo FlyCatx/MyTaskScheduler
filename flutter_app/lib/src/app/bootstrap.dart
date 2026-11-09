@@ -8,6 +8,9 @@ import 'package:flutter/material.dart';
 import '../ffi/native_gateway.dart';
 import '../model/settings.dart';
 import '../state/app_controller.dart';
+import '../state/execution/execution_deadline_controller.dart';
+import '../state/execution/execution_deadline_store.dart';
+import '../state/execution/execution_notification.dart';
 import '../state/execution/execution_store.dart';
 import '../state/execution/timer_controller.dart';
 import '../state/external_calendar_service.dart';
@@ -74,6 +77,8 @@ class _TsBootstrapState extends State<TsBootstrap> {
   TimerController? _timer;
   ScheduleController? _schedule;
   ScheduleReminderService? _reminders;
+  ExecutionDeadlineController? _executionDeadline;
+  VoidCallback? _windowShapeListener;
 
   /// Applies the global palette for the committed preferences. Registered before any
   /// other settings listener so widgets rebuilding from this notification already see
@@ -161,8 +166,12 @@ class _TsBootstrapState extends State<TsBootstrap> {
 
     // 外部日历文件选择器由 bootstrap 注入（UI 只依赖抽象 hook，测试可覆盖）。
     // 必须在 gateway 打开之后注册：对话框不可用时自身会明确报错，不会假装成功。
-    ExternalCalendarFilePicker.defaultPick = () =>
-        gateway.pickTextFiles(title: '选择 ICS 日历文件');
+    // 0.5.0 任务 06：ICS 导入使用日历专用筛选（.ics/.ical + 所有文件），
+    // 与通用“添加材料”和 OCR 专用筛选互不影响。
+    ExternalCalendarFilePicker.defaultPick = () => gateway.pickTextFiles(
+          filter: PickFilter.calendar,
+          title: '选择 ICS 日历文件',
+        );
 
     // ---- 3. settings (non-fatal) -----------------------------------------
     /*
@@ -344,6 +353,59 @@ class _TsBootstrapState extends State<TsBootstrap> {
       _reminders = reminders;
       unawaited(reminders.start());
     }
+
+    // ---- 4b. execution deadline/reminder controller (0.5.0 任务 13) -------
+    /*
+     * 截止提醒的生命周期独立于 UI：计时器恢复出来之后创建控制器，由它负责
+     * “到点结算 → 待处理 → 两次提醒 → 自动完成”的状态机与持久化。
+     * 原生可操作通知不可用时降级为前台等价操作并记录投递结果，不阻止启动。
+     */
+    final timerForDeadline = _timer;
+    if (timerForDeadline != null) {
+      try {
+        final deadlineStore = ExecutionDeadlineStore(timerForDeadline.store);
+        final notifications = NativeExecutionNotificationPort(gateway);
+        final deadline = ExecutionDeadlineController(
+          timer: timerForDeadline,
+          store: deadlineStore,
+          clock: timerForDeadline.clock,
+          localTime: timerForDeadline.localTime,
+          notifications: notifications,
+          resolveTarget: controller.executionDeadlineTargetFor,
+          taskRefFor: controller.executionTaskRefIn,
+          completeTask: controller.completeTaskFromExecution,
+          previewExtensionFor: controller.previewExecutionExtension,
+          applyExtensionFor: controller.applyExecutionExtension,
+          openTask: controller.openExecutionTask,
+          // 最小化/失焦时不能假装“前台已显示”；恢复后由 tick 补发。
+          isAppVisible: () => !windowPort.shape.value.minimized,
+          onNotice: (message, {bool error = false}) {
+            AppNotices.instance.show(
+              kind: error ? AppNoticeKind.error : AppNoticeKind.info,
+              message: message,
+              dedupeKey: 'execution-deadline',
+              autoDismiss: error ? null : const Duration(seconds: 6),
+            );
+          },
+        );
+        controller.attachExecutionDeadline(deadline);
+        _executionDeadline = deadline;
+        // 最小化/恢复到前台时立即补一次校核（原本错过/未送达的提醒重新投递）。
+        void onShape() {
+          unawaited(deadline.handleAppVisibilityChanged());
+        }
+
+        _windowShapeListener = onShape;
+        windowPort.shape.addListener(onShape);
+        await deadline.load();
+        final status = deadline.notificationStatus;
+        if (status != null && status.trim().isNotEmpty) {
+          _appendBootNotice(status);
+        }
+      } catch (e) {
+        _appendBootNotice('执行截止提醒不可用（计时与任务完成不受影响）：$e');
+      }
+    }
     setState(() {
       _gateway = gateway;
       _settings = settings;
@@ -383,6 +445,17 @@ class _TsBootstrapState extends State<TsBootstrap> {
   void dispose() {
     final listener = _paletteListener;
     if (listener != null) _settings?.removeListener(listener);
+    final shapeListener = _windowShapeListener;
+    if (shapeListener != null) {
+      windowPort.shape.removeListener(shapeListener);
+      _windowShapeListener = null;
+    }
+    final deadline = _executionDeadline;
+    _executionDeadline = null;
+    if (deadline != null) {
+      unawaited(deadline.shutdown());
+      deadline.dispose();
+    }
     _gateway?.close();
     _settings?.dispose();
     _controller?.dispose();
