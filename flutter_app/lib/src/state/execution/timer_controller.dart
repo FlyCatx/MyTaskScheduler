@@ -463,7 +463,17 @@ class TimerController extends ChangeNotifier {
   }
 
   /// 停止本次计时并确认。**不会**把任务标记为完成，也不会写预估为实际。
-  Future<TimerActionResult> stopAndConfirm() async {
+  Future<TimerActionResult> stopAndConfirm() => _stopAndConfirmInternal();
+
+  /// 按“有效截止点”结算本次计时（任务 13 到点待处理）。
+  ///
+  /// 与 [stopAndConfirm] 的唯一区别：当前未闭区间被截断在 [deadlineUtc]，到点之后
+  /// 才轮询到的等待时间绝不写进实际耗时。若开始时间已经晚于截止点（例如用户给
+  /// 已过截止的任务手动开始），不删掉真实发生的工作，按正常停止处理。
+  Future<TimerActionResult> stopAndConfirmAt(DateTime deadlineUtc) =>
+      _stopAndConfirmInternal(atUtc: deadlineUtc);
+
+  Future<TimerActionResult> _stopAndConfirmInternal({DateTime? atUtc}) async {
     final active = _active;
     if (active == null) {
       return const TimerActionResult(ok: false, message: '当前没有正在计时的任务');
@@ -473,7 +483,7 @@ class TimerController extends ChangeNotifier {
     }
     Duration closed = Duration.zero;
     if (_phase == TimerPhase.running) {
-      closed = _closeOpenInterval() ?? Duration.zero;
+      closed = _closeOpenInterval(atUtc: atUtc) ?? Duration.zero;
       _sessionClosed += closed;
     }
     final record = ledger.recordById(active.recordId);
@@ -968,11 +978,13 @@ class TimerController extends ChangeNotifier {
   /// 记录完成事件（完成时间取事件时间，不是报告读取时间）。
   ///
   /// 注意：这里**只记事件**，不会写实际耗时、不会停止计时。
+  /// [atUtc] 由“到期自动完成”传入响应窗口结束时刻；普通完成取当前时钟。
   Future<TimerActionResult> recordTaskCompletion({
     required String conversationId,
     required String taskId,
     required String planVersionId,
     required int planRevision,
+    DateTime? atUtc,
   }) async {
     if (!await _ensureWritable('记录完成')) {
       return TimerActionResult(ok: false, message: _readOnlyNotice ?? '只读实例');
@@ -982,7 +994,7 @@ class TimerController extends ChangeNotifier {
       taskId: taskId,
       planVersionId: planVersionId,
       planRevision: planRevision,
-      completedAtUtc: clock.nowUtc,
+      completedAtUtc: atUtc ?? clock.nowUtc,
     );
     if (event == null) {
       return const TimerActionResult(ok: false, message: '任务 id 为空，未记录完成事件');
@@ -1113,7 +1125,10 @@ class TimerController extends ChangeNotifier {
   }
 
   /// 关闭当前未闭区间并写进记录；返回本段时长（闭区间失败也返回估算）。
-  Duration? _closeOpenInterval() {
+  ///
+  /// [atUtc] 非空时把区间结束截断在该时刻（有效截止点）：只结算截止点之前真正
+  /// 计时的部分，晚到的等待时间不计入。
+  Duration? _closeOpenInterval({DateTime? atUtc}) {
     final active = _active;
     final startUtc = _openStartUtc;
     final startMono = _openStartMonotonic;
@@ -1121,7 +1136,15 @@ class TimerController extends ChangeNotifier {
     var duration = clock.monotonic - startMono;
     if (duration.isNegative) duration = Duration.zero;
     if (duration > maxSingleInterval) duration = maxSingleInterval;
-    final endUtc = startUtc.add(duration);
+    var endUtc = startUtc.add(duration);
+    if (atUtc != null && atUtc.isAfter(startUtc) && atUtc.isBefore(endUtc)) {
+      endUtc = atUtc.toUtc();
+      duration = endUtc.difference(startUtc);
+    }
+    if (duration.isNegative) {
+      duration = Duration.zero;
+      endUtc = startUtc;
+    }
     final record = ledger.recordById(active.recordId);
     if (record != null) {
       final interval = ExecutionInterval(
