@@ -11,11 +11,11 @@
 
 import 'dart:async';
 import 'dart:io';
-import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
+import '../ffi/native_gateway.dart';
 import '../model/calendar.dart';
 import '../model/display.dart';
 import '../model/session.dart';
@@ -23,11 +23,13 @@ import '../model/shortcuts.dart';
 import '../state/app_controller.dart';
 import '../state/execution/effort_review_service.dart';
 import '../state/execution/effort_stats.dart';
+import '../state/execution/execution_deadline.dart';
 import '../state/schedule/schedule_controller.dart';
 import '../state/schedule/schedule_expander.dart';
 import '../state/schedule/schedule_reminders.dart';
 import '../state/settings_controller.dart';
 import 'schedule/schedule_list_dialog.dart';
+import 'schedule/schedule_week_view.dart' show ScheduleTaskTime;
 import 'analysis/chunked_analysis_dialog.dart';
 import 'calendar_gantt.dart';
 import 'calendar_settings_dialog.dart';
@@ -251,11 +253,15 @@ class _AppShellState extends State<AppShell> {
     _window.onExecutionAwayChanged = _handleExecutionAway;
     // 原生关闭（标题栏 X、菜单退出、Alt+F4、任务栏关闭）统一走保存流程。
     _window.onCloseRequested = _handleWindowClose;
-    // 本地 OCR 的文件选择器：直接使用原生对话框；不可用时对话框会明确说明。
+    // 本地 OCR 的文件选择器：使用 OCR 专用原生筛选（PDF / PNG / JPG / JPEG），
+    // 与通用“添加材料”和 ICS 日历导入的筛选互不影响；不可用时对话框会明确说明。
     OcrFilePicker.defaultPick = () async {
       final gw = c.gateway;
       if (gw == null) return const <String>[];
-      return gw.pickTextFiles(title: '选择扫描 PDF 或图片（本地 OCR）');
+      return gw.pickTextFiles(
+        filter: PickFilter.ocr,
+        title: '选择扫描 PDF 或图片（本地 OCR）',
+      );
     };
     _window.attach().then((_) {
       if (!mounted) return;
@@ -1004,6 +1010,14 @@ class _AppShellState extends State<AppShell> {
                                       '${c.singleRequestInputBytes} 字节；点击发送将进入「分块分析」'
                                   : null,
                               onAddFile: _addFile,
+                              // 0.5.0 任务 07：材料处理入口移到“＋”菜单；可用性沿用
+                              // 旧顶部按钮的规则（无 OCR 服务/无会话/分块作业运行中→禁用）。
+                              onExtractText:
+                                  c.ocr != null ? _openOcrImport : null,
+                              onChunkedAnalysis: c.conversation != null &&
+                                      !c.chunkedAnalysisRunning
+                                  ? _openChunkedAnalysis
+                                  : null,
                               onRemoveAttachment: (id) => c.removeAttachment(id),
                               onDraftChanged: (text) => c.updateDraft(text),
                               enterToSend: s.prefs.sendOnEnter,
@@ -1149,6 +1163,8 @@ class _AppShellState extends State<AppShell> {
                                 canEdit: c.canEditPlan && run == null,
                                 reviewNotes: reviewNotes,
                                 showCompleted: s.prefs.showCompletedTasks,
+                                executionPendingTaskIds:
+                                    c.executionPendingTaskIds,
                                 filter: _taskFilter,
                                 query: _taskQuery,
                                 onFilter: (value) =>
@@ -1274,54 +1290,40 @@ class _AppShellState extends State<AppShell> {
     final middleSize = middleBox?.size ?? const Size(800, 600);
     final anchor = c.interaction.anchors[id];
 
-    final cardWidth = math.max(260.0, math.min(400.0, middleSize.width - 16));
-    double left;
-    double top;
+    // 锚点可能因列表滚动/窗口缩放/切换任务而过期：列表行是真实存在的
+    // RenderBox，每次构建都优先读它的实时位置，读不到才退回最近记录的锚点。
+    final liveListRect =
+        (anchor != null && anchor.view == 'list' && middleBox != null)
+            ? _liveTaskRowRect(id)
+            : null;
+    Rect? anchorLocal;
     if (anchor != null && middleBox != null) {
-      final localTopRight = middleBox.globalToLocal(anchor.rect.topRight);
-      final localTopLeft = middleBox.globalToLocal(anchor.rect.topLeft);
-      left = localTopRight.dx + 12;
-      if (left + cardWidth > middleSize.width - 8) {
-        final leftSide = localTopLeft.dx - cardWidth - 12;
-        left = leftSide >= 8 ? leftSide : (middleSize.width - cardWidth - 8);
-      }
-      top = localTopRight.dy - 8;
-      // Pinned detail stays inside the viewport even when its trigger scrolls away.
-      top = top.clamp(52.0, math.max(52.0, middleSize.height - 160));
-    } else {
-      left = middleSize.width - cardWidth - 16;
-      top = 16;
+      final globalRect = liveListRect ?? anchor.rect;
+      anchorLocal = middleBox.globalToLocal(globalRect.topLeft) & globalRect.size;
     }
-    left = left.clamp(8.0, (middleSize.width - cardWidth - 8).clamp(8.0, double.infinity));
-    /*
-     * Keep the card clear of the chart header (~46px) so the tree/gantt switch and the
-     * task counters stay clickable while a detail is pinned. A floating card that
-     * covers the controls it describes would be worse than no card.
-     */
-    const headerZone = 52.0;
-    final maxTop = (middleSize.height - 120).clamp(headerZone, double.infinity);
-    top = top.clamp(headerZone, maxTop);
 
     /*
-     * Height is derived from the top we actually placed the card at, so the card can
-     * never overhang the bottom of the chart area (it used to spill into the notes
-     * strip). It is also capped relative to the pane so a long detail does not fill the
-     * whole chart: the body scrolls instead.
+     * 高度上限 = min(480, 内容区可用高度)，并预留主题内边距；首行/上半区向下
+     * 展开，末行/下半区先把整卡平移进视口再收缩可用高度（见
+     * computeDetailPopupGeometry）。标题/关闭与固定操作区因此始终可达。
      */
-    final availableBelow = middleSize.height - top - 12;
-    final heightCap = middleSize.height * 0.72;
-    final cardMaxHeight =
-        math.min(availableBelow, math.max(180.0, heightCap)).clamp(160.0, 900.0);
+    final geometry = computeDetailPopupGeometry(
+      viewport: middleSize,
+      anchor: anchorLocal,
+    );
+    // 滚动列表不会重建本层：下一帧再核对一次真实行位置，变化时更新锚点。
+    _scheduleDetailAnchorSync();
 
     return Positioned(
-      left: left,
-      top: top,
+      left: geometry.left,
+      top: geometry.top,
+      bottom: geometry.bottom,
       child: SizedBox(
-        width: cardWidth,
+        width: geometry.width,
         child: TaskDetailCard(
           task: task,
           interaction: c.interaction,
-          maxHeight: cardMaxHeight,
+          maxHeight: geometry.maxHeight,
           pinned: c.interaction.pinned,
           canEdit: c.canEditPlan,
           onEdit: () => _editTask(task, snapshot),
@@ -1330,6 +1332,56 @@ class _AppShellState extends State<AppShell> {
         ),
       ),
     );
+  }
+
+  bool _detailAnchorSyncScheduled = false;
+
+  /// 详情浮窗打开时，滚动任务列表不会触发本 State 重建；在每一帧之后读取任务行
+  /// 的真实位置并在变化时更新锚点，使浮窗跟随行移动且始终关联正确任务。
+  ///
+  /// 这里只登记 post-frame 回调、不主动安排新帧：滚动/动画帧到来时核对一次，
+  /// 没有帧时静默等待，因此不会让 `pumpAndSettle` 或空闲态空转。
+  void _scheduleDetailAnchorSync() {
+    if (_detailAnchorSyncScheduled) return;
+    _detailAnchorSyncScheduled = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _detailAnchorSyncScheduled = false;
+      if (!mounted) return;
+      final id = c.interaction.detailTaskId;
+      if (id == null) return;
+      final anchor = c.interaction.anchors[id];
+      if (anchor == null || anchor.view != 'list') return;
+      final rect = _liveTaskRowRect(id);
+      if (rect != null && rect != anchor.rect) {
+        c.interaction.setAnchor(id, rect, view: 'list');
+        // setAnchor 会触发重建，重建时再登记下一帧的核对。
+        return;
+      }
+      _scheduleDetailAnchorSync();
+    });
+  }
+
+  /// 找到任务清单里该任务行的实时全局矩形（滚动/缩放后锚点会过期）。
+  Rect? _liveTaskRowRect(String id) {
+    Rect? result;
+    void visit(Element element) {
+      if (result != null) return;
+      final widget = element.widget;
+      if (widget is TaskRow && widget.task.id == id) {
+        final renderObject = element.renderObject;
+        if (renderObject is RenderBox &&
+            renderObject.hasSize &&
+            renderObject.attached) {
+          result = renderObject.localToGlobal(Offset.zero) & renderObject.size;
+        }
+        return;
+      }
+      element.visitChildren(visit);
+    }
+
+    final root = context as Element;
+    root.visitChildren(visit);
+    return result;
   }
 
   Future<void> _editTask(DisplayTask view, DisplaySnapshot snapshot) async {
@@ -1485,7 +1537,85 @@ class _AppShellState extends State<AppShell> {
       conversations: _scheduleConversations(),
       currentConversationId: c.conversation?.id,
       onOpenConversation: (id) => c.openConversation(id),
+      taskTimes: _scheduleTaskTimes(),
+      loadConversationTasks: _loadScheduleConversationTasks,
+      onOpenTask: _openScheduleLinkedTask,
     );
+    if (mounted) _rootFocus.requestFocus();
+  }
+
+  /// 当前甘特排程的任务时段（只读叠加到日程周视图，不写入日程、不参与占用）。
+  List<ScheduleTaskTime> _scheduleTaskTimes() {
+    final schedule = c.currentCalendarSchedule;
+    final version = c.viewVersion;
+    if (schedule == null || version == null) return const <ScheduleTaskTime>[];
+    final names = <String, String>{
+      for (final task in version.plan.tasks) task.id: task.name,
+    };
+    final out = <ScheduleTaskTime>[];
+    for (final segment in schedule.segments) {
+      final title = names[segment.taskId];
+      // 任务已被删除的片段不画：避免出现无法定位的孤立时段。
+      if (title == null) continue;
+      out.add(ScheduleTaskTime(
+        taskId: segment.taskId,
+        title: title,
+        startUtc: segment.start,
+        endUtc: segment.end,
+        tentative: segment.tentative,
+      ));
+    }
+    return out;
+  }
+
+  /// 只读加载某会话当前版本的任务，供日程“关联任务”选择器使用。
+  ///
+  /// 会话不存在/读取失败时返回空列表，不抛异常打断弹窗。
+  Future<List<ScheduleTaskOption>> _loadScheduleConversationTasks(
+    String conversationId,
+  ) async {
+    try {
+      final current = c.conversation;
+      final conversation = current != null && current.id == conversationId
+          ? current
+          : await c.store.loadConversation(conversationId);
+      final version = conversation?.currentVersion;
+      if (version == null) return const <ScheduleTaskOption>[];
+      return <ScheduleTaskOption>[
+        for (final task in version.plan.tasks)
+          ScheduleTaskOption(
+            id: task.id,
+            title: task.name,
+            done: task.isDone,
+          ),
+      ];
+    } catch (_) {
+      return const <ScheduleTaskOption>[];
+    }
+  }
+
+  /// 打开日程关联任务：切到关联会话后按稳定 ID 定位任务浮窗。
+  ///
+  /// 任务已删除或会话失效时只给出可恢复提示，绝不按同名任务误跳。
+  Future<void> _openScheduleLinkedTask(
+    String conversationId,
+    ScheduleTaskOption task,
+  ) async {
+    if (c.conversation?.id != conversationId) {
+      try {
+        await c.openConversation(conversationId);
+      } catch (_) {
+        _showSnack('关联会话不可用，无法打开关联任务');
+        return;
+      }
+    }
+    final exists = c.viewVersion?.plan.taskById(task.id) != null;
+    if (!exists) {
+      _showSnack('关联任务已不存在，无法定位');
+      return;
+    }
+    if (mounted) Navigator.of(context).pop();
+    c.interaction.selectAndReveal(task.id);
     if (mounted) _rootFocus.requestFocus();
   }
 
@@ -1661,7 +1791,11 @@ class _AppShellState extends State<AppShell> {
   /// that succeeded.
   // --------------------------------------------- execution (0.2.3 R3-E/R3-R)
 
-  /// 常驻执行状态区：左侧是当前计时任务（空闲时也保留入口），右侧是工时回顾。
+  /// 常驻执行状态区：左侧是当前计时任务（空闲时也保留入口），最右固定“工时回顾”。
+  ///
+  /// 0.5.0 任务 07：顶部旧“分块分析”“OCR”按钮已移入输入区“＋”菜单，这里只保留
+  /// “回顾”。计时/暂停/结束等执行操作与“回顾”之间用主题竖线分隔：左侧属于当前执行，
+  /// 右侧是跨任务的回顾入口，空闲与计时中都可用。
   Widget _buildExecutionStatusArea() {
     final timer = c.executionTimer!;
     return Row(
@@ -1669,51 +1803,39 @@ class _AppShellState extends State<AppShell> {
         Expanded(
           child: ExecutionStatusStrip(
             controller: timer,
+            // 任务 13：截止/待处理/前台等价操作与“延长时间/结束任务”由状态条内部
+            // 渲染；这里只接入控制器与“打开对应任务”的导航。
+            deadline: c.executionDeadline,
+            onOpenDeadlineTask: c.executionDeadline == null
+                ? null
+                : (session) => c.openExecutionTask(
+                      session.conversationId,
+                      session.taskId,
+                    ),
             showWhenIdle: true,
             onOpenTask: _openActiveTimerTask,
           ),
         ),
+        // 主题分隔（回顾固定最右，与暂停/结束分开）。
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 8),
+          child: Container(
+            key: const Key('execution-status-review-divider'),
+            width: 1,
+            height: 18,
+            color: TsColors.border,
+          ),
+        ),
         Tooltip(
-          message: '工时回顾与 CSV 导出',
+          message: '工时回顾',
           child: TextButton.icon(
             key: const Key('open-effort-review'),
             onPressed: _openEffortReview,
             icon: const Icon(Icons.assessment_outlined, size: 14),
             label: const Text('回顾', style: TextStyle(fontSize: 11.5)),
-            style: TextButton.styleFrom(
-              visualDensity: VisualDensity.compact,
-              padding: const EdgeInsets.symmetric(horizontal: 8),
-            ),
+            style: TsButtons.inline(fontSize: 11.5),
           ),
         ),
-        if (c.conversation != null && !c.isRunning && !c.chunkedAnalysisRunning)
-          Tooltip(
-            message: '超大材料分块分析（多次模型请求，费用未知）',
-            child: TextButton.icon(
-              key: const Key('open-chunked-analysis'),
-              onPressed: _openChunkedAnalysis,
-              icon: const Icon(Icons.call_split, size: 14),
-              label: const Text('分块分析', style: TextStyle(fontSize: 11.5)),
-              style: TextButton.styleFrom(
-                visualDensity: VisualDensity.compact,
-                padding: const EdgeInsets.symmetric(horizontal: 8),
-              ),
-            ),
-          ),
-        if (c.ocr != null && !c.isRunning)
-          Tooltip(
-            message: '扫描 PDF / 图片：本地离线 OCR，识别后可校对',
-            child: TextButton.icon(
-              key: const Key('open-ocr-import'),
-              onPressed: _openOcrImport,
-              icon: const Icon(Icons.document_scanner_outlined, size: 14),
-              label: const Text('OCR', style: TextStyle(fontSize: 11.5)),
-              style: TextButton.styleFrom(
-                visualDensity: VisualDensity.compact,
-                padding: const EdgeInsets.symmetric(horizontal: 8),
-              ),
-            ),
-          ),
       ],
     );
   }
@@ -1797,6 +1919,38 @@ class _AppShellState extends State<AppShell> {
       lines.add('剩余建议 ${formatEffortHours(effort.suggestedRemainingHours)}'
           '（建议值，未自动完成）');
     }
+    final deadlineController = c.executionDeadline;
+    final session = deadlineController?.sessionForTask(
+      ref.conversationId,
+      ref.taskId,
+    );
+    final effectiveDeadline = c.executionDeadlineForTask(task.id);
+    String clock(DateTime utc) =>
+        formatWallClockLabel(timer.localTime.toLocal(utc.toUtc()));
+    if (session != null) {
+      switch (session.stage) {
+        case ExecutionDeadlineStage.pending:
+          lines.add('计划时段已结束，任务待处理（等待时间不计入工时）');
+        case ExecutionDeadlineStage.secondReminder:
+          final at = session.responseWindowEndsAtUtc;
+          lines.add(at == null
+              ? '再次提醒已发出；未回应将按截止自动完成'
+              : '请在 ${clock(at)} 前选择，届时将自动完成');
+        case ExecutionDeadlineStage.completed:
+          final at = session.completedAtUtc;
+          lines.add(session.completionSource == 'auto' && at != null
+              ? '已于 ${clock(at)} 按截止自动完成'
+              : '本次执行已结束');
+        case ExecutionDeadlineStage.cancelled:
+          lines.add('本次执行已取消（任务未完成）');
+        case ExecutionDeadlineStage.scheduled:
+          lines.add(effectiveDeadline == null
+              ? '当前没有生效截止（仅有日期或尚无排程时不猜时刻）'
+              : '有效截止：${clock(effectiveDeadline)}（甘特最后一段结束）');
+      }
+    } else if (effectiveDeadline != null) {
+      lines.add('有效截止：${clock(effectiveDeadline)}（甘特最后一段结束）');
+    }
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -1813,6 +1967,7 @@ class _AppShellState extends State<AppShell> {
         ExecutionActions(
           controller: timer,
           taskRef: ref,
+          deadline: deadlineController,
           done: task.status == 'done',
           onToggleCompletion: () async {
             await c.toggleCompletion(task.id);
@@ -1835,6 +1990,8 @@ class _AppShellState extends State<AppShell> {
       service: EffortReviewService(ledger: timer.ledger),
       tasks: tasks,
       conversations: conversations,
+      // 执行截止账本里“到期自动完成”的任务：回顾里显示对应徽标（不改任何耗时口径）。
+      autoCompletedTaskIds: c.executionAutoCompletedTaskIds,
       onExport: _exportReviewCsv,
     );
   }

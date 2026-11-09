@@ -104,6 +104,9 @@ class ConflictSnapshot {
 }
 
 /// 冲突详情对话框：解释 + 定位 + 建议（预览/提交带版本校验）。
+///
+/// [onLocate] 是真正的“在甘特图中定位”入口；[onOpenTimetable] 是“修改时间表”
+/// 的手动入口（可选，没有时退回定位入口）。两者都只读，不改数据。
 Future<void> showConflictDetailsDialog(
   BuildContext context, {
   required ConflictDetail detail,
@@ -112,6 +115,7 @@ Future<void> showConflictDetailsDialog(
   required Future<bool> Function(CalendarEditOutcome outcome) commit,
   bool canEdit = true,
   VoidCallback? onLocate,
+  VoidCallback? onOpenTimetable,
 }) {
   return showDialog<void>(
     context: context,
@@ -122,6 +126,7 @@ Future<void> showConflictDetailsDialog(
       commit: commit,
       canEdit: canEdit,
       onLocate: onLocate,
+      onOpenTimetable: onOpenTimetable,
     ),
   );
 }
@@ -149,6 +154,7 @@ class _ConflictDetailsDialog extends StatefulWidget {
   final Future<bool> Function(CalendarEditOutcome outcome) commit;
   final bool canEdit;
   final VoidCallback? onLocate;
+  final VoidCallback? onOpenTimetable;
 
   const _ConflictDetailsDialog({
     required this.detail,
@@ -157,6 +163,7 @@ class _ConflictDetailsDialog extends StatefulWidget {
     required this.commit,
     required this.canEdit,
     this.onLocate,
+    this.onOpenTimetable,
   });
 
   @override
@@ -242,6 +249,23 @@ class _ConflictDetailsDialogState extends State<_ConflictDetailsDialog> {
       _errorMessage = null;
       _staleMessage = null;
     });
+    // 危险/过期建议不能误应用：提交前再确认“这条冲突在当前快照里仍存在”。
+    final freshDetails = explainConflicts(
+      schedule: _snapshot.schedule,
+      tasks: _snapshot.tasks,
+      now: _snapshot.now,
+      taskNames: _snapshot.taskNames,
+    );
+    final stillExists = freshDetails
+        .any((d) => sameConflict(d.conflict, widget.detail.conflict));
+    if (!stillExists) {
+      setState(() {
+        _busy = false;
+        _staleMessage = '该冲突已不存在（数据已变化），建议已失效；不会应用过期建议。';
+        _recompute();
+      });
+      return;
+    }
     final outcome = CalendarEditOutcome(
       schedule: scheduleAfter,
       label: '应用冲突建议：${suggestion.kind.label}',
@@ -317,39 +341,41 @@ class _ConflictDetailsDialogState extends State<_ConflictDetailsDialog> {
                   text: '当前是历史版本/运行中，只能查看解释与建议，不能应用。',
                   tone: TsColors.textSecondary,
                 ),
-              const SizedBox(height: 6),
-              Text(
-                '冲突允许保存：建议只是可选的调整，不会偷偷删除冲突或强制推迟其他任务。',
-                key: const Key('conflict-allow-save-note'),
-                style: TextStyle(
-                  fontSize: 10.5,
-                  height: 1.5,
-                  color: TsColors.textFaint,
-                ),
-              ),
             ],
           ),
         ),
       ),
+      actionsPadding: EdgeInsets.zero,
       actions: [
-        if (detail != null && widget.onLocate != null)
-          TextButton(
-            key: const Key('conflict-detail-locate'),
-            onPressed: () {
-              widget.onLocate!.call();
-              Navigator.of(context).pop();
-            },
-            child: const Text('在甘特图中定位'),
-          ),
-        TextButton(
-          key: const Key('conflict-detail-close'),
-          onPressed: () => Navigator.of(context).pop(),
-          child: const Text('关闭'),
+        TsDialogActions(
+          actions: [
+            if (detail != null && widget.onLocate != null)
+              TsDialogAction(
+                key: const Key('conflict-detail-locate'),
+                label: '在甘特图中定位',
+                role: TsDialogActionRole.primary,
+                autofocus: true,
+                onPressed: () {
+                  widget.onLocate!.call();
+                  // 只关闭最上层这个对话框，不碰其它路由。
+                  Navigator.of(context).pop();
+                },
+              ),
+            TsDialogAction(
+              key: const Key('conflict-detail-close'),
+              label: '关闭',
+              role: TsDialogActionRole.secondary,
+              onPressed: () => Navigator.of(context).pop(),
+            ),
+          ],
         ),
       ],
     );
   }
 
+  /// 绿色区域：只保留一份可读明细（任务/区间/约束/剩余需求/容量/版本）。
+  ///
+  /// 不再重复一段灰色“解释”：同一事实只写一次；来源作为短标签放在标题行。
   List<Widget> _detailSection(ConflictDetail detail, WallClock clock) {
     final blocking = detail.conflict.kind.isBlocking;
     final remaining = detail.remainingNeedMinutes;
@@ -402,7 +428,7 @@ class _ConflictDetailsDialogState extends State<_ConflictDetailsDialog> {
       ),
       _detailRow(
         '违反的约束',
-        '${detail.conflict.kind.label}：${detail.conflict.message}',
+        detail.conflict.message,
         key: const Key('conflict-detail-message'),
       ),
       _detailRow(
@@ -413,7 +439,7 @@ class _ConflictDetailsDialogState extends State<_ConflictDetailsDialog> {
       _detailRow(
         '同快照可用容量',
         '${formatDurationMinutes(detail.availableCapacityMinutes ?? 0)}'
-            '（可用时间表减去所有已排片段，同一快照计算）',
+            '（可用时间表减去全部已排片段）',
         key: const Key('conflict-detail-capacity'),
       ),
       _detailRow(
@@ -421,62 +447,39 @@ class _ConflictDetailsDialogState extends State<_ConflictDetailsDialog> {
         '${_snapshot.stamp.label} · 排程签名已记录',
         key: const Key('conflict-detail-version'),
       ),
-      const SizedBox(height: 6),
-      Container(
-        width: double.infinity,
-        padding: const EdgeInsets.all(8),
-        decoration: bezierDecoration(color: TsColors.background, radius: 8),
-        child: Text(
-          detail.explanation,
-          key: const Key('conflict-detail-explanation'),
-          style: TextStyle(
-            fontSize: 11,
-            height: 1.6,
-            color: TsColors.textSecondary,
-          ),
-        ),
-      ),
-      if (detail.source.requiresUserAction)
-        Text(
-          '这一来源只能由你在时间表/任务上明确调整：程序不会自动挪动用户占用、'
-          '其他任务预留或已完成任务的历史安排。',
-          style: TextStyle(
-            fontSize: 10.5,
-            height: 1.5,
-            color: TsColors.textFaint,
-          ),
-        ),
       const SizedBox(height: 8),
     ];
   }
 
+  /// 黄色区域：只写简短原因或具体动作及影响，不再夹带叙述性说明。
   Widget _suggestionsSection(ConflictDetail detail) {
     final hasAutomatic =
         _suggestions.any((s) => s.kind.appliesSchedule && s.canApply);
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        Text(
-          '调整建议（本地确定性生成，已用同一套冲突检测重新校验）',
-          key: const Key('conflict-suggestions-title'),
-          style: TextStyle(
-            fontSize: 12,
-            fontWeight: FontWeight.w600,
-            color: TsColors.textPrimary,
-          ),
+        Row(
+          children: [
+            Text(
+              '调整建议',
+              key: const Key('conflict-suggestions-title'),
+              style: TextStyle(
+                fontSize: 12,
+                fontWeight: FontWeight.w600,
+                color: TsColors.textPrimary,
+              ),
+            ),
+            const SizedBox(width: 8),
+            if (hasAutomatic)
+              Text(
+                '以下动作可直接应用，应用前会再次核对版本',
+                key: const Key('conflict-suggestions-hint'),
+                style:
+                    TextStyle(fontSize: 10.5, color: TsColors.textFaint),
+              ),
+          ],
         ),
         const SizedBox(height: 6),
-        if (!hasAutomatic)
-          Text(
-            '没有可自动应用的可行建议：下面列出原因与手动入口，保持现状也是允许的。',
-            key: const Key('conflict-no-auto-suggestion'),
-            style: TextStyle(
-              fontSize: 11,
-              height: 1.5,
-              color: TsColors.textSecondary,
-            ),
-          ),
-        const SizedBox(height: 4),
         for (final suggestion in _suggestions) _suggestionCard(suggestion),
       ],
     );
@@ -485,10 +488,13 @@ class _ConflictDetailsDialogState extends State<_ConflictDetailsDialog> {
   Widget _suggestionCard(ConflictSuggestion suggestion) {
     final automatic = suggestion.kind.appliesSchedule && suggestion.canApply;
     final tone = suggestion.kind == SuggestionKind.none
-        ? TsColors.textSecondary
+        ? TsColors.pending
         : automatic
             ? TsColors.ready
             : TsColors.pending;
+    final manual = !automatic &&
+        (suggestion.kind == SuggestionKind.none ||
+            suggestion.kind == SuggestionKind.openTimetable);
     return Container(
       key: Key('conflict-suggestion-${suggestion.kind.name}'),
       width: double.infinity,
@@ -610,6 +616,33 @@ class _ConflictDetailsDialogState extends State<_ConflictDetailsDialog> {
                 ),
               ],
             ),
+          ],
+          if (manual && widget.canEdit) ...[
+            const SizedBox(height: 6),
+            if (widget.onOpenTimetable != null)
+              OutlinedButton.icon(
+                key: Key(
+                    'conflict-suggestion-${suggestion.kind.name}-manual-entry'),
+                style: TsButtons.outline(radius: 8, height: 28, fontSize: 11.5),
+                onPressed: () {
+                  widget.onOpenTimetable!.call();
+                  Navigator.of(context).pop();
+                },
+                icon: const Icon(Icons.schedule_outlined, size: 14),
+                label: const Text('打开时间表调整'),
+              )
+            else if (widget.onLocate != null)
+              OutlinedButton.icon(
+                key: Key(
+                    'conflict-suggestion-${suggestion.kind.name}-manual-entry'),
+                style: TsButtons.outline(radius: 8, height: 28, fontSize: 11.5),
+                onPressed: () {
+                  widget.onLocate!.call();
+                  Navigator.of(context).pop();
+                },
+                icon: const Icon(Icons.open_with, size: 14),
+                label: const Text('在甘特图中手动调整'),
+              ),
           ],
         ],
       ),

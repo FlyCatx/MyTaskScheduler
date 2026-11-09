@@ -29,6 +29,10 @@ class TaskListView extends StatelessWidget {
   /// counts still see every task — hiding a row must not change the plan itself.
   final bool showCompleted;
 
+  /// 执行截止已到点、等待“延长/结束”的任务 id；只在行内加一个紧凑角标，
+  /// 不改完成状态、不加宽布局（有角标时 Wrap 自动换行）。
+  final Set<String> executionPendingTaskIds;
+
   final TaskFilter filter;
   final String query;
   final ValueChanged<TaskFilter> onFilter;
@@ -44,6 +48,7 @@ class TaskListView extends StatelessWidget {
     required this.onConfirmReview,
     required this.onSelect,
     this.showCompleted = true,
+    this.executionPendingTaskIds = const <String>{},
     this.filter = TaskFilter.all,
     this.query = '',
     this.onFilter = _noopFilter,
@@ -150,6 +155,8 @@ class TaskListView extends StatelessWidget {
                       canEdit: canEdit,
                       reviewNote: reviewNotes[task.id],
                       temporaryReveal: temporary,
+                      executionPending:
+                          executionPendingTaskIds.contains(task.id),
                       onTap: () {
                         interaction.selectAndReveal(task.id, view: 'list');
                         onSelect(task.id);
@@ -333,6 +340,9 @@ class TaskRow extends StatefulWidget {
   final TaskInteraction interaction;
   final bool temporaryReveal;
 
+  /// 执行截止已到点（待处理/二次提醒），行内显示“待处理”角标。
+  final bool executionPending;
+
   const TaskRow({
     super.key,
     required this.task,
@@ -345,6 +355,7 @@ class TaskRow extends StatefulWidget {
     required this.onConfirmReview,
     required this.interaction,
     this.temporaryReveal = false,
+    this.executionPending = false,
   });
 
   @override
@@ -491,6 +502,24 @@ class _TaskRowState extends State<TaskRow> {
                               style: TextStyle(
                                   fontSize: 11, color: TsColors.textFaint),
                             ),
+                          if (widget.executionPending)
+                            Tooltip(
+                              message: '计划时段已结束，等待延长或结束任务'
+                                  '（等待时间不计入实际耗时）',
+                              child: Container(
+                                key: Key('task-execution-pending-${task.id}'),
+                                padding: const EdgeInsets.symmetric(
+                                    horizontal: 5, vertical: 1),
+                                decoration: bezierDecoration(
+                                  color: TsColors.pendingSoft,
+                                  radius: 4,
+                                ),
+                                child: Text('待处理',
+                                    style: TextStyle(
+                                        fontSize: 10,
+                                        color: TsColors.pending)),
+                              ),
+                            ),
                           if (widget.temporaryReveal)
                             Container(
                               key: const Key('task-temporary-reveal'),
@@ -570,4 +599,3 @@ class _ReviewBanner extends StatelessWidget {
     );
   }
 }
-

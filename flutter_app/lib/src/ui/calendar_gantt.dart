@@ -243,8 +243,45 @@ class _CalendarGanttViewState extends State<CalendarGanttView> {
       if (!mounted) return;
       setState(() => _now = widget.clock ?? DateTime.now());
     });
+    // 公开定位能力：任何持有 TaskInteraction 的调用方（冲突弹窗、执行状态条）
+    // 调用 selectAndReveal(taskId) 时，甘特图滚动到该任务并闪一下片段；
+    // 只读定位，不修改排程/冲突数据。
+    widget.interaction.registerRevealer(_revealTask);
     WidgetsBinding.instance.addPostFrameCallback((_) => _ensureReady());
     if (!_initialScrollPlanned) _planInitialScroll();
+  }
+
+  /// 把任务滚动到可见位置并短暂高亮其片段（[TaskInteraction] 的 revealer 实现）。
+  void _revealTask(String taskId) {
+    if (!mounted) return;
+    final rows = _buildRows();
+    final row = rows.where((r) => !r.isCaption && r.task?.id == taskId);
+    if (row.isEmpty) return;
+    final segments = widget.schedule.forTask(taskId);
+    if (segments.isNotEmpty && _horizontal.hasClients) {
+      final first = segments
+          .map((segment) => segment.start)
+          .reduce((a, b) => a.isBefore(b) ? a : b);
+      final target = (_xFor(first) - 120).clamp(
+        0.0,
+        _horizontal.position.maxScrollExtent,
+      );
+      _horizontal.animateTo(target,
+          duration: const Duration(milliseconds: 240), curve: Curves.easeOut);
+      setState(() {
+        _flashSegmentId = segments.first.id;
+        _flashUntil = DateTime.now().add(const Duration(seconds: 2));
+      });
+      _flashTimer?.cancel();
+      _flashTimer = Timer(const Duration(seconds: 2), () {
+        if (mounted) setState(() => _flashSegmentId = null);
+      });
+    }
+    final ctx = _labels[taskId]?.currentContext;
+    if (ctx != null) {
+      Scrollable.ensureVisible(ctx,
+          duration: const Duration(milliseconds: 240), alignment: 0.35);
+    }
   }
 
   bool _initialScrollPlanned = false;
@@ -310,6 +347,7 @@ class _CalendarGanttViewState extends State<CalendarGanttView> {
 
   @override
   void dispose() {
+    widget.interaction.unregisterRevealer(_revealTask);
     _autoScroll?.cancel();
     _nowTimer?.cancel();
     _flashTimer?.cancel();

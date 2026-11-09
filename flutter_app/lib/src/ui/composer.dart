@@ -24,12 +24,18 @@ import 'package:flutter/services.dart';
 
 import '../model/session.dart';
 import '../model/shortcuts.dart';
+import './widgets/bezier_menu.dart';
 import './widgets/bezier_ui.dart';
 import 'theme.dart';
 
 /// Fixed number of visible text lines. Kept in one place so the shell can reserve the
 /// matching footer height.
 const int kComposerTextLines = 4;
+
+/// What the composer “＋” menu can start. The first entry is the historical add-file
+/// action; the two material-processing entries were moved here from the top status
+/// strip (0.5.0 task 07) and keep their original business flows.
+enum ComposerAddAction { addMaterial, extractText, chunkedAnalysis }
 
 /// The bottom band that hosts the composer. Exposed so the shell and the tests can
 /// refer to the same element when checking that it lines up with the sidebar footer.
@@ -59,6 +65,14 @@ class Composer extends StatefulWidget {
   final void Function(String id) onRemoveAttachment;
   final void Function(String text) onDraftChanged;
 
+  /// 0.5.0 task 07: “从 PDF / 图片提取文字”（06 的 picker 与校对流程）。null = 本地
+  /// OCR 未启用，菜单项显示为禁用态，不改变其它入口。
+  final VoidCallback? onExtractText;
+
+  /// 0.5.0 task 07: 手动“分块分析”入口；复用既有预估/确认流程。null = 当前不可用
+  /// （没有会话或分块作业正在运行），菜单项显示为禁用态。
+  final VoidCallback? onChunkedAnalysis;
+
   /// When true, a plain Enter sends and Shift+Enter inserts a newline.
   /// Ctrl+Enter always sends (kept as the documented default shortcut).
   final bool enterToSend;
@@ -80,7 +94,7 @@ class Composer extends StatefulWidget {
   final bool useCustomBindings;
   final KeyChord? sendChord;
 
-  /// 0.3.0（提示词 06）：材料超过单次请求上限时的常驻说明（含“用分块分析发送”
+  /// 材料超过单次请求上限时的常驻说明（含“用分块分析发送”
   /// 的可执行提示）。null = 材料在预算内，不占空间。
   final String? materialNotice;
 
@@ -94,6 +108,8 @@ class Composer extends StatefulWidget {
     required this.onAddFile,
     required this.onRemoveAttachment,
     required this.onDraftChanged,
+    this.onExtractText,
+    this.onChunkedAnalysis,
     this.enterToSend = false,
     this.modelLabel,
     this.onModelTap,
@@ -295,11 +311,21 @@ class _ComposerState extends State<Composer> {
         : '$sendHint 发送';
     return Row(
       children: [
-        Tooltip(
-          message: widget.running ? '分析进行中，暂不能添加文件' : '添加材料（TXT / MD / PDF / DOCX / PPTX，系统对话框）',
-          child: _IconSquare(
-            icon: Icons.add,
-            onTap: enabled ? widget.onAddFile : null,
+        // “＋” is a menu, not a bare file picker (0.5.0 task 07): 添加材料 keeps the
+        // old native dialog; the two material-processing entries keep their original
+        // business flows and availability. The trigger owns focus and returns it after
+        // the menu closes, so Tab continues from here.
+        BezierMenuTrigger<ComposerAddAction>(
+          key: const Key('composer-add-menu'),
+          tooltip: widget.running ? '分析进行中，暂不能处理材料' : '添加材料或导入文字',
+          enabled: enabled,
+          menuWidth: 248,
+          items: _addMenuItems(),
+          onSelected: _handleAddAction,
+          childBuilder: (context, open, focused) => _PlusTile(
+            open: open,
+            focused: focused,
+            enabled: enabled,
           ),
         ),
         if (widget.onOpenTimetable != null) ...[
@@ -379,6 +405,46 @@ class _ComposerState extends State<Composer> {
       ],
     );
   }
+
+  /// The “＋” menu. Order matters: 添加材料 keeps the old file dialog; the two
+  /// material-processing actions follow, with 从 PDF / 图片提取文字 above 分块分析
+  /// (0.5.0 task 07). Unavailable actions stay visible but disabled, so the menu keeps
+  /// one stable shape and the user can see why an action is missing.
+  List<BezierMenuItem<ComposerAddAction>> _addMenuItems() {
+    return <BezierMenuItem<ComposerAddAction>>[
+      const BezierMenuItem<ComposerAddAction>(
+        value: ComposerAddAction.addMaterial,
+        label: '添加材料',
+        icon: Icons.attach_file,
+      ),
+      BezierMenuItem<ComposerAddAction>(
+        value: ComposerAddAction.extractText,
+        label: '从 PDF / 图片提取文字',
+        icon: Icons.document_scanner_outlined,
+        enabled: widget.onExtractText != null,
+        dividerBefore: true,
+      ),
+      BezierMenuItem<ComposerAddAction>(
+        value: ComposerAddAction.chunkedAnalysis,
+        label: '分块分析',
+        icon: Icons.call_split,
+        enabled: widget.onChunkedAnalysis != null,
+      ),
+    ];
+  }
+
+  /// The menu reports its pick after it has closed, so one pick opens at most one
+  /// target window; every branch delegates to the shell’s existing business action.
+  void _handleAddAction(ComposerAddAction action) {
+    switch (action) {
+      case ComposerAddAction.addMaterial:
+        widget.onAddFile();
+      case ComposerAddAction.extractText:
+        widget.onExtractText?.call();
+      case ComposerAddAction.chunkedAnalysis:
+        widget.onChunkedAnalysis?.call();
+    }
+  }
 }
 
 /// Blue, link-styled file entry (icon + name). Clicking the x removes it.
@@ -451,6 +517,64 @@ class _IconSquare extends StatelessWidget {
             size: 18,
             color: enabled ? TsColors.onButton : TsColors.onButtonDisabled,
           ),
+        ),
+      ),
+    );
+  }
+}
+
+/// The “＋” tile. It is a pure visual: the surrounding [BezierMenuTrigger] owns the
+/// tap, focus and keyboard handling. Default / hover / open / focus / disabled states
+/// all come from the shared button tokens, so it reads like the other solid buttons.
+class _PlusTile extends StatefulWidget {
+  final bool open;
+  final bool focused;
+  final bool enabled;
+
+  const _PlusTile({
+    required this.open,
+    required this.focused,
+    required this.enabled,
+  });
+
+  @override
+  State<_PlusTile> createState() => _PlusTileState();
+}
+
+class _PlusTileState extends State<_PlusTile> {
+  bool _hover = false;
+
+  @override
+  Widget build(BuildContext context) {
+    final enabled = widget.enabled;
+    final Color fill;
+    if (!enabled) {
+      fill = TsColors.buttonDisabledFill;
+    } else if (widget.open) {
+      fill = TsColors.buttonFillPressed;
+    } else if (_hover || widget.focused) {
+      fill = TsColors.buttonFillHover;
+    } else {
+      fill = TsColors.buttonFill;
+    }
+    return MouseRegion(
+      cursor: enabled ? SystemMouseCursors.click : SystemMouseCursors.basic,
+      onEnter: (_) => setState(() => _hover = true),
+      onExit: (_) => setState(() => _hover = false),
+      child: Container(
+        width: 32,
+        height: 32,
+        decoration: bezierDecoration(
+          color: fill,
+          radius: 9,
+          border: widget.focused
+              ? Border.all(color: TsColors.accent, width: 1.5)
+              : Border.all(color: Colors.transparent),
+        ),
+        child: Icon(
+          Icons.add,
+          size: 18,
+          color: enabled ? TsColors.onButton : TsColors.onButtonDisabled,
         ),
       ),
     );

@@ -7,8 +7,10 @@ import 'theme/values.dart';
 import 'widgets/bezier_ui.dart';
 
 export 'theme/buttons.dart';
+export 'theme/dialog_actions.dart';
 export 'theme/values.dart';
 export 'widgets/button_row.dart';
+export 'widgets/close_button.dart';
 export 'widgets/status_chip.dart';
 /// Builds the Material theme for an explicit brightness.
 ///
@@ -244,4 +246,3 @@ ThemeData buildAppTheme([Brightness brightness = Brightness.light]) {
     ),
   );
 }
-
