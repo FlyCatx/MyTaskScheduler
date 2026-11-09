@@ -1,33 +1,39 @@
-// 全局日程管理弹窗（0.4.0 任务 4）。
+// 全局日程弹窗（0.5.0 任务 09 + 11）：左侧紧凑月历 + 右侧一周七列时间轴。
 //
-// 范围（01 框架 §4、02 提示词任务 4）：
-//   * 默认显示当前周，可上一周/下一周/本周/输入日期跳转/日期选择器看远期日程；
-//   * 标题搜索、分类筛选、关联筛选只影响展示，绝不改变忙碌合成；
-//   * 列表项同时就是详情：时间/忙闲/重复/提醒/关联都可读，可编辑/删除/跳转会话；
-//   * 重复日程的编辑/删除先问“仅本次/整个系列”；单次删除写 exclusion，
-//     整个系列删除走 deleteEvent（expectedRevision 由控制器校验）；
-//   * 删除后用现有通知宿主提供受 revision 保护的撤销；
-//   * 只通过 ScheduleController 读写；会话列表与跳转由 AppShell 注入，不依赖 AppController。
+// 功能范围：
+//   * 保留右上关闭 ×（唯一关闭入口），去掉底部重复关闭/跳转教程/忙碌解释；
+//   * 日期标题可点击并复用共享年月日历（任务 03），替代“跳转输入 + 跳转按钮 +
+//     单独选日期”三个控件；分类、关联筛选使用统一菜单；有筛选条件且无结果显示
+//     “没有符合条件的日程”，本周确无显示“本周暂无日程”，浏览其他周用对应措辞；
+//   * 搜索/分类/关联/仅当前会话只影响展示，忙碌与排程避让仍来自全部有效占用
+//     （本弹窗不参与忙碌合成，也不另写一份日程存储）；
+//   * 点击空档预填日期时间；点击事件出详情；详情里可编辑/删除并停留在原周；
+//   * “显示任务时段”只读叠加当前甘特任务层，关闭只隐藏，不写入日程；
+//   * 重复日程的编辑/删除沿用既有“仅本次/整个系列”语义与受 revision 保护撤销。
 
 import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 
-import '../../model/calendar.dart' show parseDateKey;
 import '../../model/schedule_event.dart';
 import '../../state/ics/ics_timezones.dart' show IcsTimeZoneResolver;
 import '../../state/schedule/schedule_controller.dart';
 import '../../state/schedule/schedule_expander.dart';
 import '../theme.dart';
 import '../widgets/app_notice.dart';
+import '../widgets/bezier_menu.dart';
 import '../widgets/bezier_ui.dart';
+import '../widgets/date_range_picker.dart'
+    show formatDatePickerDate, showCalendarPopup;
+import 'schedule_detail_dialog.dart';
 import 'schedule_editor_dialog.dart';
+import 'schedule_week_view.dart';
 
 export 'schedule_editor_dialog.dart'
     show ScheduleConversationOption, ScheduleEditScope, ScheduleEditorOutcome,
-        ScheduleEditorDialog, showScheduleEditorDialog;
+        ScheduleEditorDialog, ScheduleTaskOption, showScheduleEditorDialog;
 
-/// 打开全局日程管理弹窗。
+/// 打开全局日程弹窗。
 Future<void> showScheduleListDialog(
   BuildContext context, {
   required ScheduleController controller,
@@ -38,6 +44,11 @@ Future<void> showScheduleListDialog(
   Future<void> Function(String conversationId)? onOpenConversation,
   String? currentConversationId,
   DateTime Function()? clock,
+  List<ScheduleTaskTime> taskTimes = const <ScheduleTaskTime>[],
+  Future<List<ScheduleTaskOption>> Function(String conversationId)?
+      loadConversationTasks,
+  Future<void> Function(String conversationId, ScheduleTaskOption task)?
+      onOpenTask,
 }) {
   return showDialog<void>(
     context: context,
@@ -49,6 +60,9 @@ Future<void> showScheduleListDialog(
       onOpenConversation: onOpenConversation,
       currentConversationId: currentConversationId,
       clock: clock,
+      taskTimes: taskTimes,
+      loadConversationTasks: loadConversationTasks,
+      onOpenTask: onOpenTask,
     ),
   );
 }
@@ -63,6 +77,9 @@ class ScheduleListDialog extends StatefulWidget {
     this.onOpenConversation,
     this.currentConversationId,
     this.clock,
+    this.taskTimes = const <ScheduleTaskTime>[],
+    this.loadConversationTasks,
+    this.onOpenTask,
   });
 
   final ScheduleController controller;
@@ -72,6 +89,11 @@ class ScheduleListDialog extends StatefulWidget {
   final Future<void> Function(String conversationId)? onOpenConversation;
   final String? currentConversationId;
   final DateTime Function()? clock;
+  final List<ScheduleTaskTime> taskTimes;
+  final Future<List<ScheduleTaskOption>> Function(String conversationId)?
+      loadConversationTasks;
+  final Future<void> Function(String conversationId, ScheduleTaskOption task)?
+      onOpenTask;
 
   @override
   State<ScheduleListDialog> createState() => _ScheduleListDialogState();
@@ -81,13 +103,17 @@ class _ScheduleListDialogState extends State<ScheduleListDialog> {
   late final DateTime Function() _clock = widget.clock ?? DateTime.now;
   final IcsTimeZoneResolver _resolver = IcsTimeZoneResolver();
   final TextEditingController _search = TextEditingController();
-  final TextEditingController _jump = TextEditingController();
 
+  /// 当前选中日期（定位周与高亮）。
   late DateTime _anchor;
+
+  /// 左侧月历当前月（当月 1 日）。
+  late DateTime _visibleMonth;
+
   String _categoryFilter = 'all';
   String _linkFilter = 'all';
   bool _onlyCurrent = false;
-  String? _jumpError;
+  bool _showTaskLayer = false;
 
   DateTime get _nowWall =>
       wallOf(_clock().toUtc(), widget.timezoneId) ?? _clock();
@@ -97,21 +123,23 @@ class _ScheduleListDialogState extends State<ScheduleListDialog> {
     super.initState();
     final wall = _nowWall;
     _anchor = DateTime(wall.year, wall.month, wall.day);
+    _visibleMonth = DateTime(wall.year, wall.month);
   }
 
   @override
   void dispose() {
     _search.dispose();
-    _jump.dispose();
     super.dispose();
   }
 
-  // --------------------------------------------------------------- 查询范围
+  // --------------------------------------------------------------- 范围查询
 
   DateTime _weekStartOf(DateTime date) {
     final offset = (date.weekday - widget.weekStartsOn + 7) % 7;
     return DateTime(date.year, date.month, date.day - offset);
   }
+
+  DateTime get _weekStart => _weekStartOf(_anchor);
 
   DateTime? _utcOfWall(DateTime wallDate) {
     final result = _resolver.resolveWall(
@@ -122,21 +150,27 @@ class _ScheduleListDialogState extends State<ScheduleListDialog> {
         DateTime.utc(wallDate.year, wallDate.month, wallDate.day);
   }
 
-  ScheduleExpansionResult _expansionFor(DateTime weekStart) {
-    final from = _utcOfWall(weekStart) ??
-        DateTime.utc(weekStart.year, weekStart.month, weekStart.day);
-    final endWall = weekStart.add(const Duration(days: 7));
-    final end = _utcOfWall(endWall) ??
-        DateTime.utc(endWall.year, endWall.month, endWall.day);
+  ScheduleExpansionResult _expansionFor(DateTime fromWall, DateTime toWallExclusive) {
+    final from = _utcOfWall(fromWall);
+    final to = _utcOfWall(toWallExclusive);
+    if (from == null || to == null) return ScheduleExpansionResult.empty;
     return widget.controller.occurrencesInRange(
       fromUtc: from,
-      // 排他边界减 1 秒：当周最后一个全天日程不会被算进下一周。
-      toUtc: end.subtract(const Duration(seconds: 1)),
+      // 排他边界减 1 秒：最后一个全天日程不会被算进下一段。
+      toUtc: to.subtract(const Duration(seconds: 1)),
       timezoneId: widget.timezoneId,
     );
   }
 
-  List<ScheduleOccurrence> _visibleOccurrences(List<ScheduleOccurrence> all) {
+  /// 本周全部实例（未过滤，用于空态判断与统计）。
+  List<ScheduleOccurrence> get _weekAll {
+    final start = _weekStart;
+    return _expansionFor(start, start.add(const Duration(days: 7))).occurrences;
+  }
+
+  List<ScheduleOccurrence> _visible(
+    List<ScheduleOccurrence> all,
+  ) {
     final query = _search.text.trim().toLowerCase();
     final current = widget.currentConversationId;
     final filtered = <ScheduleOccurrence>[];
@@ -166,15 +200,33 @@ class _ScheduleListDialogState extends State<ScheduleListDialog> {
     return filtered;
   }
 
+  bool get _hasActiveFilters =>
+      _search.text.trim().isNotEmpty ||
+      _categoryFilter != 'all' ||
+      _linkFilter != 'all' ||
+      _onlyCurrent;
+
+  /// 左侧月历小点用的当月实例（不受筛选影响，帮助导航）。
+  List<ScheduleOccurrence> get _monthAll {
+    final month = DateTime(_visibleMonth.year, _visibleMonth.month);
+    return _expansionFor(
+      month,
+      DateTime(month.year, month.month + 1),
+    ).occurrences;
+  }
+
   // ------------------------------------------------------------------ 操作
 
-  Future<void> _add() async {
+  Future<void> _add({DateTime? date, int? startMinute}) async {
     final outcome = await showScheduleEditorDialog(
       context,
       controller: widget.controller,
       timezoneId: widget.timezoneId,
       conversations: widget.conversations,
       clock: widget.clock,
+      loadConversationTasks: widget.loadConversationTasks,
+      initialDate: date,
+      initialStartMinute: startMinute,
     );
     if (outcome == null || !mounted) return;
     _afterSaved(outcome);
@@ -184,8 +236,11 @@ class _ScheduleListDialogState extends State<ScheduleListDialog> {
     final anchor = outcome.anchorDate;
     if (anchor != null) {
       final date = dateKeyToUtc(anchor);
-      if (date != null) {
-        setState(() => _anchor = DateTime(date.year, date.month, date.day));
+      if (date != null && mounted) {
+        setState(() {
+          _anchor = DateTime(date.year, date.month, date.day);
+          _visibleMonth = DateTime(date.year, date.month);
+        });
       }
     }
     _showNotice(AppNoticeKind.success, outcome.result.message);
@@ -194,7 +249,7 @@ class _ScheduleListDialogState extends State<ScheduleListDialog> {
   Future<void> _edit(ScheduleOccurrence occurrence) async {
     final event = widget.controller.eventById(occurrence.eventId);
     if (event == null) {
-      _showNotice(AppNoticeKind.error, '日程已不存在，请关闭后重新打开列表');
+      _showNotice(AppNoticeKind.error, '日程已不存在，请关闭后重新打开日程');
       return;
     }
     var scope = ScheduleEditScope.series;
@@ -211,6 +266,7 @@ class _ScheduleListDialogState extends State<ScheduleListDialog> {
       occurrence: scope == ScheduleEditScope.occurrence ? occurrence : null,
       conversations: widget.conversations,
       clock: widget.clock,
+      loadConversationTasks: widget.loadConversationTasks,
     );
     if (outcome == null || !mounted) return;
     _afterSaved(outcome);
@@ -219,7 +275,7 @@ class _ScheduleListDialogState extends State<ScheduleListDialog> {
   Future<void> _delete(ScheduleOccurrence occurrence) async {
     final event = widget.controller.eventById(occurrence.eventId);
     if (event == null) {
-      _showNotice(AppNoticeKind.error, '日程已不存在，请关闭后重新打开列表');
+      _showNotice(AppNoticeKind.error, '日程已不存在，请关闭后重新打开日程');
       return;
     }
     ScheduleMutationResult result;
@@ -246,13 +302,55 @@ class _ScheduleListDialogState extends State<ScheduleListDialog> {
     }
   }
 
-  Future<void> _openLinkedConversation(ScheduleOccurrence occurrence) async {
-    final opener = widget.onOpenConversation;
-    final id = occurrence.linkedConversationId;
-    if (opener == null || id == null) return;
-    await opener(id);
-    if (!mounted) return;
-    Navigator.of(context).pop();
+  Future<void> _openDetail(ScheduleOccurrence occurrence) async {
+    final event = widget.controller.eventById(occurrence.eventId);
+    if (event == null) {
+      _showNotice(AppNoticeKind.error, '日程已不存在，请关闭后重新打开日程');
+      return;
+    }
+    await showScheduleDetailDialog(
+      context,
+      occurrence: occurrence,
+      event: event,
+      displayTimezoneId: widget.timezoneId,
+      conversations: widget.conversations,
+      resolveLinkedTask: _linkedTaskResolver(event),
+      onEdit: () => _edit(occurrence),
+      onDelete: () => _delete(occurrence),
+      onOpenConversation: widget.onOpenConversation == null
+          ? null
+          : (id) async {
+              await widget.onOpenConversation!(id);
+              if (mounted) Navigator.of(context).pop();
+            },
+      onOpenTask: widget.onOpenTask == null || event.linkedConversationId == null
+          ? null
+          : (task) async {
+              await widget.onOpenTask!(event.linkedConversationId!, task);
+            },
+    );
+  }
+
+  Future<ScheduleTaskOption?> Function()? _linkedTaskResolver(
+    ScheduleEvent event,
+  ) {
+    final loader = widget.loadConversationTasks;
+    final conversationId = event.linkedConversationId;
+    final taskId = event.linkedTaskId;
+    if (loader == null || conversationId == null || taskId == null) {
+      return null;
+    }
+    return () async {
+      try {
+        final tasks = await loader(conversationId);
+        for (final task in tasks) {
+          if (task.id == taskId) return task;
+        }
+      } catch (_) {
+        // 会话读取失败不打断详情：按“不可用”展示，绝不同名误跳。
+      }
+      return null;
+    };
   }
 
   Future<ScheduleEditScope?> _askScope({
@@ -279,11 +377,13 @@ class _ScheduleListDialogState extends State<ScheduleListDialog> {
         actions: [
           TextButton(
             key: const Key('schedule-scope-cancel'),
+            style: TsButtons.inline(),
             onPressed: () => Navigator.of(context).pop(),
             child: const Text('取消'),
           ),
           TextButton(
             key: const Key('schedule-scope-occurrence'),
+            style: TsButtons.inline(),
             onPressed: () =>
                 Navigator.of(context).pop(ScheduleEditScope.occurrence),
             child: Text(deleting ? '仅删除本次' : '仅修改本次'),
@@ -350,43 +450,39 @@ class _ScheduleListDialogState extends State<ScheduleListDialog> {
 
   // ---------------------------------------------------------------- 导航
 
+  void _selectDate(DateTime date) {
+    setState(() {
+      _anchor = DateTime(date.year, date.month, date.day);
+      _visibleMonth = DateTime(date.year, date.month);
+    });
+  }
+
   void _shiftWeek(int days) {
     setState(() {
       _anchor = _anchor.add(Duration(days: days));
-      _jumpError = null;
+      _visibleMonth = DateTime(_anchor.year, _anchor.month);
     });
   }
 
-  void _jumpToDate(String text) {
-    final parsed = parseDateKey(text.trim());
-    if (parsed == null) {
-      setState(() => _jumpError = '日期格式应为 YYYY-MM-DD');
-      return;
-    }
-    final date = dateKeyToUtc(parsed);
-    if (date == null) {
-      setState(() => _jumpError = '日期不合法');
-      return;
-    }
-    setState(() {
-      _anchor = DateTime(date.year, date.month, date.day);
-      _jumpError = null;
-    });
-  }
-
-  Future<void> _pickAnchorDate() async {
-    final picked = await showDatePicker(
-      context: context,
-      initialDate: _anchor,
-      firstDate: DateTime(2000),
-      lastDate: DateTime(2100),
-      helpText: '跳转到日期',
+  Future<void> _pickAnchorDate(BuildContext anchorContext) async {
+    final picked = await showCalendarPopup(
+      context,
+      anchorContext: anchorContext,
+      initialDate: DateTime.utc(_anchor.year, _anchor.month, _anchor.day),
+      firstDate: DateTime.utc(2000, 1, 1),
+      lastDate: DateTime.utc(2100, 12, 31),
+      today: _nowWall,
     );
     if (picked == null || !mounted) return;
-    setState(() {
-      _anchor = DateTime(picked.year, picked.month, picked.day);
-      _jumpError = null;
-    });
+    _selectDate(picked);
+  }
+
+  Future<void> _selectCategory(String value) async {
+    setState(() => _categoryFilter = value);
+  }
+
+  Future<void> _selectLink(String value) async {
+    setState(() => _linkFilter = value);
   }
 
   // ---------------------------------------------------------------- 构建
@@ -394,8 +490,8 @@ class _ScheduleListDialogState extends State<ScheduleListDialog> {
   @override
   Widget build(BuildContext context) {
     final media = MediaQuery.sizeOf(context);
-    final width = math.min(780.0, math.max(320.0, media.width - 24));
-    final height = math.min(720.0, math.max(320.0, media.height - 36));
+    final width = math.min(1080.0, math.max(360.0, media.width - 28));
+    final height = math.min(780.0, math.max(360.0, media.height - 36));
     return Dialog(
       key: const Key('schedule-list-dialog'),
       backgroundColor: TsColors.surface,
@@ -413,19 +509,46 @@ class _ScheduleListDialogState extends State<ScheduleListDialog> {
   }
 
   Widget _content() {
-    final weekStart = _weekStartOf(_anchor);
-    final expansion = _expansionFor(weekStart);
-    final visible = _visibleOccurrences(expansion.occurrences);
+    final weekAll = _weekAll;
+    final visible = _visible(weekAll);
+    final monthAll = _monthAll;
+    final isCurrentWeek = _isSameWeek(_weekStart, _weekStartOf(_nowWall));
+    final emptyMessage = _emptyMessage(isCurrentWeek);
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
         _header(),
         Divider(height: 1, thickness: 1, color: TsColors.border),
-        _toolbar(weekStart),
+        _toolbar(isCurrentWeek),
         Divider(height: 1, thickness: 1, color: TsColors.border),
-        Expanded(child: _listArea(expansion, visible)),
+        Expanded(
+          child: ScheduleWeekView(
+            weekStart: _weekStart,
+            timezoneId: widget.timezoneId,
+            occurrences: visible,
+            monthAnchor: _visibleMonth,
+            monthOccurrences: monthAll,
+            selectedDate: _anchor,
+            today: _nowWall,
+            taskTimes: widget.taskTimes,
+            showTaskLayer: _showTaskLayer,
+            onToggleTaskLayer: (value) =>
+                setState(() => _showTaskLayer = value),
+            onSelectDate: _selectDate,
+            onMonthChanged: (month) => setState(() {
+              _visibleMonth = DateTime(month.year, month.month);
+            }),
+            onSelectSlot: (date, startMinute) => _add(
+              date: date,
+              startMinute: startMinute,
+            ),
+            onSelectOccurrence: _openDetail,
+            emptyMessage: emptyMessage,
+            showEmptyMessage: visible.isEmpty,
+          ),
+        ),
         Divider(height: 1, thickness: 1, color: TsColors.border),
-        _footer(visible.length),
+        _footer(visible.length, isCurrentWeek),
       ],
     );
   }
@@ -452,254 +575,150 @@ class _ScheduleListDialogState extends State<ScheduleListDialog> {
           FilledButton.icon(
             key: const Key('schedule-add'),
             style: TsButtons.solid(),
-            onPressed: _add,
+            onPressed: () => _add(),
             icon: const Icon(Icons.add, size: 15),
             label: const Text('添加日程'),
           ),
           const SizedBox(width: 4),
-          IconButton(
+          TsCloseButton(
             key: const Key('schedule-list-close'),
-            tooltip: '关闭',
-            style: TsButtons.closeIcon(size: 28),
             onPressed: () => Navigator.of(context).pop(),
-            icon: const Icon(Icons.close, size: 16),
           ),
         ],
       ),
     );
   }
 
-  Widget _toolbar(DateTime weekStart) {
+  Widget _toolbar(bool isCurrentWeek) {
+    final weekStart = _weekStart;
     final weekEnd = weekStart.add(const Duration(days: 6));
     return Padding(
       padding: const EdgeInsets.fromLTRB(12, 6, 12, 8),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
+      child: Wrap(
+        spacing: 8,
+        runSpacing: 6,
+        crossAxisAlignment: WrapCrossAlignment.center,
         children: [
-          Wrap(
-            spacing: 8,
-            runSpacing: 6,
-            crossAxisAlignment: WrapCrossAlignment.center,
-            children: [
-              IconButton(
-                key: const Key('schedule-prev-week'),
-                tooltip: '上一周',
-                visualDensity: VisualDensity.compact,
-                onPressed: () => _shiftWeek(-7),
-                icon: const Icon(Icons.chevron_left, size: 18),
-              ),
-              Text(
-                _weekRangeLabel(weekStart, weekEnd),
-                key: const Key('schedule-week-label'),
-                style:
-                    const TextStyle(fontSize: 12, fontWeight: FontWeight.w600),
-              ),
-              IconButton(
-                key: const Key('schedule-next-week'),
-                tooltip: '下一周',
-                visualDensity: VisualDensity.compact,
-                onPressed: () => _shiftWeek(7),
-                icon: const Icon(Icons.chevron_right, size: 18),
-              ),
-              TextButton(
-                key: const Key('schedule-this-week'),
-                style: TsButtons.inline(),
-                onPressed: () {
-                  final wall = _nowWall;
-                  setState(() {
-                    _anchor = DateTime(wall.year, wall.month, wall.day);
-                    _jumpError = null;
-                  });
-                },
-                child: const Text('本周'),
-              ),
-              SizedBox(
-                width: 150,
-                child: TextField(
-                  key: const Key('schedule-jump'),
-                  controller: _jump,
-                  style: const TextStyle(fontSize: 12),
-                  onSubmitted: _jumpToDate,
-                  decoration: const InputDecoration(
-                    labelText: '跳转日期',
-                    hintText: 'YYYY-MM-DD',
-                    isDense: true,
-                  ),
-                ),
-              ),
-              TextButton(
-                key: const Key('schedule-jump-go'),
-                style: TsButtons.inline(),
-                onPressed: () => _jumpToDate(_jump.text),
-                child: const Text('跳转'),
-              ),
-              TextButton.icon(
-                key: const Key('schedule-jump-pick'),
-                style: TsButtons.inline(),
-                onPressed: _pickAnchorDate,
-                icon: const Icon(Icons.event, size: 15),
-                label: const Text('选择日期'),
-              ),
-              SizedBox(
-                width: 170,
-                child: TextField(
-                  key: const Key('schedule-search'),
-                  controller: _search,
-                  style: const TextStyle(fontSize: 12),
-                  onChanged: (_) => setState(() {}),
-                  decoration: const InputDecoration(
-                    labelText: '搜索',
-                    hintText: '标题/地点/备注',
-                    isDense: true,
-                  ),
-                ),
-              ),
-              DropdownButton<String>(
-                key: const Key('schedule-category-filter'),
-                value: _categoryFilter,
+          IconButton(
+            key: const Key('schedule-prev-week'),
+            tooltip: '上一周',
+            style: TsButtons.icon(size: TsSizes.compactIconSize),
+            onPressed: () => _shiftWeek(-7),
+            icon: const Icon(Icons.chevron_left, size: 18),
+          ),
+          _DateTitle(
+            label: _weekRangeLabel(weekStart, weekEnd),
+            onTap: _pickAnchorDate,
+          ),
+          IconButton(
+            key: const Key('schedule-next-week'),
+            tooltip: '下一周',
+            style: TsButtons.icon(size: TsSizes.compactIconSize),
+            onPressed: () => _shiftWeek(7),
+            icon: const Icon(Icons.chevron_right, size: 18),
+          ),
+          OutlinedButton(
+            key: const Key('schedule-this-week'),
+            style: TsButtons.outline(height: TsSizes.compactButtonHeight),
+            onPressed: () {
+              final wall = _nowWall;
+              _selectDate(wall);
+            },
+            child: const Text('本周'),
+          ),
+          const SizedBox(width: 8),
+          SizedBox(
+            width: 168,
+            child: TextField(
+              key: const Key('schedule-search'),
+              controller: _search,
+              style: const TextStyle(fontSize: 12),
+              onChanged: (_) => setState(() {}),
+              decoration: const InputDecoration(
+                hintText: '搜索',
+                prefixIcon: Icon(Icons.search, size: 15),
                 isDense: true,
-                style: TextStyle(fontSize: 12, color: TsColors.textPrimary),
-                items: <DropdownMenuItem<String>>[
-                  const DropdownMenuItem(value: 'all', child: Text('全部分类')),
-                  for (final category in ScheduleCategory.values)
-                    DropdownMenuItem(
-                      value: category.wireName,
-                      child: Text(category.label),
-                    ),
-                ],
-                onChanged: (value) =>
-                    setState(() => _categoryFilter = value ?? 'all'),
               ),
-              DropdownButton<String>(
-                key: const Key('schedule-linked-filter'),
-                value: _linkFilter,
-                isDense: true,
-                style: TextStyle(fontSize: 12, color: TsColors.textPrimary),
-                items: <DropdownMenuItem<String>>[
-                  const DropdownMenuItem(value: 'all', child: Text('全部关联')),
-                  const DropdownMenuItem(value: 'none', child: Text('未关联')),
-                  for (final option in widget.conversations)
-                    DropdownMenuItem(
-                      value: option.id,
-                      child: Text(
-                        option.title,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                      ),
-                    ),
-                ],
-                onChanged: (value) =>
-                    setState(() => _linkFilter = value ?? 'all'),
-              ),
-              if (widget.currentConversationId != null)
-                Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Checkbox(
-                      key: const Key('schedule-only-current'),
-                      value: _onlyCurrent,
-                      onChanged: (value) =>
-                          setState(() => _onlyCurrent = value ?? false),
-                    ),
-                    const Text('仅当前会话', style: TextStyle(fontSize: 12)),
-                  ],
+            ),
+          ),
+          BezierMenuSelect<String>(
+            key: const Key('schedule-category-filter'),
+            label: _categoryLabel,
+            width: 132,
+            dense: true,
+            menuWidth: 168,
+            items: <BezierMenuItem<String>>[
+              for (final option in const <(String, String)>[
+                ('all', '全部分类'),
+                ('work', '工作'),
+                ('study', '学习'),
+                ('life', '生活'),
+              ])
+                BezierMenuItem(
+                  value: option.$1,
+                  label: option.$2,
+                  selected: _categoryFilter == option.$1,
                 ),
             ],
+            onSelected: _selectCategory,
           ),
-          if (_jumpError != null)
-            Padding(
-              padding: const EdgeInsets.only(top: 4),
-              child: Text(
-                _jumpError!,
-                key: const Key('schedule-jump-error'),
-                style: TextStyle(fontSize: 11.5, color: TsColors.blocked),
+          BezierMenuSelect<String>(
+            key: const Key('schedule-linked-filter'),
+            label: _linkLabel,
+            width: 176,
+            dense: true,
+            menuWidth: 240,
+            items: <BezierMenuItem<String>>[
+              BezierMenuItem(
+                value: 'all',
+                label: '全部关联',
+                selected: _linkFilter == 'all',
               ),
+              BezierMenuItem(
+                value: 'none',
+                label: '未关联',
+                selected: _linkFilter == 'none',
+              ),
+              for (final option in widget.conversations)
+                BezierMenuItem(
+                  value: option.id,
+                  label: option.title,
+                  selected: _linkFilter == option.id,
+                ),
+            ],
+            onSelected: _selectLink,
+          ),
+          if (widget.currentConversationId != null)
+            Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Checkbox(
+                  key: const Key('schedule-only-current'),
+                  value: _onlyCurrent,
+                  visualDensity: VisualDensity.compact,
+                  onChanged: (value) =>
+                      setState(() => _onlyCurrent = value ?? false),
+                ),
+                const Text('仅当前会话', style: TextStyle(fontSize: 12)),
+              ],
             ),
         ],
       ),
     );
   }
 
-  Widget _listArea(
-    ScheduleExpansionResult expansion,
-    List<ScheduleOccurrence> visible,
-  ) {
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.stretch,
-      children: [
-        if (!expansion.complete)
-          Container(
-            key: const Key('schedule-warnings'),
-            margin: const EdgeInsets.fromLTRB(12, 8, 12, 0),
-            padding: const EdgeInsets.all(10),
-            decoration: bezierDecoration(
-              color: TsColors.pendingSoft,
-              radius: 8,
-              border:
-                  Border.all(color: TsColors.pending.withValues(alpha: 0.4)),
-            ),
-            child: Text(
-              '日程展开不完整：${expansion.warnings.join('；')}',
-              style: TextStyle(
-                fontSize: 11.5,
-                height: 1.45,
-                color: TsColors.pending,
-              ),
-            ),
-          ),
-        Expanded(
-          child: visible.isEmpty
-              ? _emptyState()
-              : ListView.builder(
-                  padding: const EdgeInsets.fromLTRB(12, 8, 12, 8),
-                  itemCount: visible.length,
-                  itemBuilder: (context, index) => _row(visible[index]),
-                ),
-        ),
-      ],
-    );
-  }
-
-  Widget _emptyState() {
-    return Center(
-      child: Padding(
-        padding: const EdgeInsets.all(24),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Icon(Icons.event_available_outlined,
-                size: 34, color: TsColors.border),
-            const SizedBox(height: 10),
-            Text(
-              '这个范围没有日程',
-              style: TextStyle(fontSize: 12.5, color: TsColors.textSecondary),
-            ),
-            const SizedBox(height: 4),
-            Text(
-              '默认显示当前周；可用「跳转日期」查看远期日程。',
-              textAlign: TextAlign.center,
-              style: TextStyle(
-                fontSize: 11.5,
-                height: 1.5,
-                color: TsColors.textFaint,
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  Widget _footer(int visibleCount) {
+  Widget _footer(int visibleCount, bool isCurrentWeek) {
+    final rangeWord = isCurrentWeek ? '本周' : '这一周';
     return Padding(
-      padding: const EdgeInsets.fromLTRB(16, 6, 12, 8),
+      padding: const EdgeInsets.fromLTRB(16, 6, 16, 8),
       child: Row(
         children: [
           Expanded(
             child: Text(
-              '本周 $visibleCount 条 · 全局共 ${widget.controller.events.length} 个日程；'
-              '筛选只影响展示，不改变忙碌计算。',
-              maxLines: 2,
+              '$rangeWord $visibleCount 条 · '
+              '全局共 ${widget.controller.events.length} 个日程',
+              key: const Key('schedule-footer-stats'),
+              maxLines: 1,
               overflow: TextOverflow.ellipsis,
               style: TextStyle(
                 fontSize: 11,
@@ -708,264 +727,91 @@ class _ScheduleListDialogState extends State<ScheduleListDialog> {
               ),
             ),
           ),
-          TextButton(
-            key: const Key('schedule-list-close-footer'),
-            style: TsButtons.inline(),
-            onPressed: () => Navigator.of(context).pop(),
-            child: const Text('关闭'),
-          ),
         ],
       ),
     );
   }
 
-  // ---------------------------------------------------------------- 列表行
+  String _emptyMessage(bool isCurrentWeek) {
+    if (_hasActiveFilters) return '没有符合条件的日程';
+    return isCurrentWeek ? '本周暂无日程' : '这一周暂无日程';
+  }
 
-  Widget _row(ScheduleOccurrence occurrence) {
-    final event = widget.controller.eventById(occurrence.eventId);
-    final linked = _conversationFor(occurrence.linkedConversationId);
-    final timeLines = _timeLines(occurrence);
-    final meta = <String>[
-      _repeatLabel(event),
-      if (occurrence.reminder != ScheduleReminderKind.none)
-        '提醒：${occurrence.reminder.label}',
-      if (occurrence.linkedConversationId != null)
-        linked == null
-            ? '关联：会话不可用'
-            : '关联：${linked.title}${linked.statusLabel == null ? '' : '（${linked.statusLabel}）'}',
-      if (event?.location != null && event!.location!.trim().isNotEmpty)
-        '地点：${event.location!.trim()}',
-      if (occurrence.timezoneId != widget.timezoneId)
-        '时区：${occurrence.timezoneId}',
-    ];
-    final actions = <Widget>[
-      if (occurrence.linkedConversationId != null &&
-          widget.onOpenConversation != null)
-        TextButton(
-          key: Key('schedule-open-conversation-${occurrence.occurrenceKey}'),
-          style: TsButtons.inline(fontSize: 11.5),
-          onPressed: () => _openLinkedConversation(occurrence),
-          child: const Text('打开会话'),
-        ),
-      TextButton(
-        key: Key('schedule-edit-${occurrence.occurrenceKey}'),
-        style: TsButtons.inline(fontSize: 11.5),
-        onPressed: () => _edit(occurrence),
-        child: const Text('编辑'),
-      ),
-      TextButton(
-        key: Key('schedule-delete-${occurrence.occurrenceKey}'),
-        style: TsButtons.inline(fontSize: 11.5).copyWith(
-          foregroundColor: WidgetStatePropertyAll(TsColors.blocked),
-        ),
-        onPressed: () => _delete(occurrence),
-        child: const Text('删除'),
-      ),
-    ];
+  String get _categoryLabel {
+    switch (_categoryFilter) {
+      case 'work':
+        return '工作';
+      case 'study':
+        return '学习';
+      case 'life':
+        return '生活';
+      default:
+        return '全部分类';
+    }
+  }
 
-    return Container(
-      key: Key('schedule-row-${occurrence.occurrenceKey}'),
-      margin: const EdgeInsets.only(bottom: 8),
-      padding: const EdgeInsets.fromLTRB(12, 8, 8, 8),
-      decoration: bezierDecoration(color: TsColors.surfaceAlt, radius: 10),
-      child: LayoutBuilder(builder: (context, constraints) {
-        final narrow = constraints.maxWidth < 560;
-        final leading = SizedBox(
-          width: narrow ? 100 : 124,
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
+  String get _linkLabel {
+    if (_linkFilter == 'none') return '未关联';
+    if (_linkFilter == 'all') return '全部关联';
+    for (final option in widget.conversations) {
+      if (option.id == _linkFilter) return option.title;
+    }
+    return '全部关联';
+  }
+
+  bool _isSameWeek(DateTime a, DateTime b) =>
+      a.year == b.year && a.month == b.month && a.day == b.day;
+
+  String _weekRangeLabel(DateTime start, DateTime end) {
+    final sameYear = start.year == end.year;
+    final sameMonth = sameYear && start.month == end.month;
+    final startLabel = '${start.month}月${start.day}日';
+    final endLabel =
+        sameMonth ? '${end.day}日' : '${end.month}月${end.day}日';
+    if (sameYear && start.year == _nowWall.year) {
+      return '$startLabel-$endLabel';
+    }
+    if (sameYear) return '${start.year}年$startLabel-$endLabel';
+    return '${start.year}年$startLabel-${end.year}年$endLabel';
+  }
+}
+
+/// 可点击的日期标题：替代“跳转输入 + 跳转按钮 + 单独选日期”。
+class _DateTitle extends StatelessWidget {
+  const _DateTitle({required this.label, required this.onTap});
+
+  final String label;
+  final Future<void> Function(BuildContext anchorContext) onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    return Builder(
+      builder: (titleContext) => InkWell(
+        key: const Key('schedule-week-label'),
+        borderRadius: BorderRadius.circular(6),
+        onTap: () => onTap(titleContext),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
             children: [
               Text(
-                timeLines.$1,
+                label,
                 style: TextStyle(
-                  fontSize: 12,
+                  fontSize: 12.5,
                   fontWeight: FontWeight.w600,
                   color: TsColors.textPrimary,
                 ),
               ),
-              const SizedBox(height: 2),
-              Text(
-                timeLines.$2,
-                style: TextStyle(fontSize: 11, color: TsColors.textSecondary),
-              ),
+              const SizedBox(width: 4),
+              Icon(Icons.expand_more, size: 14, color: TsColors.textFaint),
             ],
           ),
-        );
-        final middle = Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Wrap(
-              spacing: 6,
-              runSpacing: 3,
-              crossAxisAlignment: WrapCrossAlignment.center,
-              children: [
-                Text(
-                  occurrence.title,
-                  style: TextStyle(
-                    fontSize: 13,
-                    fontWeight: FontWeight.w600,
-                    color: TsColors.textPrimary,
-                  ),
-                ),
-                if (occurrence.category != null)
-                  _categoryBadge(occurrence.category!),
-                if (!occurrence.blocksScheduling)
-                  _badge('不占用', TsColors.done, TsColors.doneSoft),
-                if (occurrence.isOverride)
-                  _badge('本次已调整', TsColors.waiting, TsColors.waitingSoft),
-              ],
-            ),
-            const SizedBox(height: 3),
-            Text(
-              meta.join(' · '),
-              style: TextStyle(
-                fontSize: 11,
-                height: 1.45,
-                color: TsColors.textFaint,
-              ),
-            ),
-          ],
-        );
-        final buttonRow = Wrap(spacing: 2, children: actions);
-        if (narrow) {
-          return Column(
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [
-              Row(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  leading,
-                  const SizedBox(width: 8),
-                  Expanded(child: middle),
-                ],
-              ),
-              Align(
-                alignment: Alignment.centerRight,
-                child: buttonRow,
-              ),
-            ],
-          );
-        }
-        return Row(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            leading,
-            const SizedBox(width: 10),
-            Expanded(child: middle),
-            buttonRow,
-          ],
-        );
-      }),
-    );
-  }
-
-  Widget _badge(String label, Color foreground, Color background) => Container(
-        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-        decoration: bezierDecoration(color: background, radius: 6),
-        child: Text(
-          label,
-          style: TextStyle(fontSize: 10.5, color: foreground),
         ),
-      );
-
-  Widget _categoryBadge(String wireName) {
-    final label =
-        ScheduleCategory.parse(wireName)?.label ?? wireName;
-    final (foreground, background) = switch (wireName) {
-      'work' => (TsColors.waiting, TsColors.waitingSoft),
-      'study' => (TsColors.accent, TsColors.accentSoft),
-      'life' => (TsColors.ready, TsColors.readySoft),
-      _ => (TsColors.textSecondary, TsColors.doneSoft),
-    };
-    return _badge(label, foreground, background);
-  }
-
-  ScheduleConversationOption? _conversationFor(String? id) {
-    if (id == null) return null;
-    for (final option in widget.conversations) {
-      if (option.id == id) return option;
-    }
-    return null;
-  }
-
-  // -------------------------------------------------------------- 展示格式
-
-  String _repeatLabel(ScheduleEvent? event) {
-    final rule = event?.repeat;
-    if (rule == null || !rule.repeats) return '单次';
-    final until = rule.untilDate;
-    switch (rule.kind) {
-      case ScheduleRepeatKind.daily:
-        return until == null ? '每天' : '每天，至 $until';
-      case ScheduleRepeatKind.weekly:
-        final days = rule.weekdays
-            .map((day) =>
-                const ['一', '二', '三', '四', '五', '六', '日'][day - 1])
-            .join('、');
-        return '每周$days${until == null ? '' : '，至 $until'}';
-      case ScheduleRepeatKind.none:
-        return '单次';
-    }
-  }
-
-  /// 返回（日期行, 时间行）；定时实例按日程自身时区的墙钟显示。
-  (String, String) _timeLines(ScheduleOccurrence occurrence) {
-    if (occurrence.allDay) {
-      final start = dateKeyToUtc(occurrence.startDate ?? '');
-      final endExclusive = dateKeyToUtc(occurrence.endDateExclusive ?? '');
-      final startLabel = start == null
-          ? (occurrence.startDate ?? '')
-          : '${_md(start)} ${_weekdayName(start.weekday)}';
-      if (start == null || endExclusive == null) {
-        return (startLabel, '全天');
-      }
-      final endInclusive = endExclusive.subtract(const Duration(days: 1));
-      if (endInclusive.isAtSameMomentAs(start)) {
-        return (startLabel, '全天');
-      }
-      final days = endExclusive.difference(start).inDays;
-      return ('${_md(start)} – ${_md(endInclusive)}', '全天 · $days 天');
-    }
-    final start = occurrence.startUtc == null
-        ? null
-        : wallOf(occurrence.startUtc!, occurrence.timezoneId);
-    final end = occurrence.endUtc == null
-        ? null
-        : wallOf(occurrence.endUtc!, occurrence.timezoneId);
-    if (start == null || end == null) {
-      return ('时间未知', '');
-    }
-    final sameDay = start.year == end.year &&
-        start.month == end.month &&
-        start.day == end.day;
-    if (sameDay) {
-      return (
-        '${_md(start)} ${_weekdayName(start.weekday)}',
-        '${_hm(start)}–${_hm(end)}',
-      );
-    }
-    return (
-      '${_md(start)} ${_hm(start)} →',
-      '${_md(end)} ${_hm(end)}',
+      ),
     );
   }
-
-  String _weekRangeLabel(DateTime start, DateTime end) {
-    final sameYear = start.year == end.year;
-    final startLabel = '${start.year} ${_md(start)}';
-    return sameYear
-        ? '$startLabel – ${_md(end)}'
-        : '$startLabel – ${end.year} ${_md(end)}';
-  }
-
-  static String _two(int value) => value.toString().padLeft(2, '0');
-
-  static String _md(DateTime date) =>
-      '${_two(date.month)}-${_two(date.day)}';
-
-  static String _hm(DateTime date) =>
-      '${_two(date.hour)}:${_two(date.minute)}';
-
-  static String _weekdayName(int weekday) =>
-      const ['周一', '周二', '周三', '周四', '周五', '周六', '周日'][weekday - 1];
 }
+
+/// 供测试/外部复用：把本地日期格式化成日期键。
+String scheduleDateKey(DateTime date) => formatDatePickerDate(date);

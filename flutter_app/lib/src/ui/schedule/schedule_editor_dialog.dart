@@ -1,25 +1,37 @@
-// 日程新建/编辑弹窗（0.4.0 任务 4）。
+// 日程新建/编辑弹窗（0.5.0 任务 10，与任务 09/11 共用）。
 //
-// 交互要点（01 框架 §3/§7、02 提示词任务 4）：
-//   * 字段顺序：标题/地点 → 时间 → 提醒 → 重复 → 备注；分类/关联/时区可折叠或次级；
-//   * 定时与全天两套草稿分开保存，切换分支不丢输入，提交只保存当前合法分支；
-//   * 定时保存本地墙钟与 IANA 时区；全天界面结束日包含当天，存储结束日排他；
-//   * 重复日程的“仅本次”编辑只改本次日期/时间（override，key 仍指向原始日期），
-//     标题/提醒/关联等系列字段只读，并提供“改为编辑整个系列”的明确入口；
-//   * 保存中禁用重复提交；失败就地显示并保留草稿；取消/Esc 走脏数据确认；
-//   * 本弹窗只通过 ScheduleController 读写，不碰文件、不 import FFI。
+// 交互要点：
+//   * 删除常驻“精确到分钟……最多跨一天”与“其他会话的排程会避开这段”说明，
+//     保留占用开关与真实校验，只在输入无效时给出具体错误；
+//   * 提醒只出现一个字段标签，并在标签中说明“应用运行期间”的限制；
+//   * 开始/结束复用共享年月日历（任务 03）：全天只输入日期，定时事项显示时分，
+//     同日与合法跨午夜（最多跨一天）都能保存；
+//   * “备注与时区”折叠区里使用可搜索、可滚动的应用风格时区选单：中文城市 +
+//     UTC 偏移展示，保存 IANA ID；旧值预选，无效旧值给修复入口，不静默改写；
+//   * 选择关联会话后可再选择该会话的稳定任务 ID（linkedTaskId）；换会话清除
+//     不匹配任务；任务删除/会话失效只显示不可用，不按同名误跳；
+//   * 开始/结束或占用开关变化后做重叠检测：显示相交对象、实际重叠分钟与“查看”，
+//     编辑自身排除原记录，首尾相接重叠为 0。
+//
+// 本弹窗只通过 ScheduleController 读写，不碰文件、不 import FFI。
 
+import 'dart:async';
 import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 
 import '../../model/calendar.dart' show WallClock, parseDateKey;
 import '../../model/schedule_event.dart';
+import '../../state/ics/ics_timezones.dart' show IcsTimeZoneResolver;
+import '../../state/schedule/schedule_conflicts.dart';
 import '../../state/schedule/schedule_controller.dart';
 import '../../state/schedule/schedule_expander.dart'
     show ScheduleOccurrence, wallOf;
+import '../../state/schedule/schedule_timezones.dart';
 import '../theme.dart';
 import '../widgets/bezier_ui.dart';
+import '../widgets/date_range_picker.dart' show DatePickerField;
+import 'schedule_timezone_picker.dart';
 
 /// 单次编辑还是系列编辑。
 enum ScheduleEditScope { occurrence, series }
@@ -37,6 +49,20 @@ class ScheduleConversationOption {
 
   /// 已归档/最近删除等状态；null 表示正常会话。
   final String? statusLabel;
+}
+
+/// 某个会话里的稳定任务选项（由组合根只读加载 currentVersion 后构造）。
+class ScheduleTaskOption {
+  const ScheduleTaskOption({
+    required this.id,
+    required this.title,
+    this.done = false,
+  });
+
+  /// 稳定任务 ID（LocalPlan 的 TaskRecord.id），改名后仍指向同一任务。
+  final String id;
+  final String title;
+  final bool done;
 }
 
 /// 编辑成功的结果；[anchorDate] 供列表把日期导航到保存后的日期。
@@ -62,6 +88,10 @@ Future<ScheduleEditorOutcome?> showScheduleEditorDialog(
   List<ScheduleConversationOption> conversations =
       const <ScheduleConversationOption>[],
   DateTime Function()? clock,
+  Future<List<ScheduleTaskOption>> Function(String conversationId)?
+      loadConversationTasks,
+  DateTime? initialDate,
+  int? initialStartMinute,
 }) {
   assert(event != null || occurrence == null,
       'occurrence 只能用于编辑已存在的系列');
@@ -74,6 +104,9 @@ Future<ScheduleEditorOutcome?> showScheduleEditorDialog(
       occurrence: occurrence,
       conversations: conversations,
       clock: clock,
+      loadConversationTasks: loadConversationTasks,
+      initialDate: initialDate,
+      initialStartMinute: initialStartMinute,
     ),
   );
 }
@@ -87,6 +120,9 @@ class ScheduleEditorDialog extends StatefulWidget {
     this.occurrence,
     this.conversations = const <ScheduleConversationOption>[],
     this.clock,
+    this.loadConversationTasks,
+    this.initialDate,
+    this.initialStartMinute,
   });
 
   final ScheduleController controller;
@@ -95,6 +131,10 @@ class ScheduleEditorDialog extends StatefulWidget {
   final ScheduleOccurrence? occurrence;
   final List<ScheduleConversationOption> conversations;
   final DateTime Function()? clock;
+  final Future<List<ScheduleTaskOption>> Function(String conversationId)?
+      loadConversationTasks;
+  final DateTime? initialDate;
+  final int? initialStartMinute;
 
   @override
   State<ScheduleEditorDialog> createState() => _ScheduleEditorDialogState();
@@ -106,7 +146,6 @@ class _ScheduleEditorDialogState extends State<ScheduleEditorDialog> {
   late final TextEditingController _title;
   late final TextEditingController _location;
   late final TextEditingController _notes;
-  late final TextEditingController _timezone;
 
   // 定时分支草稿（YYYY-MM-DD / HH:mm）。
   late final TextEditingController _timedStartDate;
@@ -124,16 +163,29 @@ class _ScheduleEditorDialogState extends State<ScheduleEditorDialog> {
   String _category = '';
   bool _blocksScheduling = true;
   String _linkedConversationId = '';
+  String _linkedTaskId = '';
   String _repeatKind = 'none';
   final Set<int> _weekdays = <int>{};
   ScheduleReminderKind _timedReminder = ScheduleReminderKind.none;
   ScheduleReminderKind _allDayReminder = ScheduleReminderKind.none;
+
+  /// 保存到日程的 IANA 时区；不再是自由文本框（不允许粘贴任意文本）。
   String _timezoneId = '';
 
-  bool _advanced = false;
+  bool _notesExpanded = false;
   bool _saving = false;
   bool _dirty = false;
   String? _error;
+
+  // 关联任务下拉状态（只读加载该会话 currentVersion 的任务）。
+  List<ScheduleTaskOption> _taskOptions = const <ScheduleTaskOption>[];
+  bool _taskLoading = false;
+  String? _taskLoadError;
+  int _taskLoadToken = 0;
+
+  // 重叠检测结果。
+  List<ScheduleOverlap> _overlaps = const <ScheduleOverlap>[];
+  int _conflictToken = 0;
 
   late ScheduleEditScope _scope;
 
@@ -154,7 +206,6 @@ class _ScheduleEditorDialogState extends State<ScheduleEditorDialog> {
     _title = TextEditingController();
     _location = TextEditingController();
     _notes = TextEditingController();
-    _timezone = TextEditingController(text: _timezoneId);
     _timedStartDate = TextEditingController();
     _timedStartClock = TextEditingController();
     _timedEndDate = TextEditingController();
@@ -163,6 +214,12 @@ class _ScheduleEditorDialogState extends State<ScheduleEditorDialog> {
     _allDayEnd = TextEditingController();
     _until = TextEditingController();
     _applyInitialValues();
+    if (widget.event?.linkedConversationId != null) {
+      _loadConversationTasks(initial: true);
+    }
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) _refreshConflicts();
+    });
   }
 
   @override
@@ -170,7 +227,6 @@ class _ScheduleEditorDialogState extends State<ScheduleEditorDialog> {
     _title.dispose();
     _location.dispose();
     _notes.dispose();
-    _timezone.dispose();
     _timedStartDate.dispose();
     _timedStartClock.dispose();
     _timedEndDate.dispose();
@@ -192,10 +248,19 @@ class _ScheduleEditorDialogState extends State<ScheduleEditorDialog> {
       }
       return;
     }
-    // 新建：开始时间取下个整点（23 点后取 23:00，结束跨到次日 00:00）。
+    // 新建：优先使用周视图点击空档的日期/时间；否则取下个整点
+    //（23 点后取 23:00，结束跨到次日 00:00）。
     final wall = _nowWall;
-    final today = _dateKey(wall);
-    final startMinute = wall.hour >= 23 ? 23 * 60 : (wall.hour + 1) * 60;
+    final baseDate = widget.initialDate == null
+        ? DateTime(wall.year, wall.month, wall.day)
+        : DateTime(
+            widget.initialDate!.year,
+            widget.initialDate!.month,
+            widget.initialDate!.day,
+          );
+    final today = _dateKey(baseDate);
+    final startMinute = widget.initialStartMinute ??
+        (wall.hour >= 23 ? 23 * 60 : (wall.hour + 1) * 60);
     final endMinute = startMinute + 60;
     _timedStartDate.text = today;
     _timedStartClock.text = _clockText(startMinute);
@@ -210,11 +275,12 @@ class _ScheduleEditorDialogState extends State<ScheduleEditorDialog> {
     _title.text = event.title;
     _location.text = event.location ?? '';
     _notes.text = event.notes ?? '';
-    _timezone.text = event.timezoneId;
+    _notesExpanded = (event.notes ?? '').trim().isNotEmpty;
     _timezoneId = event.timezoneId;
     _category = event.category?.wireName ?? '';
     _blocksScheduling = event.blocksScheduling;
     _linkedConversationId = event.linkedConversationId ?? '';
+    _linkedTaskId = event.linkedTaskId ?? '';
     _repeatKind = event.repeat.kind.wireName;
     _weekdays
       ..clear()
@@ -275,6 +341,206 @@ class _ScheduleEditorDialogState extends State<ScheduleEditorDialog> {
     _timedEndDate.text = _dateKey(endWall);
     _timedEndClock.text = _clockText(endWall.hour * 60 + endWall.minute);
     if (dayDiff < 0) _timedEndDate.text = startDate;
+  }
+
+  // -------------------------------------------------------- 关联任务加载
+
+  Future<void> _loadConversationTasks({bool initial = false}) async {
+    final loader = widget.loadConversationTasks;
+    final conversationId = _linkedConversationId.trim();
+    final token = ++_taskLoadToken;
+    if (loader == null || conversationId.isEmpty) {
+      if (mounted) {
+        setState(() {
+          _taskOptions = const <ScheduleTaskOption>[];
+          _taskLoading = false;
+          _taskLoadError = null;
+        });
+      }
+      return;
+    }
+    setState(() {
+      _taskLoading = true;
+      _taskLoadError = null;
+    });
+    try {
+      final tasks = await loader(conversationId);
+      if (!mounted || token != _taskLoadToken) return;
+      setState(() {
+        _taskOptions = tasks;
+        _taskLoading = false;
+        if (_linkedTaskId.isNotEmpty &&
+            !tasks.any((task) => task.id == _linkedTaskId)) {
+          // 任务被删除或不属于该会话：清除引用，不按同名误跳。
+          _linkedTaskId = '';
+          if (!initial) _dirty = true;
+        }
+      });
+    } catch (_) {
+      if (!mounted || token != _taskLoadToken) return;
+      setState(() {
+        _taskLoading = false;
+        _taskOptions = const <ScheduleTaskOption>[];
+        _taskLoadError = '读取该会话任务失败，请稍后重试或重新选择关联会话';
+      });
+    }
+  }
+
+  // ---------------------------------------------------------- 重叠检测
+
+  void _refreshConflicts() {
+    final range = _currentIntervalUtc();
+    if (range == null) {
+      _conflictToken++;
+      if (_overlaps.isNotEmpty && mounted) {
+        setState(() => _overlaps = const <ScheduleOverlap>[]);
+      }
+      return;
+    }
+    final token = ++_conflictToken;
+    final expansion = widget.controller.occurrencesInRange(
+      fromUtc: range.$1.subtract(const Duration(days: 1)),
+      toUtc: range.$2.add(const Duration(days: 1)),
+      timezoneId: widget.timezoneId,
+    );
+    final overlaps = mergeOverlapsByOccurrence(findScheduleOverlaps(
+      startUtc: range.$1,
+      endUtc: range.$2,
+      candidates: expansion.occurrences,
+      blocksScheduling: _blocksScheduling,
+      excludeEventId: _occurrenceOnly ? null : widget.event?.id,
+      excludeOccurrenceKey:
+          _occurrenceOnly ? widget.occurrence?.occurrenceKey : null,
+    ));
+    if (!mounted || token != _conflictToken) return;
+    if (_sameOverlaps(_overlaps, overlaps)) return;
+    setState(() => _overlaps = overlaps);
+  }
+
+  bool _sameOverlaps(
+    List<ScheduleOverlap> a,
+    List<ScheduleOverlap> b,
+  ) {
+    if (a.length != b.length) return false;
+    for (var i = 0; i < a.length; i++) {
+      if (a[i].occurrenceKey != b[i].occurrenceKey) return false;
+      if (a[i].overlapMinutes != b[i].overlapMinutes) return false;
+    }
+    return true;
+  }
+
+  /// 当前表单（可能还不合法）对应的 UTC 起止；不合法返回 null。
+  (DateTime, DateTime)? _currentIntervalUtc() {
+    if (_allDay) return null;
+    final startDate = parseDateKey(_timedStartDate.text.trim());
+    final startClock = _parseClock(_timedStartClock.text);
+    final endDate = parseDateKey(_timedEndDate.text.trim());
+    final endClock = _parseClock(_timedEndClock.text);
+    if (startDate == null || endDate == null) return null;
+    if (startClock == null || endClock == null) return null;
+    final startBase = dateKeyToUtc(startDate);
+    final endBase = dateKeyToUtc(endDate);
+    if (startBase == null || endBase == null) return null;
+    final dayDiff = endBase.difference(startBase).inDays;
+    if (dayDiff < 0) return null;
+    final endMinute = dayDiff * 1440 + endClock;
+    if (endMinute <= startClock) return null;
+    final resolver = IcsTimeZoneResolver();
+    final start = resolver.resolveWall(
+      _timezoneId,
+      _wall(startDate, startClock),
+    );
+    final end = resolver.resolveWall(
+      _timezoneId,
+      _wall(startDate, endMinute),
+    );
+    if (start.utc == null || end.utc == null) return null;
+    if (!end.utc!.isAfter(start.utc!)) return null;
+    return (start.utc!, end.utc!);
+  }
+
+  static DateTime _wall(String dateKey, int minute) {
+    final base = dateKeyToUtc(dateKey);
+    if (base == null) return DateTime.utc(1970);
+    final days = minute ~/ 1440;
+    final rest = minute % 1440;
+    return DateTime.utc(
+      base.year,
+      base.month,
+      base.day + days,
+      rest ~/ 60,
+      rest % 60,
+    );
+  }
+
+  Future<void> _showConflicts() async {
+    if (_overlaps.isEmpty) return;
+    await showDialog<void>(
+      context: context,
+      builder: (context) => AlertDialog(
+        key: const Key('schedule-conflict-dialog'),
+        title: Text(
+          '与 ${_overlaps.length} 个日程重叠',
+          style: const TextStyle(fontSize: 15),
+        ),
+        content: SizedBox(
+          width: 360,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              for (final overlap in _overlaps)
+                Padding(
+                  padding: const EdgeInsets.only(bottom: 8),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        overlap.title,
+                        style: TextStyle(
+                          fontSize: 13,
+                          fontWeight: FontWeight.w600,
+                          color: TsColors.textPrimary,
+                        ),
+                      ),
+                      Text(
+                        '${_wallTimeLabel(overlap.overlapStartUtc)}–'
+                        '${_wallTimeLabel(overlap.overlapEndUtc)}'
+                        ' · 重叠 ${overlap.overlapMinutes} 分钟',
+                        style: TextStyle(
+                          fontSize: 11.5,
+                          color: TsColors.textSecondary,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              Text(
+                '可以继续调整时间，或按现有规则保留这次冲突。',
+                style: TextStyle(
+                  fontSize: 11.5,
+                  height: 1.5,
+                  color: TsColors.textFaint,
+                ),
+              ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            key: const Key('schedule-conflict-close'),
+            style: TsButtons.inline(),
+            onPressed: () => Navigator.of(context).pop(),
+            child: const Text('改时间'),
+          ),
+          FilledButton(
+            key: const Key('schedule-conflict-keep'),
+            onPressed: () => Navigator.of(context).pop(),
+            child: const Text('保留冲突'),
+          ),
+        ],
+      ),
+    );
   }
 
   // ------------------------------------------------------------------ 保存
@@ -377,6 +643,7 @@ class _ScheduleEditorDialogState extends State<ScheduleEditorDialog> {
         actions: [
           TextButton(
             key: const Key('schedule-exceptions-cancel'),
+            style: TsButtons.inline(),
             onPressed: () => Navigator.of(context).pop(false),
             child: const Text('取消'),
           ),
@@ -415,13 +682,13 @@ class _ScheduleEditorDialogState extends State<ScheduleEditorDialog> {
       _setError('备注不能超过 $kScheduleNotesMaxLength 个字符');
       return null;
     }
-    final timezone = _timezone.text.trim();
+    final timezone = _timezoneId.trim();
     if (timezone.isEmpty) {
       _setError('时区不能为空');
       return null;
     }
     if (wallOf(DateTime.now().toUtc(), timezone) == null) {
-      _setError('时区无法解析：$timezone（应使用 IANA 名称，例如 Asia/Shanghai）');
+      _setError('时区无法解析：$timezone；请重新选择有效时区');
       return null;
     }
     final event = widget.event;
@@ -452,6 +719,9 @@ class _ScheduleEditorDialogState extends State<ScheduleEditorDialog> {
       linkedConversationId: forOccurrence
           ? event?.linkedConversationId
           : (_linkedConversationId.isEmpty ? null : _linkedConversationId),
+      linkedTaskId: forOccurrence
+          ? event?.linkedTaskId
+          : (_linkedTaskId.isEmpty ? null : _linkedTaskId),
       repeat: repeat,
       reminder: forOccurrence
           ? (event?.reminder ?? ScheduleReminderKind.none)
@@ -599,6 +869,7 @@ class _ScheduleEditorDialogState extends State<ScheduleEditorDialog> {
         actions: [
           TextButton(
             key: const Key('schedule-discard-cancel'),
+            style: TsButtons.inline(),
             onPressed: () => Navigator.of(context).pop(false),
             child: const Text('继续编辑'),
           ),
@@ -620,8 +891,8 @@ class _ScheduleEditorDialogState extends State<ScheduleEditorDialog> {
   @override
   Widget build(BuildContext context) {
     final media = MediaQuery.sizeOf(context);
-    final width = math.min(640.0, math.max(320.0, media.width - 32));
-    final height = math.min(680.0, math.max(320.0, media.height - 40));
+    final width = math.min(680.0, math.max(320.0, media.width - 32));
+    final height = math.min(700.0, math.max(320.0, media.height - 40));
     return PopScope(
       canPop: false,
       onPopInvokedWithResult: (didPop, _) {
@@ -681,12 +952,9 @@ class _ScheduleEditorDialogState extends State<ScheduleEditorDialog> {
               ),
             ),
           ),
-          IconButton(
+          TsCloseButton(
             key: const Key('schedule-editor-close'),
-            tooltip: '关闭',
-            style: TsButtons.closeIcon(size: 28),
             onPressed: _saving ? null : _requestClose,
-            icon: const Icon(Icons.close, size: 16),
           ),
         ],
       ),
@@ -766,41 +1034,60 @@ class _ScheduleEditorDialogState extends State<ScheduleEditorDialog> {
                     ),
                 ],
                 onChanged: (value) => setState(() {
-                  _linkedConversationId = value ?? '';
+                  final next = value ?? '';
+                  if (next != _linkedConversationId) {
+                    // 换会话清除不匹配的任务引用，并重新只读加载该会话任务。
+                    _linkedTaskId = '';
+                  }
+                  _linkedConversationId = next;
                   _dirty = true;
+                  unawaited(_loadConversationTasks());
                 }),
               ),
             ),
           ],
         ),
+        if (_linkedConversationId.isNotEmpty) _taskField(),
         _sectionLabel('时间'),
         Row(
           children: [
-            Text('全天日程', style: TextStyle(fontSize: 12.5, color: TsColors.textPrimary)),
+            Text('全天日程',
+                style: TextStyle(fontSize: 12.5, color: TsColors.textPrimary)),
             const Spacer(),
             Switch(
               key: const Key('schedule-all-day'),
               value: _allDay,
-              onChanged: (value) => setState(() {
-                _allDay = value;
-                _dirty = true;
-              }),
+              onChanged: (value) {
+                setState(() {
+                  _allDay = value;
+                  _dirty = true;
+                });
+                _refreshConflicts();
+              },
             ),
           ],
         ),
         if (_allDay) ...[
-          _dateField(
-            key: const Key('schedule-allday-start'),
-            pickKey: const Key('schedule-allday-start-pick'),
-            controller: _allDayStart,
-            label: '开始日期',
-          ),
-          const SizedBox(height: 10),
-          _dateField(
-            key: const Key('schedule-allday-end'),
-            pickKey: const Key('schedule-allday-end-pick'),
-            controller: _allDayEnd,
-            label: '结束日期（含当天）',
+          Row(
+            children: [
+              Expanded(
+                child: _dateField(
+                  key: const Key('schedule-allday-start'),
+                  pickKey: const Key('schedule-allday-start-pick'),
+                  controller: _allDayStart,
+                  label: '开始日期',
+                ),
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                child: _dateField(
+                  key: const Key('schedule-allday-end'),
+                  pickKey: const Key('schedule-allday-end-pick'),
+                  controller: _allDayEnd,
+                  label: '结束日期（含当天）',
+                ),
+              ),
+            ],
           ),
         ] else ...[
           Row(
@@ -846,31 +1133,31 @@ class _ScheduleEditorDialogState extends State<ScheduleEditorDialog> {
               ),
             ],
           ),
-          Padding(
-            padding: const EdgeInsets.only(top: 4),
-            child: _hint('精确到分钟；结束日期晚于开始日期即表示跨日，最多跨一天。'),
-          ),
+          if (_overlaps.isNotEmpty) _conflictBanner(),
         ],
         const SizedBox(height: 4),
         Row(
           children: [
             Expanded(
               child: Text(
-                '占用排程时间（其他会话的排程会避开这段）',
+                '占用排程时间',
                 style: TextStyle(fontSize: 12, color: TsColors.textSecondary),
               ),
             ),
             Switch(
               key: const Key('schedule-blocks'),
               value: _blocksScheduling,
-              onChanged: (value) => setState(() {
-                _blocksScheduling = value;
-                _dirty = true;
-              }),
+              onChanged: (value) {
+                setState(() {
+                  _blocksScheduling = value;
+                  _dirty = true;
+                });
+                _refreshConflicts();
+              },
             ),
           ],
         ),
-        _sectionLabel('提醒（应用运行期间）'),
+        const SizedBox(height: 8),
         _reminderDropdown(),
         _sectionLabel('重复'),
         BezierSegments(
@@ -917,54 +1204,32 @@ class _ScheduleEditorDialogState extends State<ScheduleEditorDialog> {
         ],
         if (_repeatKind != 'none') ...[
           const SizedBox(height: 8),
-          _dateField(
-            key: const Key('schedule-until'),
-            pickKey: const Key('schedule-until-pick'),
-            controller: _until,
-            label: '重复结束日期（空 = 不设结束）',
-            clearKey: const Key('schedule-until-clear'),
+          Row(
+            children: [
+              Expanded(
+                child: _dateField(
+                  key: const Key('schedule-until'),
+                  pickKey: const Key('schedule-until-pick'),
+                  controller: _until,
+                  label: '重复结束日期（空 = 不设结束）',
+                ),
+              ),
+              if (_until.text.trim().isNotEmpty)
+                IconButton(
+                  key: const Key('schedule-until-clear'),
+                  tooltip: '清空',
+                  style: TsButtons.icon(size: TsSizes.compactIconSize),
+                  onPressed: () => setState(() {
+                    _until.clear();
+                    _dirty = true;
+                  }),
+                  icon: const Icon(Icons.clear, size: 15),
+                ),
+            ],
           ),
         ],
-        _sectionLabel('备注'),
-        TextField(
-          key: const Key('schedule-notes'),
-          controller: _notes,
-          style: const TextStyle(fontSize: 12.5, height: 1.5),
-          minLines: 2,
-          maxLines: 4,
-          onChanged: (_) => _markDirty(),
-          decoration: const InputDecoration(
-            labelText: '备注（可选，最多 $kScheduleNotesMaxLength 字）',
-          ),
-        ),
-        const SizedBox(height: 8),
-        TextButton.icon(
-          key: const Key('schedule-advanced-toggle'),
-          style: TsButtons.link(),
-          onPressed: () => setState(() => _advanced = !_advanced),
-          icon: Icon(
-            _advanced ? Icons.expand_less : Icons.expand_more,
-            size: 16,
-          ),
-          label: const Text('高级：时区'),
-        ),
-        if (_advanced) ...[
-          const SizedBox(height: 4),
-          TextField(
-            key: const Key('schedule-timezone'),
-            controller: _timezone,
-            style: const TextStyle(fontSize: 12.5),
-            onChanged: (_) => _markDirty(),
-            decoration: const InputDecoration(
-              labelText: 'IANA 时区',
-              hintText: '例如 Asia/Shanghai',
-            ),
-          ),
-          Padding(
-            padding: const EdgeInsets.only(top: 4),
-            child: _hint('定时日程按该时区的当地钟点重复；默认沿用应用当前时区。'),
-          ),
-        ],
+        _sectionLabel('备注与时区'),
+        _notesAndTimezoneSection(),
         if (_error != null) _errorBanner(),
       ],
     );
@@ -1013,18 +1278,26 @@ class _ScheduleEditorDialogState extends State<ScheduleEditorDialog> {
         ),
         _sectionLabel('时间'),
         if (_allDay) ...[
-          _dateField(
-            key: const Key('schedule-allday-start'),
-            pickKey: const Key('schedule-allday-start-pick'),
-            controller: _allDayStart,
-            label: '开始日期',
-          ),
-          const SizedBox(height: 10),
-          _dateField(
-            key: const Key('schedule-allday-end'),
-            pickKey: const Key('schedule-allday-end-pick'),
-            controller: _allDayEnd,
-            label: '结束日期（含当天）',
+          Row(
+            children: [
+              Expanded(
+                child: _dateField(
+                  key: const Key('schedule-allday-start'),
+                  pickKey: const Key('schedule-allday-start-pick'),
+                  controller: _allDayStart,
+                  label: '开始日期',
+                ),
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                child: _dateField(
+                  key: const Key('schedule-allday-end'),
+                  pickKey: const Key('schedule-allday-end-pick'),
+                  controller: _allDayEnd,
+                  label: '结束日期（含当天）',
+                ),
+              ),
+            ],
           ),
         ] else ...[
           Row(
@@ -1070,6 +1343,7 @@ class _ScheduleEditorDialogState extends State<ScheduleEditorDialog> {
               ),
             ],
           ),
+          if (_overlaps.isNotEmpty) _conflictBanner(),
         ],
         Padding(
           padding: const EdgeInsets.only(top: 6),
@@ -1088,6 +1362,75 @@ class _ScheduleEditorDialogState extends State<ScheduleEditorDialog> {
       _fillSeries(event);
       _dirty = true;
     });
+    _refreshConflicts();
+  }
+
+  Widget _taskField() {
+    final options = <DropdownMenuItem<String>>[
+      const DropdownMenuItem<String>(value: '', child: Text('不关联任务')),
+      for (final task in _taskOptions)
+        DropdownMenuItem<String>(
+          value: task.id,
+          child: Text(
+            task.done ? '${task.title}（已完成）' : task.title,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+          ),
+        ),
+    ];
+    final value = _taskOptions.any((task) => task.id == _linkedTaskId)
+        ? _linkedTaskId
+        : '';
+    return Padding(
+      padding: const EdgeInsets.only(top: 10),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          KeyedSubtree(
+            key: ValueKey<String>('tasks-${_taskOptions.length}-$value'),
+            child: DropdownButtonFormField<String>(
+              key: const Key('schedule-linked-task'),
+              initialValue: value,
+              isExpanded: true,
+              style: TextStyle(fontSize: 12.5, color: TsColors.textPrimary),
+              decoration: const InputDecoration(labelText: '关联任务（可选）'),
+              items: options,
+              onChanged: _taskLoading
+                  ? null
+                  : (selected) => setState(() {
+                        _linkedTaskId = selected ?? '';
+                        _dirty = true;
+                      }),
+            ),
+          ),
+          if (_taskLoading)
+            Padding(
+              padding: const EdgeInsets.only(top: 4),
+              child: Text(
+                '正在读取该会话的任务…',
+                style: TextStyle(fontSize: 10.5, color: TsColors.textFaint),
+              ),
+            )
+          else if (_taskLoadError != null)
+            Padding(
+              padding: const EdgeInsets.only(top: 4),
+              child: Text(
+                _taskLoadError!,
+                key: const Key('schedule-linked-task-error'),
+                style: TextStyle(fontSize: 10.5, color: TsColors.blocked),
+              ),
+            )
+          else if (_taskOptions.isEmpty)
+            Padding(
+              padding: const EdgeInsets.only(top: 4),
+              child: Text(
+                '该会话暂无可关联任务',
+                style: TextStyle(fontSize: 10.5, color: TsColors.textFaint),
+              ),
+            ),
+        ],
+      ),
+    );
   }
 
   Widget _reminderDropdown() {
@@ -1107,6 +1450,7 @@ class _ScheduleEditorDialogState extends State<ScheduleEditorDialog> {
           ];
     final value = _allDay ? _allDayReminder : _timedReminder;
     // 定时/全天两套提醒选项互斥；分支切换时重建 FormField，避免内部旧值不在新选项里。
+    // 只保留一个字段标签（含“应用运行期间”限制），不再有重复的“提醒”区块标题。
     return KeyedSubtree(
       key: ValueKey<bool>(_allDay),
       child: DropdownButtonFormField<ScheduleReminderKind>(
@@ -1114,7 +1458,7 @@ class _ScheduleEditorDialogState extends State<ScheduleEditorDialog> {
         initialValue:
             options.contains(value) ? value : ScheduleReminderKind.none,
         style: TextStyle(fontSize: 12.5, color: TsColors.textPrimary),
-        decoration: const InputDecoration(labelText: '提醒'),
+        decoration: const InputDecoration(labelText: '提醒（应用运行期间）'),
         items: <DropdownMenuItem<ScheduleReminderKind>>[
           for (final option in options)
             DropdownMenuItem(value: option, child: Text(option.label)),
@@ -1132,27 +1476,231 @@ class _ScheduleEditorDialogState extends State<ScheduleEditorDialog> {
     );
   }
 
-  Widget _actionRow() {
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(18, 10, 18, 10),
-      child: Row(
-        mainAxisAlignment: MainAxisAlignment.end,
-        children: [
-          TextButton(
-            key: const Key('schedule-cancel'),
-            style: TsButtons.inline(),
-            onPressed: _saving ? null : _requestClose,
-            child: const Text('取消'),
+  Widget _notesAndTimezoneSection() {
+    final eventTimezone = _timezoneId.trim();
+    final option = ScheduleTimeZoneCatalog.find(eventTimezone, _clock().toUtc());
+    final invalid = eventTimezone.isNotEmpty && option == null;
+    final summary = invalid
+        ? '时区无效'
+        : (option == null
+            ? '选择时区'
+            : '${option.offsetLabel} ${option.cityLabel}');
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        InkWell(
+          key: const Key('schedule-notes-timezone-toggle'),
+          borderRadius: BorderRadius.circular(8),
+          onTap: () => setState(() => _notesExpanded = !_notesExpanded),
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+            decoration: BoxDecoration(
+              color: TsColors.surfaceAlt,
+              borderRadius: BorderRadius.circular(8),
+              border: Border.all(color: TsColors.border),
+            ),
+            child: Row(
+              children: [
+                Icon(
+                  _notesExpanded ? Icons.expand_more : Icons.chevron_right,
+                  size: 16,
+                  color: TsColors.textSecondary,
+                ),
+                const SizedBox(width: 6),
+                Text(
+                  '备注与时区',
+                  style: TextStyle(
+                    fontSize: 12.5,
+                    color: TsColors.textPrimary,
+                  ),
+                ),
+                const Spacer(),
+                Flexible(
+                  child: Text(
+                    summary,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      fontSize: 11,
+                      color: invalid ? TsColors.blocked : TsColors.textFaint,
+                    ),
+                  ),
+                ),
+              ],
+            ),
           ),
-          const SizedBox(width: 8),
-          FilledButton(
-            key: const Key('schedule-save'),
-            style: TsButtons.solid(),
-            onPressed: _saving ? null : _save,
-            child: Text(_saving ? '保存中…' : '保存'),
+        ),
+        if (_notesExpanded) ...[
+          const SizedBox(height: 10),
+          TextField(
+            key: const Key('schedule-notes'),
+            controller: _notes,
+            style: const TextStyle(fontSize: 12.5, height: 1.5),
+            minLines: 2,
+            maxLines: 4,
+            onChanged: (_) => _markDirty(),
+            decoration: const InputDecoration(
+              labelText: '备注（可选，最多 $kScheduleNotesMaxLength 字）',
+            ),
+          ),
+          const SizedBox(height: 10),
+          InkWell(
+            key: const Key('schedule-timezone'),
+            borderRadius: BorderRadius.circular(8),
+            onTap: _pickTimezone,
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+              decoration: BoxDecoration(
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(
+                  color: invalid ? TsColors.blocked : TsColors.border,
+                ),
+                color: TsColors.surface,
+              ),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          '时区',
+                          style: TextStyle(
+                            fontSize: 10.5,
+                            color: TsColors.textFaint,
+                          ),
+                        ),
+                        const SizedBox(height: 1),
+                        Text(
+                          invalid
+                              ? '时区无效：$eventTimezone'
+                              : (option == null
+                                  ? '选择时区'
+                                  : '${option.offsetLabel} ${option.cityLabel}'),
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                            fontSize: 12.5,
+                            color: invalid
+                                ? TsColors.blocked
+                                : TsColors.textPrimary,
+                          ),
+                        ),
+                        if (!invalid && option != null)
+                          Text(
+                            option.id,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: TextStyle(
+                              fontSize: 10,
+                              color: TsColors.textFaint,
+                            ),
+                          ),
+                      ],
+                    ),
+                  ),
+                  Icon(Icons.expand_more,
+                      size: 16, color: TsColors.textSecondary),
+                ],
+              ),
+            ),
+          ),
+          if (invalid)
+            Padding(
+              padding: const EdgeInsets.only(top: 4),
+              child: Text(
+                '旧时区值无法解析，保存会被拒绝。请点上方重新选择有效时区；'
+                '不会静默改成其他时区。',
+                key: const Key('schedule-timezone-invalid'),
+                style: TextStyle(
+                  fontSize: 10.5,
+                  height: 1.45,
+                  color: TsColors.blocked,
+                ),
+              ),
+            ),
+          Padding(
+            padding: const EdgeInsets.only(top: 4),
+            child: _hint('定时日程按该时区的当地钟点重复；默认沿用应用当前时区。'),
           ),
         ],
+      ],
+    );
+  }
+
+  Future<void> _pickTimezone() async {
+    final picked = await showScheduleTimeZonePicker(
+      context,
+      currentId: _timezoneId,
+      clock: _clock,
+    );
+    if (picked == null || !mounted) return;
+    setState(() {
+      _timezoneId = picked;
+      _dirty = true;
+    });
+    _refreshConflicts();
+  }
+
+  Widget _conflictBanner() {
+    final first = _overlaps.first;
+    final more = _overlaps.length > 1 ? ' 等 ${_overlaps.length} 条' : '';
+    return Padding(
+      padding: const EdgeInsets.only(top: 6),
+      child: Container(
+        key: const Key('schedule-conflict-banner'),
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+        decoration: bezierDecoration(
+          color: TsColors.pendingSoft,
+          radius: 8,
+          border: Border.all(color: TsColors.pending.withValues(alpha: 0.4)),
+        ),
+        child: Row(
+          children: [
+            Icon(Icons.warning_amber_rounded,
+                size: 15, color: TsColors.pending),
+            const SizedBox(width: 6),
+            Expanded(
+              child: Text(
+                '与「${first.title}」$more重叠 ${first.overlapMinutes} 分钟',
+                maxLines: 2,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(
+                  fontSize: 11.5,
+                  height: 1.4,
+                  color: TsColors.pending,
+                ),
+              ),
+            ),
+            TextButton(
+              key: const Key('schedule-conflict-view'),
+              style: TsButtons.link(),
+              onPressed: _showConflicts,
+              child: const Text('查看'),
+            ),
+          ],
+        ),
       ),
+    );
+  }
+
+  Widget _actionRow() {
+    return TsDialogActions(
+      padding: const EdgeInsets.fromLTRB(18, 10, 18, 10),
+      actions: [
+        TsDialogAction(
+          key: const Key('schedule-cancel'),
+          label: '取消',
+          role: TsDialogActionRole.secondary,
+          onPressed: _saving ? null : _requestClose,
+        ),
+        TsDialogAction(
+          key: const Key('schedule-save'),
+          label: _saving ? '保存中…' : '保存',
+          role: TsDialogActionRole.primary,
+          onPressed: _saving ? null : _save,
+        ),
+      ],
     );
   }
 
@@ -1188,47 +1736,28 @@ class _ScheduleEditorDialogState extends State<ScheduleEditorDialog> {
         ),
       );
 
+  /// 日期字段：复用共享年月日历控件（任务 03），只读点开选择。
   Widget _dateField({
     required Key key,
     required Key pickKey,
     required TextEditingController controller,
     required String label,
-    Key? clearKey,
   }) {
-    return TextField(
+    return DatePickerField(
       key: key,
-      controller: controller,
-      style: const TextStyle(fontSize: 12.5),
-      onChanged: (_) => _markDirty(),
-      decoration: InputDecoration(
-        labelText: label,
-        hintText: 'YYYY-MM-DD',
-        isDense: true,
-        suffixIcon: Row(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            if (clearKey != null)
-              IconButton(
-                key: clearKey,
-                tooltip: '清空',
-                visualDensity: VisualDensity.compact,
-                icon: const Icon(Icons.clear, size: 15),
-                onPressed: () => setState(() {
-                  controller.clear();
-                  _dirty = true;
-                }),
-              ),
-            IconButton(
-              key: pickKey,
-              tooltip: '选择日期',
-              visualDensity: VisualDensity.compact,
-              icon: const Icon(Icons.event, size: 15),
-              onPressed: () => _pickDate(controller, label),
-            ),
-          ],
-        ),
-        suffixIconConstraints: const BoxConstraints(minWidth: 0, minHeight: 0),
-      ),
+      pickIconKey: pickKey,
+      value: parseDateKey(controller.text.trim()) == null
+          ? null
+          : dateKeyToUtc(controller.text.trim()),
+      onChanged: (date) {
+        controller.text = _dateKey(date);
+        _markDirty();
+        _refreshConflicts();
+      },
+      label: label,
+      firstDate: DateTime.utc(2000, 1, 1),
+      lastDate: DateTime.utc(2100, 12, 31),
+      today: DateTime.utc(_nowWall.year, _nowWall.month, _nowWall.day),
     );
   }
 
@@ -1241,30 +1770,16 @@ class _ScheduleEditorDialogState extends State<ScheduleEditorDialog> {
         key: key,
         controller: controller,
         style: const TextStyle(fontSize: 12.5),
-        onChanged: (_) => _markDirty(),
+        onChanged: (_) {
+          _markDirty();
+          _refreshConflicts();
+        },
         decoration: InputDecoration(
           labelText: label,
           hintText: 'HH:mm',
           isDense: true,
         ),
       );
-
-  Future<void> _pickDate(TextEditingController controller, String label) async {
-    final parsed = parseDateKey(controller.text.trim());
-    final base = parsed == null ? _nowWall : dateKeyToUtc(parsed)!;
-    final picked = await showDatePicker(
-      context: context,
-      initialDate: base,
-      firstDate: DateTime(2000),
-      lastDate: DateTime(2100),
-      helpText: label,
-    );
-    if (picked == null || !mounted) return;
-    setState(() {
-      controller.text = _dateKey(picked);
-      _dirty = true;
-    });
-  }
 
   // -------------------------------------------------------------- 小工具
 
@@ -1299,6 +1814,17 @@ class _ScheduleEditorDialogState extends State<ScheduleEditorDialog> {
   }
 
   DateTime? _wallOf(DateTime utc) => wallOf(utc, _timezoneId);
+
+  String _wallTimeLabel(DateTime utc) {
+    final wall = wallOf(utc, widget.timezoneId);
+    if (wall == null) {
+      return '${utc.hour.toString().padLeft(2, '0')}:'
+          '${utc.minute.toString().padLeft(2, '0')}';
+    }
+    return '${wall.month}月${wall.day}日 '
+        '${wall.hour.toString().padLeft(2, '0')}:'
+        '${wall.minute.toString().padLeft(2, '0')}';
+  }
 }
 
 class _TimeSelection {
