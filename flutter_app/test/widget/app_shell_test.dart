@@ -23,6 +23,7 @@ import 'package:taskscheduler_flutter/src/ui/gantt_chart.dart';
 import 'package:taskscheduler_flutter/src/ui/settings_dialog.dart';
 import 'package:taskscheduler_flutter/src/ui/theme.dart';
 
+import '../execution/execution_test_support.dart';
 import '../support/test_support.dart';
 
 typedef Shell = (AppController, FakeScheduleEngine, InMemorySessionRepository);
@@ -44,6 +45,34 @@ Future<Shell> pumpShell(WidgetTester tester,
   await tester.pumpAndSettle();
   addTearDown(controller.dispose);
   return (controller, engine, store);
+}
+
+/// Pumps the shell with an execution timer, so the top status bar (idle/timing) and its
+/// fixed “回顾” entry are part of the tree.
+Future<(AppController, TimerFixture)> pumpShellWithTimer(
+    WidgetTester tester) async {
+  final store = InMemorySessionRepository();
+  await seedConversation(store);
+  final fixture = await TimerFixture.create(memory: true);
+  final controller = AppController(
+    engine: FakeScheduleEngine(),
+    store: store,
+    timer: fixture.timer,
+  );
+  await controller.initialize();
+  await tester.pumpWidget(MaterialApp(
+    theme: buildAppTheme(),
+    home: AppShell(
+      controller: controller,
+      settings: makeTestSettingsController(),
+    ),
+  ));
+  await tester.pumpAndSettle();
+  addTearDown(() async {
+    controller.dispose();
+    await fixture.close();
+  });
+  return (controller, fixture);
 }
 
 String visibleText(WidgetTester tester) => tester
@@ -340,5 +369,69 @@ void main() {
     await tester.pumpAndSettle();
     expect(controller.summaries.length, greaterThan(before));
   });
-}
 
+  // ---------------------------------------------------------------- 0.5.0 task 07
+
+  testWidgets('空闲时状态条最右固定“回顾”，顶部无旧 OCR/分块分析按钮',
+      (tester) async {
+    await tester.binding.setSurfaceSize(const Size(1440, 900));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    await pumpShellWithTimer(tester);
+
+    // 空闲时状态条仍在，且有“当前没有计时中的任务”提示。
+    expect(find.byKey(const Key('execution-status-idle')), findsOneWidget);
+
+    final review = find.byKey(const Key('open-effort-review'));
+    expect(review, findsOneWidget, reason: '空闲时也能进入回顾');
+    expect(find.byKey(const Key('execution-status-review-divider')), findsOneWidget,
+        reason: '回顾与计时/操作区之间必须有主题分隔');
+    // 回顾固定最右：在状态条与分隔线右侧。
+    expect(tester.getCenter(review).dx,
+        greaterThan(tester.getCenter(find.byKey(const Key('execution-status-strip'))).dx));
+
+    // 顶部旧入口已删除（不再有旧按钮与旧占位提示）。
+    expect(find.byKey(const Key('open-chunked-analysis')), findsNothing);
+    expect(find.byKey(const Key('open-ocr-import')), findsNothing);
+    expect(find.text('分块分析'), findsNothing, reason: '顶部不再有旧分块分析按钮');
+    expect(find.text('OCR'), findsNothing, reason: '顶部不再有旧 OCR 按钮');
+    expect(find.textContaining('超大材料分块分析'), findsNothing);
+
+    // 空闲时点“回顾”能打开回顾窗口。
+    await tester.tap(review);
+    await tester.pumpAndSettle();
+    expect(find.text('执行回顾'), findsOneWidget);
+    await tester.sendKeyEvent(LogicalKeyboardKey.escape);
+    await tester.pumpAndSettle();
+    expect(find.text('执行回顾'), findsNothing);
+  });
+
+  testWidgets('计时中状态条仍保留“回顾”且可打开', (tester) async {
+    await tester.binding.setSurfaceSize(const Size(1440, 900));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    final (controller, _) = await pumpShellWithTimer(tester);
+
+    expect(await controller.startTaskTimer('task-a'), isNull);
+    await tester.pumpAndSettle();
+    expect(find.byKey(const Key('execution-status-task')), findsOneWidget);
+    expect(find.byKey(const Key('execution-status-review-divider')), findsOneWidget);
+
+    final review = find.byKey(const Key('open-effort-review'));
+    expect(review, findsOneWidget, reason: '计时中回顾入口必须仍在');
+    await tester.tap(review);
+    await tester.pumpAndSettle();
+    expect(find.text('执行回顾'), findsOneWidget);
+  });
+
+  testWidgets('小窗口时状态条仍能展示“回顾”入口', (tester) async {
+    await tester.binding.setSurfaceSize(const Size(1024, 700));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    await pumpShellWithTimer(tester);
+
+    expect(tester.takeException(), isNull, reason: '窄窗口不应溢出');
+    final review = find.byKey(const Key('open-effort-review'));
+    expect(review, findsOneWidget);
+    final rect = tester.getRect(review);
+    expect(rect.right, lessThanOrEqualTo(1024));
+    expect(rect.left, greaterThanOrEqualTo(0));
+  });
+}

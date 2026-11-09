@@ -38,22 +38,23 @@ void main() {
     ));
     await tester.pumpAndSettle();
     final card = tester.getRect(find.byType(TaskDetailCard));
-    final before = tester.getRect(find.byIcon(Icons.close));
+    final close = find.byKey(const Key('task-detail-close'));
+    final before = tester.getRect(close);
     expect(before.top, greaterThanOrEqualTo(card.top));
     expect(before.right, lessThanOrEqualTo(card.right));
     expect(before.width, greaterThanOrEqualTo(40));
+    expect(before.height, greaterThanOrEqualTo(40));
 
     await tester.drag(
       find.byType(SingleChildScrollView),
       const Offset(0, -2400),
     );
     await tester.pumpAndSettle();
-    final after = tester.getRect(find.byIcon(Icons.close));
+    final after = tester.getRect(close);
     expect(after, before, reason: '滚动到底部后 X 不能跟着内容滚走');
 
-    await tester.tap(find.byIcon(Icons.close));
+    await tester.tap(close);
     await tester.pump();
     expect(interaction.detailTaskId, isNull);
   });
 }
-

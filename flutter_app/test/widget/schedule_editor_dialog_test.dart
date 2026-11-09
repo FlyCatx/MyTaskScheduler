@@ -23,6 +23,8 @@ import 'package:taskscheduler_flutter/src/state/schedule/schedule_expander.dart'
 import 'package:taskscheduler_flutter/src/state/schedule/schedule_store.dart';
 import 'package:taskscheduler_flutter/src/ui/schedule/schedule_editor_dialog.dart';
 import 'package:taskscheduler_flutter/src/ui/theme.dart';
+import 'package:taskscheduler_flutter/src/ui/widgets/date_range_picker.dart'
+    show DatePickerField, formatDatePickerDate;
 
 int _idSeed = 0;
 
@@ -74,6 +76,7 @@ Widget _host({
   ScheduleOccurrence? occurrence,
   List<ScheduleConversationOption> conversations =
       const <ScheduleConversationOption>[],
+  Future<List<ScheduleTaskOption>> Function(String)? loadConversationTasks,
   Brightness brightness = Brightness.light,
   double textScale = 1.0,
 }) {
@@ -97,6 +100,7 @@ Widget _host({
               occurrence: occurrence,
               conversations: conversations,
               clock: () => DateTime.utc(2026, 11, 6, 1),
+              loadConversationTasks: loadConversationTasks,
             ),
             child: const Text('打开编辑'),
           ),
@@ -113,6 +117,7 @@ Future<void> _open(
   ScheduleOccurrence? occurrence,
   List<ScheduleConversationOption> conversations =
       const <ScheduleConversationOption>[],
+  Future<List<ScheduleTaskOption>> Function(String)? loadConversationTasks,
   Brightness brightness = Brightness.light,
   double textScale = 1.0,
 }) async {
@@ -122,6 +127,7 @@ Future<void> _open(
     event: event,
     occurrence: occurrence,
     conversations: conversations,
+    loadConversationTasks: loadConversationTasks,
     brightness: brightness,
     textScale: textScale,
   ));
@@ -137,6 +143,39 @@ String _textOf(WidgetTester tester, Key key) {
   return field.controller?.text ?? '';
 }
 
+String _dateOf(WidgetTester tester, Key key) {
+  final field = tester.widget<DatePickerField>(find.byKey(key));
+  return field.value == null ? '' : formatDatePickerDate(field.value!);
+}
+
+/// 通过共享年月日历控件选一个日期（开始/结束字段均为只读点开选择）。
+Future<void> _pickDate(WidgetTester tester, Key fieldKey, String dateKey) async {
+  await tester.tap(find.byKey(fieldKey));
+  await tester.pump();
+  await tester.pump(const Duration(milliseconds: 250));
+  final day = find.byKey(Key('calendar-day-$dateKey'));
+  expect(day, findsOneWidget, reason: '日期弹层应显示 $dateKey 的日格');
+  await tester.tap(day);
+  await tester.pump();
+  await tester.pump(const Duration(milliseconds: 250));
+}
+
+/// 编辑正文可滚动：点下方字段前先滚动到可见（与真实用户一致）。
+Future<void> _tapVisible(WidgetTester tester, Finder finder) async {
+  // 用纵向 Scrollable（弹窗正文）而不是 TextField 内部的横向 Scrollable。
+  final scrollable = find
+      .byWidgetPredicate(
+          (widget) => widget is Scrollable && widget.axisDirection == AxisDirection.down)
+      .first;
+  for (var i = 0; i < 8; i++) {
+    if (finder.hitTestable().evaluate().isNotEmpty) break;
+    await tester.drag(scrollable, const Offset(0, -200));
+    await tester.pumpAndSettle();
+  }
+  await tester.tap(finder);
+  await tester.pumpAndSettle();
+}
+
 Future<ScheduleEvent> _seed(
   ScheduleController controller, {
   String title = '周会',
@@ -148,11 +187,13 @@ Future<ScheduleEvent> _seed(
   ScheduleRepeatRule repeat = const ScheduleRepeatRule.none(),
   ScheduleCategory? category,
   String? linkedConversationId,
+  String? linkedTaskId,
+  String timezoneId = 'Asia/Shanghai',
   ScheduleReminderKind reminder = ScheduleReminderKind.none,
 }) async {
   final result = await controller.createEvent(ScheduleDraft(
     title: title,
-    timezoneId: 'Asia/Shanghai',
+    timezoneId: timezoneId,
     startDate: startDate,
     allDay: allDay,
     startMinute: allDay ? null : startMinute,
@@ -161,6 +202,7 @@ Future<ScheduleEvent> _seed(
     repeat: repeat,
     category: category,
     linkedConversationId: linkedConversationId,
+    linkedTaskId: linkedTaskId,
     reminder: reminder,
   ));
   expect(result.ok, isTrue, reason: result.message);
@@ -225,12 +267,10 @@ void main() {
 
     await _open(tester, controller: controller);
     await tester.enterText(find.byKey(const Key('schedule-title')), '跨夜值班');
-    await tester.enterText(
-        find.byKey(const Key('schedule-start-date')), '2026-11-09');
+    await _pickDate(tester, const Key('schedule-start-date'), '2026-11-09');
     await tester.enterText(
         find.byKey(const Key('schedule-start-time')), '23:30');
-    await tester.enterText(
-        find.byKey(const Key('schedule-end-date')), '2026-11-10');
+    await _pickDate(tester, const Key('schedule-end-date'), '2026-11-10');
     await tester.enterText(
         find.byKey(const Key('schedule-end-time')), '00:30');
     await tester.tap(find.byKey(const Key('schedule-save')));
@@ -251,12 +291,10 @@ void main() {
 
     await _open(tester, controller: controller);
     await tester.enterText(find.byKey(const Key('schedule-title')), '纪念日');
-    await tester.enterText(
-        find.byKey(const Key('schedule-start-date')), '2026-11-19');
+    await _pickDate(tester, const Key('schedule-start-date'), '2026-11-19');
     await tester.enterText(
         find.byKey(const Key('schedule-start-time')), '18:15');
-    await tester.enterText(
-        find.byKey(const Key('schedule-end-date')), '2026-11-19');
+    await _pickDate(tester, const Key('schedule-end-date'), '2026-11-19');
     await tester.enterText(
         find.byKey(const Key('schedule-end-time')), '19:45');
 
@@ -264,17 +302,15 @@ void main() {
     await tester.tap(find.byKey(const Key('schedule-all-day')));
     await tester.pumpAndSettle();
     expect(find.byKey(const Key('schedule-start-time')), findsNothing);
-    await tester.enterText(
-        find.byKey(const Key('schedule-allday-start')), '2026-11-20');
-    await tester.enterText(
-        find.byKey(const Key('schedule-allday-end')), '2026-11-21');
+    await _pickDate(tester, const Key('schedule-allday-start'), '2026-11-20');
+    await _pickDate(tester, const Key('schedule-allday-end'), '2026-11-21');
 
     // 切回定时：刚才 18:15/19:45 没有被全天分支覆盖。
     await tester.tap(find.byKey(const Key('schedule-all-day')));
     await tester.pumpAndSettle();
     expect(_textOf(tester, const Key('schedule-start-time')), '18:15');
     expect(_textOf(tester, const Key('schedule-end-time')), '19:45');
-    expect(_textOf(tester, const Key('schedule-start-date')), '2026-11-19');
+    expect(_dateOf(tester, const Key('schedule-start-date')), '2026-11-19');
 
     // 再切回全天提交：只保存全天分支，界面结束日含当天 → 存储排他 +1 天。
     await tester.tap(find.byKey(const Key('schedule-all-day')));
@@ -512,5 +548,327 @@ void main() {
     expect(find.byKey(const Key('schedule-title')), findsOneWidget);
     expect(find.byKey(const Key('schedule-save')), findsOneWidget);
     expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('删除常驻说明；提醒只出现一个字段标签并说明运行期限制', (tester) async {
+    await tester.binding.setSurfaceSize(const Size(1200, 900));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    final controller = await _readyController();
+
+    await _open(tester, controller: controller);
+    expect(find.textContaining('精确到分钟'), findsNothing);
+    expect(find.textContaining('其他会话的排程会避开这段'), findsNothing);
+    expect(find.byKey(const Key('schedule-blocks')), findsOneWidget);
+    // 只有一个“提醒”字段标签，且带运行期限制。
+    expect(find.text('提醒'), findsNothing);
+    expect(find.text('提醒（应用运行期间）'), findsOneWidget);
+    expect(find.byKey(const Key('schedule-reminder')), findsOneWidget);
+    // 开始/结束复用共享日期控件，定时事项保留时分输入。
+    expect(find.byType(DatePickerField), findsNWidgets(2));
+    expect(find.byKey(const Key('schedule-start-time')), findsOneWidget);
+    expect(find.byKey(const Key('schedule-end-time')), findsOneWidget);
+
+    // 全天分支只输入日期，不显示时分。
+    await tester.tap(find.byKey(const Key('schedule-all-day')));
+    await tester.pumpAndSettle();
+    expect(find.byKey(const Key('schedule-start-time')), findsNothing);
+    expect(find.byKey(const Key('schedule-end-time')), findsNothing);
+    expect(find.byKey(const Key('schedule-allday-start')), findsOneWidget);
+    expect(find.byKey(const Key('schedule-allday-end')), findsOneWidget);
+  });
+
+  testWidgets('时区选单可搜索中文城市并保存 IANA；重开预选', (tester) async {
+    await tester.binding.setSurfaceSize(const Size(1200, 900));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    final controller = await _readyController();
+
+    await _open(tester, controller: controller);
+    await tester.enterText(find.byKey(const Key('schedule-title')), '时区日程');
+    await _tapVisible(
+        tester, find.byKey(const Key('schedule-notes-timezone-toggle')));
+    expect(find.byKey(const Key('schedule-notes')), findsOneWidget,
+        reason: '展开备注与时区');
+    await _tapVisible(tester, find.byKey(const Key('schedule-timezone')));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 250));
+    expect(find.byKey(const Key('schedule-timezone-picker')), findsOneWidget);
+    await tester.enterText(
+        find.byKey(const Key('schedule-timezone-search')), '北京');
+    await tester.pump();
+    await tester.tap(
+        find.byKey(const Key('schedule-timezone-option-Asia/Shanghai')));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 250));
+    await tester.tap(find.byKey(const Key('schedule-save')));
+    await tester.pumpAndSettle();
+
+    expect(controller.events, hasLength(1));
+    final event = controller.events.single;
+    expect(event.timezoneId, 'Asia/Shanghai');
+
+    // 重开：时区选单预选为保存的 IANA 值。
+    await _open(tester, controller: controller, event: event);
+    await _tapVisible(tester, find.byKey(const Key('schedule-notes-timezone-toggle')));
+    await tester.pumpAndSettle();
+    expect(find.text('Asia/Shanghai'), findsOneWidget);
+    expect(find.byKey(const Key('schedule-timezone-invalid')), findsNothing);
+  });
+
+  testWidgets('同偏移不同 DST 地区分别保存：Europe/London 与 Africa/Abidjan',
+      (tester) async {
+    await tester.binding.setSurfaceSize(const Size(1200, 900));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    final controller = await _readyController();
+
+    Future<void> createWith(String search, String expectedId) async {
+      await _open(tester, controller: controller);
+      await tester.enterText(
+          find.byKey(const Key('schedule-title')), '时区-$expectedId');
+      await _tapVisible(tester, find.byKey(const Key('schedule-notes-timezone-toggle')));
+      await tester.pumpAndSettle();
+      await _tapVisible(tester, find.byKey(const Key('schedule-timezone')));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 250));
+      await tester.enterText(
+          find.byKey(const Key('schedule-timezone-search')), search);
+      await tester.pump();
+      // 伦敦与阿比让当前都是 UTC+00:00，但只有伦敦有夏令时：分别列出且可区分。
+      await tester.tap(find.byKey(Key('schedule-timezone-option-$expectedId')));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 250));
+      await tester.tap(find.byKey(const Key('schedule-save')));
+      await tester.pumpAndSettle();
+      expect(
+        controller.events.any((event) =>
+            event.timezoneId == expectedId && event.title == '时区-$expectedId'),
+        isTrue,
+      );
+    }
+
+    await createWith('伦敦', 'Europe/London');
+    await createWith('阿比让', 'Africa/Abidjan');
+  });
+
+  testWidgets('无效旧时区：显示修复入口、保存被拒绝，重选后才写入', (tester) async {
+    await tester.binding.setSurfaceSize(const Size(1200, 900));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    final controller = await _readyController();
+    final event = await _seed(
+      controller,
+      title: '旧时区日程',
+      timezoneId: 'Invalid/Zone',
+    );
+    expect(event.timezoneId, 'Invalid/Zone');
+
+    await _open(tester, controller: controller, event: event);
+    await _tapVisible(tester, find.byKey(const Key('schedule-notes-timezone-toggle')));
+    await tester.pumpAndSettle();
+    expect(find.byKey(const Key('schedule-timezone-invalid')), findsOneWidget);
+    await tester.tap(find.byKey(const Key('schedule-save')));
+    await tester.pumpAndSettle();
+    expect(find.byKey(const Key('schedule-editor-error')), findsOneWidget);
+    expect(find.textContaining('时区无法解析'), findsOneWidget);
+
+    await _tapVisible(tester, find.byKey(const Key('schedule-timezone')));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 250));
+    await tester.enterText(
+        find.byKey(const Key('schedule-timezone-search')), '上海');
+    await tester.pump();
+    await tester.tap(
+        find.byKey(const Key('schedule-timezone-option-Asia/Shanghai')));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 250));
+    await tester.tap(find.byKey(const Key('schedule-save')));
+    await tester.pumpAndSettle();
+    expect(find.byKey(const Key('schedule-editor-dialog')), findsNothing);
+    expect(controller.eventById(event.id)!.timezoneId, 'Asia/Shanghai');
+  });
+
+  testWidgets('选择关联会话后可选该会话任务并保存稳定 ID', (tester) async {
+    await tester.binding.setSurfaceSize(const Size(1200, 900));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    final controller = await _readyController();
+    const conversations = <ScheduleConversationOption>[
+      ScheduleConversationOption(id: 'c-1', title: '会话一'),
+    ];
+    Future<List<ScheduleTaskOption>> loadTasks(String id) async {
+      if (id != 'c-1') return const <ScheduleTaskOption>[];
+      return const <ScheduleTaskOption>[
+        ScheduleTaskOption(id: 't-1', title: '任务一'),
+        ScheduleTaskOption(id: 't-2', title: '任务二', done: true),
+      ];
+    }
+
+    await _open(
+      tester,
+      controller: controller,
+      conversations: conversations,
+      loadConversationTasks: loadTasks,
+    );
+    await tester.enterText(find.byKey(const Key('schedule-title')), '关联任务日程');
+    await tester.tap(find.byKey(const Key('schedule-linked')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('会话一').last);
+    await tester.pumpAndSettle();
+    expect(find.byKey(const Key('schedule-linked-task')), findsOneWidget);
+    await tester.tap(find.text('不关联任务').last);
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('任务二（已完成）').last);
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const Key('schedule-save')));
+    await tester.pumpAndSettle();
+
+    final event = controller.events.single;
+    expect(event.linkedConversationId, 'c-1');
+    expect(event.linkedTaskId, 't-2');
+  });
+
+  testWidgets('换会话清除不匹配任务；任务被删除时清空引用', (tester) async {
+    await tester.binding.setSurfaceSize(const Size(1200, 900));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    final controller = await _readyController();
+    final event = await _seed(
+      controller,
+      title: '已关联',
+      linkedConversationId: 'c-1',
+      linkedTaskId: 't-1',
+    );
+    expect(event.linkedTaskId, 't-1');
+    const conversations = <ScheduleConversationOption>[
+      ScheduleConversationOption(id: 'c-1', title: '会话一'),
+      ScheduleConversationOption(id: 'c-2', title: '会话二'),
+    ];
+    Future<List<ScheduleTaskOption>> loadTasks(String id) async {
+      if (id == 'c-1') {
+        return const <ScheduleTaskOption>[
+          ScheduleTaskOption(id: 't-1', title: '任务一'),
+        ];
+      }
+      return const <ScheduleTaskOption>[
+        ScheduleTaskOption(id: 't-9', title: '另一会话任务'),
+      ];
+    }
+
+    await _open(
+      tester,
+      controller: controller,
+      event: event,
+      conversations: conversations,
+      loadConversationTasks: loadTasks,
+    );
+    await tester.tap(find.byKey(const Key('schedule-linked')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('会话二').last);
+    await tester.pumpAndSettle();
+    // 任务下拉已刷新为新会话任务；旧的 t-1 不在选项里。
+    await tester.tap(find.text('不关联任务').last);
+    await tester.pumpAndSettle();
+    expect(find.text('另一会话任务').last, findsOneWidget);
+    await tester.tap(find.text('另一会话任务').last);
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const Key('schedule-save')));
+    await tester.pumpAndSettle();
+
+    final saved = controller.eventById(event.id)!;
+    expect(saved.linkedConversationId, 'c-2');
+    expect(saved.linkedTaskId, 't-9');
+
+    // 再模拟任务被删除：loader 对该会话返回空 → 打开即清除引用，保存后为空。
+    Future<List<ScheduleTaskOption>> loadDeleted(String id) async =>
+        const <ScheduleTaskOption>[];
+    final latest = controller.eventById(event.id)!;
+    await _open(
+      tester,
+      controller: controller,
+      event: latest,
+      conversations: conversations,
+      loadConversationTasks: loadDeleted,
+    );
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const Key('schedule-save')));
+    await tester.pumpAndSettle();
+    expect(controller.eventById(event.id)!.linkedTaskId, isNull);
+  });
+
+  testWidgets('开始/结束变化触发重叠检测：显示相交对象与实际重叠分钟，可保留冲突',
+      (tester) async {
+    await tester.binding.setSurfaceSize(const Size(1200, 900));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    final controller = await _readyController();
+    final a = await _seed(
+      controller,
+      title: '前端页面开发',
+      startDate: '2026-11-09',
+      startMinute: 14 * 60,
+      endMinute: 15 * 60,
+    );
+    final b = await _seed(
+      controller,
+      title: '设计讨论',
+      startDate: '2026-11-09',
+      startMinute: 14 * 60 + 30,
+      endMinute: 15 * 60 + 30,
+    );
+
+    await _open(tester, controller: controller, event: b);
+    expect(find.byKey(const Key('schedule-conflict-banner')), findsOneWidget);
+    expect(find.textContaining('前端页面开发'), findsWidgets);
+    expect(find.textContaining('重叠 30 分钟'), findsOneWidget);
+    await tester.tap(find.byKey(const Key('schedule-conflict-view')));
+    await tester.pumpAndSettle();
+    expect(find.byKey(const Key('schedule-conflict-dialog')), findsOneWidget);
+    expect(find.textContaining('重叠 30 分钟'), findsWidgets);
+    await tester.tap(find.byKey(const Key('schedule-conflict-keep')));
+    await tester.pumpAndSettle();
+    // 按既有规则保留冲突：保存成功，不会阻止写入。
+    await tester.tap(find.byKey(const Key('schedule-save')));
+    await tester.pumpAndSettle();
+    expect(find.byKey(const Key('schedule-editor-dialog')), findsNothing);
+    expect(controller.eventById(b.id)!.startMinute, 14 * 60 + 30);
+
+    // 编辑自身时排除原记录：编辑 A 只会看到 B 的 30 分钟重叠。
+    final latestA = controller.eventById(a.id)!;
+    await _open(tester, controller: controller, event: latestA);
+    expect(find.byKey(const Key('schedule-conflict-banner')), findsOneWidget);
+    expect(find.textContaining('「设计讨论」'), findsOneWidget);
+    await tester.tap(find.byKey(const Key('schedule-editor-close')));
+    await tester.pumpAndSettle();
+
+    // 刚好首尾相接 = 0 分钟：C 从 15:30 开始，与 A/B 都不冲突。
+    final c = await _seed(
+      controller,
+      title: '版本验收',
+      startDate: '2026-11-09',
+      startMinute: 15 * 60 + 30,
+      endMinute: 16 * 60 + 30,
+    );
+    await _open(tester, controller: controller, event: c);
+    expect(find.byKey(const Key('schedule-conflict-banner')), findsNothing);
+  });
+
+  testWidgets('占用开关关闭后不再提示排程冲突', (tester) async {
+    await tester.binding.setSurfaceSize(const Size(1200, 900));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    final controller = await _readyController();
+    await _seed(
+      controller,
+      title: '前端页面开发',
+      startDate: '2026-11-09',
+      startMinute: 14 * 60,
+      endMinute: 15 * 60,
+    );
+    final b = await _seed(
+      controller,
+      title: '设计讨论',
+      startDate: '2026-11-09',
+      startMinute: 14 * 60 + 30,
+      endMinute: 15 * 60 + 30,
+    );
+    await _open(tester, controller: controller, event: b);
+    expect(find.byKey(const Key('schedule-conflict-banner')), findsOneWidget);
+    await tester.tap(find.byKey(const Key('schedule-blocks')));
+    await tester.pumpAndSettle();
+    expect(find.byKey(const Key('schedule-conflict-banner')), findsNothing);
   });
 }

@@ -154,6 +154,8 @@ Future<void> pumpDetailsDialogHost(
   required ConflictSnapshot Function() currentSnapshot,
   required Recorded record,
   bool canEdit = true,
+  VoidCallback? onLocate,
+  VoidCallback? onOpenTimetable,
 }) async {
   await tester.pumpWidget(MaterialApp(
     theme: buildAppTheme(Brightness.light),
@@ -172,6 +174,8 @@ Future<void> pumpDetailsDialogHost(
                 return true;
               },
               canEdit: canEdit,
+              onLocate: onLocate,
+              onOpenTimetable: onOpenTimetable,
             ),
             child: const Text('打开冲突详情'),
           ),
@@ -244,7 +248,38 @@ void main() {
     expect(find.textContaining('1 小时'), findsWidgets);
     expect(find.textContaining('同快照可用容量'), findsWidgets);
     expect(find.textContaining('计划版本 rev 3'), findsWidgets);
-    expect(find.textContaining('允许保存'), findsWidgets);
+    // 绿色区域只留一份明细：每类事实只出现一次，不再有灰色复述段落。
+    expect(find.byKey(const Key('conflict-detail-tasks')), findsOneWidget);
+    expect(find.byKey(const Key('conflict-detail-range')), findsOneWidget);
+    expect(find.byKey(const Key('conflict-detail-remaining')), findsOneWidget);
+    expect(find.byKey(const Key('conflict-detail-capacity')), findsOneWidget);
+    expect(find.byKey(const Key('conflict-detail-explanation')), findsNothing);
+    // 黄色区域删除叙述；允许保存冲突的能力保留（不再用灰色说明文案充当证据）。
+    expect(find.byKey(const Key('conflict-allow-save-note')), findsNothing);
+    expect(
+      find.descendant(
+        of: find.byKey(const Key('conflict-detail-dialog')),
+        matching: find.textContaining('允许保存'),
+      ),
+      findsNothing,
+    );
+    expect(find.textContaining('本地确定性生成'), findsNothing);
+    expect(
+      find.descendant(
+        of: find.byKey(const Key('conflict-detail-dialog')),
+        matching: find.textContaining('不会偷偷删除'),
+      ),
+      findsNothing,
+    );
+    // 主按钮“在甘特图中定位”、次按钮“关闭”。
+    expect(
+      tester.widget(find.byKey(const Key('conflict-detail-locate'))),
+      isA<FilledButton>(),
+    );
+    expect(
+      tester.widget(find.byKey(const Key('conflict-detail-close'))),
+      isA<TextButton>(),
+    );
     // 覆盖来源提示不是“自动解决”，而是一次可见的允许保存的冲突。
     expect(find.textContaining('写报告'), findsWidgets);
     expect(find.textContaining('做实验'), findsWidgets);
@@ -341,12 +376,13 @@ void main() {
     expect(find.textContaining('计划版本 rev 4'), findsWidgets);
   });
 
-  testWidgets('无可行自动建议时给出原因，并保留“允许带冲突保存”', (tester) async {
+  testWidgets('无可行自动建议时只写简短原因，并给有效手动入口', (tester) async {
     final schedule = overlapSchedule(source: SegmentSource.manual);
     final tasks = schedulingTasks(plan.tasks);
     final detail = detailOfKind(schedule, tasks, ConflictKind.taskOverlap);
     final record = Recorded();
     final snapshot = snapshotOf(schedule, plan.tasks);
+    var openedTimetable = 0;
 
     await pumpDetailsDialogHost(
       tester,
@@ -354,20 +390,25 @@ void main() {
       snapshot: snapshot,
       currentSnapshot: () => snapshot,
       record: record,
+      onLocate: () {},
+      onOpenTimetable: () => openedTimetable++,
     );
 
     expect(find.byKey(const Key('conflict-suggestion-none')), findsOneWidget);
     expect(find.byKey(const Key('conflict-none-reason')), findsOneWidget);
-    expect(find.textContaining('手动'), findsWidgets);
-    expect(find.textContaining('没有可自动应用的可行建议'), findsOneWidget);
+    expect(find.text('该时段已手动固定'), findsOneWidget,
+        reason: '手动固定只写一句短原因');
+    expect(find.textContaining('没有可自动应用的可行建议'), findsNothing);
+    expect(find.textContaining('不会偷偷删除'), findsNothing);
     expect(
       find.byKey(const Key('conflict-suggestion-apply-moveToNextGap')),
       findsNothing,
     );
-    expect(find.byKey(const Key('conflict-allow-save-note')), findsOneWidget);
-
-    await tester.tap(find.byKey(const Key('conflict-detail-close')));
+    // 无自动建议时给真实手动入口；点击后关闭本层并调用入口。
+    await tester.tap(
+        find.byKey(const Key('conflict-suggestion-none-manual-entry')));
     await tester.pumpAndSettle();
+    expect(openedTimetable, 1);
     expect(find.byKey(const Key('conflict-detail-dialog')), findsNothing);
     expect(record.commits, isEmpty);
   });

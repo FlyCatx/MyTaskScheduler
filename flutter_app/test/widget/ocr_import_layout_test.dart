@@ -4,16 +4,19 @@
 //
 // test/ocr/ocr_import_dialog_test.dart（ocr-dev2 的目录）里，本文件不改它们。
 //
-// 验收点：
+// 布局检查：
 //   * 选择阶段：格式/文字层说明并入文件控件（按钮 Tooltip + 控件内简短提示），
 //     初始页两段常驻说明（文件格式+文字层处理、后续联网边界）整段删除、不占位；
-//     模型发送边界保留在可随时打开的“使用说明与联网边界”入口（标题栏帮助）；
+//     标题栏问号提示统一为“使用说明”，帮助里只有格式与提取方式，不再有联网边界
+//     与安装说明常驻；
 //   * 顶部 _boundaryNotice 与“识别语言：…”常驻说明已删除，且没有留下空白；
 //   * 页计划列表不再固定 maxHeight: 168：长列表独立滚动、短列表按内容收缩，
 //     16 页样例显示的行数明显多于原来约 7 行；
 //   * 文件选择 / 页范围 / DPI / 密码 / 建议页范围 / 开始识别 / 底部按钮始终可达；
 //   * 极矮窗口允许整表滚动；
-//   * 窄窗 + 1.5 倍字号不溢出，页码/原因/说明三列不互相覆盖。
+//   * 窄窗 + 1.5 倍字号不溢出，页码/原因/说明三列不互相覆盖；
+//   * 校对页：图10 红框常驻“逐页校对……”说明及空白占位删除，识别原文含该词
+//     仍保留；页数/待校对/风险字段/逐页编辑/恢复原文/确认加入材料齐全。
 
 import 'dart:io';
 
@@ -22,6 +25,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:taskscheduler_flutter/src/state/ocr/ocr_host.dart';
 import 'package:taskscheduler_flutter/src/state/ocr/ocr_page_detection.dart';
 import 'package:taskscheduler_flutter/src/state/ocr/ocr_service.dart';
+import 'package:taskscheduler_flutter/src/state/ocr/ocr_types.dart';
 import 'package:taskscheduler_flutter/src/ui/ocr/ocr_import_dialog.dart';
 import 'package:taskscheduler_flutter/src/ui/theme.dart';
 
@@ -92,7 +96,8 @@ void main() {
 
   /// 有界 pump：探测本地 OCR 组件时进度指示器一直在转，pumpAndSettle 永远不会停。
   Future<void> settle(WidgetTester tester,
-      {Duration step = const Duration(milliseconds: 120), int maxSteps = 40}) async {
+      {Duration step = const Duration(milliseconds: 120),
+      int maxSteps = 40}) async {
     await tester.pump();
     for (var i = 0; i < maxSteps; i++) {
       await tester.pump(step);
@@ -171,8 +176,7 @@ void main() {
     return count;
   }
 
-  testWidgets('选择阶段：格式提示并入文件控件，联网边界移入可查看帮助入口',
-      (tester) async {
+  testWidgets('选择阶段：格式提示并入文件控件，帮助只保留格式与提取方式', (tester) async {
     await setSurface(tester, const Size(1280, 900));
     await openSelect(tester);
 
@@ -180,13 +184,9 @@ void main() {
     expect(find.byKey(const Key('ocr-pick-file')), findsOneWidget);
     expect(find.byKey(const Key('ocr-file-name')), findsOneWidget);
     expect(find.byKey(const Key('ocr-file-hint')), findsOneWidget);
-    expect(find.textContaining('文本型 PDF 复用原文字层'), findsWidgets);
+    expect(find.text(OcrFileSupport.helpBody), findsWidgets);
     // 格式说明并入按钮 Tooltip（可随时查看，不再占一整段常驻正文）。
-    expect(
-      find.byTooltip('支持扫描型/混合文字层 PDF、PNG、JPEG；'
-          '文本型 PDF 优先使用原有文字层，不重复识别。'),
-      findsOneWidget,
-    );
+    expect(find.byTooltip('使用说明'), findsOneWidget);
 
     // 旧的两段常驻说明（格式+文字层处理、后续联网边界）必须整段消失。
     expect(find.textContaining('支持扫描型 PDF、混合文字/扫描 PDF'), findsNothing);
@@ -194,23 +194,65 @@ void main() {
     expect(find.textContaining('只有你主动让已配置的模型分析材料时'), findsNothing);
     expect(find.byKey(const Key('ocr-local-boundary')), findsNothing);
 
-    // 边界说明保留一处可达入口：标题栏帮助。
+    // 帮助入口仍可达，但内容只剩格式/提取方式：红框联网边界与安装说明都退出。
     expect(find.byKey(const Key('ocr-help')), findsOneWidget);
     await tester.tap(find.byKey(const Key('ocr-help')));
     await settle(tester);
     expect(find.byKey(const Key('ocr-help-dialog')), findsOneWidget);
     expect(find.byKey(const Key('ocr-help-body')), findsOneWidget);
-    expect(find.byKey(const Key('ocr-help-boundary')), findsOneWidget);
-    expect(find.textContaining('只有你主动让已配置的模型分析材料时'), findsWidgets);
-    expect(find.textContaining('本机完成'), findsWidgets);
+    expect(find.text(OcrFileSupport.helpBody), findsWidgets);
+    expect(find.byKey(const Key('ocr-help-boundary')), findsNothing);
+    expect(find.textContaining('联网边界'), findsNothing);
+    expect(find.textContaining('只有你主动让已配置的模型分析材料时'), findsNothing);
+    expect(find.textContaining('光学字符识别'), findsNothing);
     await tester.tap(find.byKey(const Key('ocr-help-close')));
     await settle(tester);
     expect(find.byKey(const Key('ocr-help-dialog')), findsNothing);
     expect(tester.takeException(), isNull);
   });
 
-  testWidgets('16 页混合 PDF：两段常驻说明已删除，页计划列表吃掉剩余高度',
-      (tester) async {
+  testWidgets('校对页：常驻“逐页校对”说明删除，识别原文含该词仍保留', (tester) async {
+    await setSurface(tester, const Size(1280, 900));
+    fakeClient.documentInfoResult =
+        const OcrDocumentInfo(kind: 'pdf', pageCount: kPageCount);
+    fakeClient.runHandler = (request) async => fakeJobResult(
+          request: request,
+          pages: request.pages,
+          texts: <int, String>{
+            for (final page in request.pages)
+              page: '第 $page 页原文：逐页校对是材料正文，不是界面说明。',
+          },
+        );
+    await openConfigure(tester, 'scan.pdf');
+    await tester.tap(find.byKey(const Key('ocr-start')));
+    await settle(tester);
+
+    // 图10 红框段落（产品界面文字）连同空白占位删除。
+    expect(
+      find.byWidgetPredicate((widget) =>
+          widget is Text && (widget.data ?? '').contains('识别原文与你的修改分开保存')),
+      findsNothing,
+    );
+    expect(find.textContaining('识别原文与你的修改分开保存'), findsNothing);
+    // 识别原文本身含“逐页校对”时仍显示、可编辑、可恢复。
+    expect(find.textContaining('逐页校对是材料正文'), findsWidgets);
+    final field = tester.widget<TextField>(
+      find.byKey(const Key('ocr-review-text-7')),
+    );
+    expect(field.controller!.text, contains('逐页校对'));
+    // 保留：页数、待校对数量/风险提示、恢复识别原文、确认加入材料。
+    expect(find.textContaining('第 7 页'), findsWidgets);
+    expect(find.byKey(const Key('ocr-review-hint')), findsOneWidget);
+    expect(find.byKey(const Key('ocr-reset-review-7')), findsOneWidget);
+    expect(find.byKey(const Key('ocr-confirm')), findsOneWidget);
+    // 删除后没有遗留空白行：风险提示紧跟识别摘要。
+    final summary = tester.getRect(find.byKey(const Key('ocr-review-summary')));
+    final hint = tester.getRect(find.byKey(const Key('ocr-review-hint')));
+    expect(hint.top - summary.bottom, lessThanOrEqualTo(12));
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('16 页混合 PDF：两段常驻说明已删除，页计划列表吃掉剩余高度', (tester) async {
     await setSurface(tester, const Size(1280, 900));
     await openConfigure(tester, 'scan.pdf');
 
@@ -235,8 +277,7 @@ void main() {
 
     // 2) 页列表获得剩余高度：不再固定在 168。
     final planRect = tester.getRect(find.byKey(const Key('ocr-page-plan')));
-    expect(planRect.height, greaterThan(260),
-        reason: '页计划列表必须吃掉删除文案与底部富余的高度');
+    expect(planRect.height, greaterThan(260), reason: '页计划列表必须吃掉删除文案与底部富余的高度');
 
     // 3) 16 页样例显示的行数明显多于原来的约 7 行。
     final rows = visiblePlanRows(tester);
@@ -265,7 +306,8 @@ void main() {
     await openConfigure(tester, 'scan.pdf');
 
     final cardBefore = cardRect(tester);
-    final pageSpecBefore = tester.getRect(find.byKey(const Key('ocr-page-spec')));
+    final pageSpecBefore =
+        tester.getRect(find.byKey(const Key('ocr-page-spec')));
     expect(find.byKey(const Key('ocr-page-plan-row-1')), findsOneWidget);
 
     // 列表自己的 Scrollable（不是外层页面）。
@@ -279,18 +321,17 @@ void main() {
     await tester.pump();
     await tester.pumpAndSettle();
 
-    expect(scrollState.position.pixels, greaterThan(0),
-        reason: '长列表必须能独立滚动');
+    expect(scrollState.position.pixels, greaterThan(0), reason: '长列表必须能独立滚动');
     // 滚动后后面的页进入视口（前几行离开并被回收，说明是真滚动了）。
     expect(find.byKey(const Key('ocr-page-plan-row-12')), findsOneWidget);
-    expect(tester.getRect(find.byKey(const Key('ocr-page-spec'))), pageSpecBefore,
+    expect(
+        tester.getRect(find.byKey(const Key('ocr-page-spec'))), pageSpecBefore,
         reason: '列表滚动不能带动页范围/DPI 这些固定控件');
     expect(cardRect(tester), cardBefore);
     expect(tester.takeException(), isNull);
   });
 
-  testWidgets('单页图片：页列表按内容收缩，底部控件紧接其后而不是被推到最底',
-      (tester) async {
+  testWidgets('单页图片：页列表按内容收缩，底部控件紧接其后而不是被推到最底', (tester) async {
     await setSurface(tester, const Size(1280, 900));
     // 图片输入只有 1 页；detectPages 对图片直接给出单页计划。
     await openConfigure(tester, 'scan.png');

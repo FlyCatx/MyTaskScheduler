@@ -1,7 +1,7 @@
 // 执行回顾弹窗的**布局/视觉**测试（0.3.0 任务 03A）。
 //
 // 统计口径与筛选/导出回调用例已经在 test/execution/effort_review_dialog_test.dart
-// （timing-dev 的目录）里，这里只补 UI 层验收：
+// 中，这里补充 UI 层检查：
 //   * 与 OCR 主弹窗/设置弹窗同一套贝塞尔卡片（不再是 AlertDialog + 固定 660×400）；
 //   * 标题左“执行回顾”、右“日期范围 + 关闭”；底部动作固定、中间列表滚动；
 //   * 窄窗 + 1.5 倍字号允许分组换行、不溢出、关闭可达；
@@ -25,6 +25,7 @@ import 'package:taskscheduler_flutter/src/ui/theme.dart';
 import 'package:taskscheduler_flutter/src/ui/widgets/bezier_ui.dart';
 
 import '../execution/execution_test_support.dart';
+import 'date_picker_test_harness.dart';
 
 class _Fixture {
   _Fixture({required this.service, required this.tasks});
@@ -122,6 +123,7 @@ Future<void> _openDialog(
   Size surface = const Size(1000, 760),
   double textScale = 1.0,
   List<ExecutionConversationInfo>? conversations,
+  Set<String>? autoCompletedTaskIds,
 }) async {
   await _setSurface(tester, surface);
   await tester.pumpWidget(MaterialApp(
@@ -146,6 +148,8 @@ Future<void> _openDialog(
                   ],
               initialPreset: preset,
               onExport: onExport,
+              // 不传 = 旧调用方/旧数据（默认 null）。
+              autoCompletedTaskIds: autoCompletedTaskIds,
             ),
             child: const Text('打开回顾'),
           ),
@@ -348,16 +352,20 @@ void main() {
     );
     await _openDialog(tester, service: service, tasks: const <ExecutionTaskInfo>[]);
     expect(find.byKey(const Key('effort-review-empty')), findsOneWidget);
-    expect(find.textContaining('未知 ≠ 0'), findsOneWidget);
+    expect(
+      tester.widget<Text>(find.byKey(const Key('effort-review-empty'))).data,
+      '暂无执行记录',
+    );
     expect(find.byKey(const Key('effort-review-export')), findsNothing,
         reason: '未注入导出钩子时不显示导出按钮（不伪造导出）');
     expect(find.byKey(const Key('effort-review-close')), findsOneWidget);
   });
 
-  testWidgets('已完成但无记录：实际耗时显示“未知”，不是 0 分钟', (tester) async {
+  testWidgets('已完成但无记录：实际耗时显示“—”，展开区显示「暂无执行记录」', (tester) async {
     final f = _fixture();
     await _openDialog(tester, service: f.service, tasks: f.tasks);
-    expect(find.textContaining('实际 未知'), findsWidgets);
+    expect(find.textContaining('实际 —'), findsWidgets);
+    expect(find.textContaining('实际 未知'), findsNothing);
     expect(
       tester
           .widget<Text>(find.byKey(const Key('effort-review-done-no-actual')))
@@ -366,40 +374,122 @@ void main() {
     );
     await tester.tap(find.byKey(const Key('effort-review-task-task-b')));
     await tester.pumpAndSettle();
-    expect(find.textContaining('实际耗时未知（不是 0 分钟）'), findsOneWidget);
+    expect(find.text('暂无执行记录'), findsWidgets);
+    expect(find.textContaining('不是 0 分钟'), findsNothing);
+    expect(
+      find.byKey(const Key('effort-review-no-record-task-b')),
+      findsOneWidget,
+    );
   });
 
-  testWidgets('自定义日期非法：可执行反馈与底部动作仍可达', (tester) async {
+  testWidgets('到期自动完成：命中任务显示紧凑徽标，未命中不显示且不越出卡片',
+      (tester) async {
     final f = _fixture();
     await _openDialog(
       tester,
       service: f.service,
       tasks: f.tasks,
-      onExport: (name, csv, path) async => true,
+      autoCompletedTaskIds: <String>{'task-b'},
     );
-    await tester.tap(find.text('自定义'));
-    await tester.pumpAndSettle();
-    expect(find.byKey(const Key('effort-review-from')), findsOneWidget);
-    // 1) 无法解析的日期 → 明确格式提示，导出禁用。
-    await tester.enterText(find.byKey(const Key('effort-review-from')), 'abc');
-    await tester.tap(find.byKey(const Key('effort-review-apply')));
-    await tester.pumpAndSettle();
-    expect(find.byKey(const Key('effort-review-range-error')), findsOneWidget);
-    expect(find.textContaining('日期格式应为 YYYY-MM-DD'), findsOneWidget);
+    // 命中的任务（task-b）折叠行有徽标；未命中的任务没有。
     expect(
-      tester.widget<TextButton>(find.byKey(const Key('effort-review-export'))).onPressed,
-      isNull,
+      find.byKey(const Key('effort-review-auto-completed-task-b')),
+      findsOneWidget,
     );
-    expect(find.byKey(const Key('effort-review-close')), findsOneWidget);
+    expect(
+      find.byKey(const Key('effort-review-auto-completed-task-a')),
+      findsNothing,
+    );
+    expect(find.text('到期自动完成'), findsOneWidget);
+    // 徽标是紧凑标签，留在卡片内、不把任务行撑出横向溢出。
+    final card = _cardRect(tester);
+    final badge = _rectOf(
+        tester, const Key('effort-review-auto-completed-task-b'));
+    expect(badge.left, greaterThanOrEqualTo(card.left - 0.5));
+    expect(badge.right, lessThanOrEqualTo(card.right + 0.5));
+    expect(tester.takeException(), isNull);
+    // 展开该任务后徽标仍在（折叠行/展开区都可达）。
+    await tester.tap(find.byKey(const Key('effort-review-task-task-b')));
+    await tester.pumpAndSettle();
+    expect(
+      find.byKey(const Key('effort-review-auto-completed-task-b')),
+      findsOneWidget,
+    );
+  });
+
+  testWidgets('旧数据/未传 autoCompletedTaskIds：不显示“到期自动完成”徽标',
+      (tester) async {
+    final f = _fixture();
+    await _openDialog(tester, service: f.service, tasks: f.tasks);
+    expect(find.text('到期自动完成'), findsNothing);
+    expect(
+      find.byWidgetPredicate((widget) =>
+          widget.key is ValueKey<String> &&
+          (widget.key! as ValueKey<String>).value.startsWith(
+              'effort-review-auto-completed-')),
+      findsNothing,
+    );
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('自定义范围逆序：就地报错、阻止刷新；改正后报告/标题/CSV 用已应用范围',
+      (tester) async {
+    final f = _fixture();
+    String? csv;
+    await _openDialog(
+      tester,
+      service: f.service,
+      tasks: f.tasks,
+      preset: EffortReviewPreset.custom,
+      onExport: (name, content, path) async {
+        csv = content;
+        return true;
+      },
+    );
+    // 已应用范围初始为今天（2026-11-04）。
+    expect(_text(tester, const Key('effort-review-range')),
+        contains('2026-11-04'));
+    final confirmedBefore = _text(tester, const Key('effort-review-confirmed'));
+
+    // 开始 2026-11-05、结束 2026-10-30 → 逆序：保留草稿并就地报错。
+    await pickDateFromField(
+        tester, const Key('effort-review-from'), DateTime.utc(2026, 11, 5));
+    await pickDateFromField(
+        tester, const Key('effort-review-to'), DateTime.utc(2026, 10, 30));
+    expect(find.byKey(const Key('effort-review-range-error')), findsOneWidget);
+    expect(find.text('结束日期须等于或晚于开始日期'), findsOneWidget);
+    expect(_text(tester, const Key('effort-review-range')),
+        contains('2026-11-04'),
+        reason: '逆序时报告/标题仍显示已生效范围，不刷新');
+    expect(_text(tester, const Key('effort-review-confirmed')), confirmedBefore,
+        reason: '逆序阻止刷新，统计值不变');
+    expect(
+      tester
+          .widget<TextButton>(find.byKey(const Key('effort-review-apply')))
+          .onPressed,
+      isNull,
+      reason: '逆序时「应用」禁用',
+    );
     expect(tester.takeException(), isNull);
 
-    // 2) 起止颠倒 → 按时间先后调整并给出说明（不装作没发生）。
-    await tester.enterText(find.byKey(const Key('effort-review-from')), '2026-11-04');
-    await tester.enterText(find.byKey(const Key('effort-review-to')), '2026-10-30');
+    // 改正结束日期后错误消失、可以应用。
+    await pickDateFromField(
+        tester, const Key('effort-review-to'), DateTime.utc(2026, 11, 6));
+    expect(find.byKey(const Key('effort-review-range-error')), findsNothing);
     await tester.tap(find.byKey(const Key('effort-review-apply')));
     await tester.pumpAndSettle();
-    expect(find.byKey(const Key('effort-review-range-note')), findsOneWidget);
-    expect(find.textContaining('顺序颠倒'), findsOneWidget);
+    final appliedRange = _text(tester, const Key('effort-review-range'));
+    expect(appliedRange, contains('自定义'));
+    expect(appliedRange, contains('2026-11-05'));
+    expect(appliedRange, contains('2026-11-06'));
+    // 导出 CSV 的统计范围与标题一致（都用已应用范围）。
+    await tester.tap(find.byKey(const Key('effort-review-export')));
+    await tester.pumpAndSettle();
+    expect(csv, isNotNull);
+    expect(csv, contains('2026-11-05'));
+    expect(csv, contains('2026-11-06'));
+    expect(find.byKey(const Key('effort-review-close')), findsOneWidget);
+    expect(tester.takeException(), isNull);
   });
 
   testWidgets('窄窗 + 1.5 倍字号：筛选/摘要分组换行、不溢出、关闭可达', (tester) async {
@@ -544,10 +634,10 @@ void main() {
       preset: EffortReviewPreset.custom,
     );
     expect(find.byKey(const Key('effort-review-from')), findsOneWidget);
-    await tester.enterText(
-        find.byKey(const Key('effort-review-from')), '2026-01-01');
-    await tester.enterText(
-        find.byKey(const Key('effort-review-to')), '2026-03-02');
+    await pickDateFromField(
+        tester, const Key('effort-review-from'), DateTime.utc(2026, 1, 1));
+    await pickDateFromField(
+        tester, const Key('effort-review-to'), DateTime.utc(2026, 3, 2));
     await tester.tap(find.byKey(const Key('effort-review-apply')));
     await tester.pumpAndSettle();
     expect(_text(tester, const Key('effort-review-range')),
@@ -623,14 +713,16 @@ void main() {
     }
     expect(tester.takeException(), isNull);
 
-    // 打开长会话名的菜单：选项以完整名称出现（两行内可读，不被省略号截断）。
+    // 打开长会话名的菜单：统一菜单单行省略，悬停 tooltip 可读全名。
     await tester.tap(find.byKey(const Key('effort-review-filter-conversation')));
     await tester.pumpAndSettle();
+    expect(find.byKey(const Key('bezier-menu-panel')), findsOneWidget);
     expect(find.text(longTitle), findsOneWidget);
     final itemRect = tester.getRect(find.text(longTitle));
     expect(itemRect.width, greaterThan(120));
-    // 菜单项允许两行；选中后按钮里是单行省略显示。
-    expect(tester.widget<Text>(find.text(longTitle)).maxLines, 2);
+    expect(tester.widget<Text>(find.text(longTitle)).maxLines, 1);
+    expect(find.byTooltip(longTitle), findsWidgets,
+        reason: '长名称在统一菜单里通过 tooltip 可读全名');
     expect(tester.takeException(), isNull);
     await tester.tap(find.text(longTitle));
     await tester.pumpAndSettle();
@@ -726,22 +818,31 @@ void main() {
     expect(tester.takeException(), isNull);
   });
 
-  testWidgets('空状态与表单错误都完整落在卡片内', (tester) async {
+  testWidgets('逆序错误与自定义字段都完整落在卡片内', (tester) async {
     final f = _fixture();
     await _openDialog(tester, service: f.service, tasks: f.tasks);
     await tester.tap(find.text('自定义'));
     await tester.pumpAndSettle();
-    await tester.enterText(find.byKey(const Key('effort-review-from')), 'abc');
-    await tester.tap(find.byKey(const Key('effort-review-apply')));
-    await tester.pumpAndSettle();
+    await pickDateFromField(
+        tester, const Key('effort-review-from'), DateTime.utc(2026, 11, 5));
+    await pickDateFromField(
+        tester, const Key('effort-review-to'), DateTime.utc(2026, 10, 30));
     final card = _cardRect(tester);
     final errorRect = _rectOf(tester, const Key('effort-review-range-error'));
     expect(errorRect.right, lessThanOrEqualTo(card.right + 0.5),
         reason: '表单错误不能被裁');
-    // 错误状态下正文给出空状态提示，同样完整可见。
-    final emptyRect = _rectOf(tester, const Key('effort-review-empty'));
-    expect(emptyRect.left, greaterThanOrEqualTo(card.left - 0.5));
-    expect(emptyRect.right, lessThanOrEqualTo(card.right + 0.5));
+    expect(errorRect.left, greaterThanOrEqualTo(card.left - 0.5));
+    for (final key in <Key>[
+      const Key('effort-review-from'),
+      const Key('effort-review-to'),
+      const Key('effort-review-apply'),
+    ]) {
+      final rect = _rectOf(tester, key);
+      expect(rect.left, greaterThanOrEqualTo(card.left - 0.5));
+      expect(rect.right, lessThanOrEqualTo(card.right + 0.5));
+      expect(rect.top, greaterThanOrEqualTo(card.top - 0.5));
+      expect(rect.bottom, lessThanOrEqualTo(card.bottom + 0.5));
+    }
     expect(tester.takeException(), isNull);
   });
 

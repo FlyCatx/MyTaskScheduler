@@ -146,20 +146,170 @@ void main() {
       expect(field.keyboardType, TextInputType.multiline);
     });
 
-    testWidgets('adding a file goes through the native bridge, not a Flutter dialog',
+    testWidgets('“＋”菜单顺序：添加材料 → 从 PDF / 图片提取文字 → 分块分析',
         (tester) async {
       await tester.binding.setSurfaceSize(const Size(1440, 900));
       addTearDown(() => tester.binding.setSurfaceSize(null));
       await pumpShell(tester);
 
-      await tester.tap(find.descendant(
-          of: find.byType(Composer), matching: find.byIcon(Icons.add)));
+      await tester.tap(find.byKey(const Key('composer-add-menu')));
+      await tester.pumpAndSettle();
+
+      final panel = find.byKey(const Key('bezier-menu-panel'));
+      expect(panel, findsOneWidget);
+      final add = tester.getCenter(find.text('添加材料')).dy;
+      final extract = tester.getCenter(find.text('从 PDF / 图片提取文字')).dy;
+      final chunked = tester.getCenter(find.text('分块分析')).dy;
+      expect(add, lessThan(extract), reason: '添加材料在最上');
+      expect(extract, lessThan(chunked), reason: 'OCR 入口在分块分析之上');
+
+      // 菜单完整落在可视区域内，且靠近底部时向上展开而不是被裁掉。
+      final rect = tester.getRect(panel);
+      expect(rect.top, greaterThanOrEqualTo(0));
+      expect(rect.bottom, lessThanOrEqualTo(900));
+      // 不遮住触发器与发送键：菜单在“＋”上方展开。
+      final trigger = tester.getRect(find.byKey(const Key('composer-add-menu')));
+      expect(rect.bottom, lessThanOrEqualTo(trigger.top),
+          reason: '菜单应在触发器上方展开');
+      final send = tester.getRect(find.descendant(
+          of: find.byType(Composer), matching: find.byIcon(Icons.arrow_upward)));
+      expect(rect.overlaps(send), isFalse, reason: '菜单不得遮住发送键');
+    });
+
+    testWidgets('选择“添加材料”仍走原生桥接，且菜单关闭', (tester) async {
+      await tester.binding.setSurfaceSize(const Size(1440, 900));
+      addTearDown(() => tester.binding.setSurfaceSize(null));
+      await pumpShell(tester);
+
+      await tester.tap(find.byKey(const Key('composer-add-menu')));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('添加材料'));
       await tester.pumpAndSettle();
 
       // In tests there is no native gateway, so the shell must say so instead of
       // opening a Flutter-drawn picker.
       expect(find.byType(Dialog), findsNothing);
       expect(find.textContaining('原生桥接不可用'), findsOneWidget);
+      expect(find.byKey(const Key('bezier-menu-panel')), findsNothing);
+    });
+
+    testWidgets('选择“分块分析”复用既有预估入口，不直接发请求', (tester) async {
+      await tester.binding.setSurfaceSize(const Size(1440, 900));
+      addTearDown(() => tester.binding.setSurfaceSize(null));
+      final (controller, _) = await pumpShell(tester);
+
+      await tester.tap(find.byKey(const Key('composer-add-menu')));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('分块分析'));
+      await tester.pumpAndSettle();
+
+      // 没有材料时只提示，不打开对话框、不发请求。
+      expect(find.textContaining('当前没有可分析的文本材料'), findsOneWidget);
+      expect(find.byType(Dialog), findsNothing);
+      expect(controller.isRunning, isFalse);
+    });
+
+    testWidgets('Esc 关闭“＋”菜单且不触发任何动作', (tester) async {
+      await tester.binding.setSurfaceSize(const Size(1440, 900));
+      addTearDown(() => tester.binding.setSurfaceSize(null));
+      await pumpShell(tester);
+
+      await tester.tap(find.byKey(const Key('composer-add-menu')));
+      await tester.pumpAndSettle();
+      await tester.sendKeyEvent(LogicalKeyboardKey.escape);
+      await tester.pumpAndSettle();
+      expect(find.byKey(const Key('bezier-menu-panel')), findsNothing);
+      expect(find.textContaining('原生桥接不可用'), findsNothing);
+    });
+    testWidgets('OCR 与分块分析各自只打开自己的动作，选择后菜单关闭', (tester) async {
+      await tester.binding.setSurfaceSize(const Size(1200, 800));
+      addTearDown(() => tester.binding.setSurfaceSize(null));
+      var add = 0;
+      var extract = 0;
+      var chunked = 0;
+      final text = TextEditingController();
+      addTearDown(text.dispose);
+      await tester.pumpWidget(_composerApp(
+        text: text,
+        onAddFile: () async => add++,
+        onExtractText: () => extract++,
+        onChunkedAnalysis: () => chunked++,
+      ));
+
+      await tester.tap(find.byKey(const Key('composer-add-menu')));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('从 PDF / 图片提取文字'));
+      await tester.pumpAndSettle();
+      expect(extract, 1);
+      expect(add, 0);
+      expect(chunked, 0);
+      expect(find.byKey(const Key('bezier-menu-panel')), findsNothing,
+          reason: '选择后菜单必须关闭，只保留一个目标窗口');
+
+      await tester.tap(find.byKey(const Key('composer-add-menu')));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('分块分析'));
+      await tester.pumpAndSettle();
+      expect(chunked, 1);
+      expect(extract, 1, reason: '一次选择只触发一个动作');
+      expect(find.byKey(const Key('bezier-menu-panel')), findsNothing);
+    });
+
+    testWidgets('不可用的 OCR / 分块分析项为禁用态：点击无效且菜单不关闭',
+        (tester) async {
+      await tester.binding.setSurfaceSize(const Size(1200, 800));
+      addTearDown(() => tester.binding.setSurfaceSize(null));
+      var add = 0;
+      final text = TextEditingController();
+      addTearDown(text.dispose);
+      await tester.pumpWidget(_composerApp(
+        text: text,
+        onAddFile: () async => add++,
+        // 未注入 = OCR 服务缺失 / 当前没有可分析会话。
+        onExtractText: null,
+        onChunkedAnalysis: null,
+      ));
+
+      await tester.tap(find.byKey(const Key('composer-add-menu')));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('从 PDF / 图片提取文字'), warnIfMissed: false);
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('分块分析'), warnIfMissed: false);
+      await tester.pumpAndSettle();
+      expect(find.byKey(const Key('bezier-menu-panel')), findsOneWidget,
+          reason: '禁用项不能关闭菜单');
+      expect(add, 0);
+
+      // 菜单仍可用：选择“添加材料”。
+      await tester.tap(find.text('添加材料'));
+      await tester.pumpAndSettle();
+      expect(add, 1);
+    });
+    testWidgets('无 OCR 服务时 OCR 项禁用；分块分析沿用旧可用性',
+        (tester) async {
+      await tester.binding.setSurfaceSize(const Size(1440, 900));
+      addTearDown(() => tester.binding.setSurfaceSize(null));
+      await pumpShell(tester);
+
+      // 测试装配没有 OCR 服务（等价于原顶部 OCR 按钮不显示）。
+      await tester.tap(find.byKey(const Key('composer-add-menu')));
+      await tester.pumpAndSettle();
+
+      final extract = tester.widget<Text>(find.text('从 PDF / 图片提取文字'));
+      expect(extract.style!.color, TsColors.textFaint, reason: '不可用时为禁用态');
+      await tester.tap(find.text('从 PDF / 图片提取文字'), warnIfMissed: false);
+      await tester.pumpAndSettle();
+      expect(find.byKey(const Key('bezier-menu-panel')), findsOneWidget,
+          reason: '禁用项不关闭菜单');
+      expect(find.byType(Dialog), findsNothing);
+
+      // 有会话时“分块分析”仍可用（与原顶部按钮一致），点击复用既有预估入口。
+      final chunked = tester.widget<Text>(find.text('分块分析'));
+      expect(chunked.style!.color, TsColors.textPrimary, reason: '可用项为主文字色');
+      await tester.tap(find.text('分块分析'));
+      await tester.pumpAndSettle();
+      expect(find.textContaining('当前没有可分析的文本材料'), findsOneWidget);
+      expect(find.byKey(const Key('bezier-menu-panel')), findsNothing);
     });
   });
 
@@ -203,3 +353,34 @@ class _FileLinkProbe extends StatelessWidget {
   Widget build(BuildContext context) => const SizedBox.shrink();
 }
 
+/// Standalone composer harness: lets each menu action be counted without the shell.
+Widget _composerApp({
+  required TextEditingController text,
+  required Future<void> Function() onAddFile,
+  VoidCallback? onExtractText,
+  VoidCallback? onChunkedAnalysis,
+}) {
+  return MaterialApp(
+    theme: buildAppTheme(),
+    home: Scaffold(
+      body: Align(
+        alignment: Alignment.topCenter,
+        child: SizedBox(
+          width: 900,
+          child: Composer(
+            textController: text,
+            attachments: const [],
+            running: false,
+            canSend: true,
+            onSend: () {},
+            onAddFile: onAddFile,
+            onRemoveAttachment: (_) {},
+            onDraftChanged: (_) {},
+            onExtractText: onExtractText,
+            onChunkedAnalysis: onChunkedAnalysis,
+          ),
+        ),
+      ),
+    ),
+  );
+}
