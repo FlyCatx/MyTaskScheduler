@@ -4,7 +4,7 @@ TaskScheduler 是一款 Windows 桌面任务规划工具，可从文字和文档
 
 ## 当前源码版本
 
-0.4.0（Windows x64）。已发布的程序包见 [GitHub Releases](https://github.com/FlyCatx/MyTaskScheduler/releases)，各版本变化见 [更新日志](CHANGELOG.md)。
+0.5.0（Windows x64）。已发布的程序包见 [GitHub Releases](https://github.com/FlyCatx/MyTaskScheduler/releases)，各版本变化见 [更新日志](CHANGELOG.md)。
 
 ## 主要功能
 
@@ -12,7 +12,8 @@ TaskScheduler 是一款 Windows 桌面任务规划工具，可从文字和文档
 - 排程冲突说明及经过本地校验的调整建议，甘特图和其他计划视图。
 - 本地 ICS 日历只读导入，并将外部占用计入可用时间。
 - 任务执行计时、暂停、手工补记、异常退出恢复、耗时回顾和 CSV 导出。
-- 全局共享日程：可关联一个会话仅用于导航；定时/全天、每日/每周重复、单次例外与运行期提醒；忙碌日程对所有会话的排程生效。
+- 执行截止提醒：到达计划截止后待处理，5 分钟后再提醒，仍未回应则自动完成；支持延长截止。
+- 全局共享日程：可关联一个会话仅用于导航；定时/全天、每日/每周重复、单次例外与运行期提醒；忙碌日程对所有会话的排程生效；侧栏提供一周时间轴与小月历导航。
 - 本地离线 OCR，支持扫描 PDF、混合 PDF、PNG 和 JPEG 的逐页识别与校对。
 - 长材料分块分析，在生成计划前预估请求量并预览结果。
 - Windows 自绘窗口、设置、应用数据保存和备份。
@@ -33,7 +34,7 @@ TaskScheduler 是一款 Windows 桌面任务规划工具，可从文字和文档
 powershell -ExecutionPolicy Bypass -File scripts/build.ps1 -Test
 powershell -ExecutionPolicy Bypass -File scripts/build_ocr_host.ps1
 powershell -ExecutionPolicy Bypass -File scripts/build_flutter_app.ps1
-powershell -ExecutionPolicy Bypass -File scripts/make_flutter_release.ps1 -Version 0.4.0 -NoApiKey
+powershell -ExecutionPolicy Bypass -File scripts/make_flutter_release.ps1 -Version 0.5.0 -NoApiKey
 ```
 
 Flutter 应用通过 `ts_bridge.dll` 调用 C 内核。界面说明见 [Flutter README](flutter_app/README.md)。

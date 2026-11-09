@@ -1,12 +1,50 @@
 cmake_minimum_required(VERSION 3.16)
-project(TaskScheduler LANGUAGES C)
+project(TaskScheduler LANGUAGES C CXX)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 if(MSVC)
     add_compile_definitions(_CRT_SECURE_NO_WARNINGS UNICODE _UNICODE)
+endif()
+
+# ---------------------------------------------------------------------------
+# C++/WinRT（Windows SDK 自带头文件，不联网下载）。
+# ts_toast.cpp 只用 Windows SDK 10.0.26100 里已安装的 cppwinrt 头 + windowsapp.lib。
+# 这里按已安装 SDK 版本自动挑选最高的 cppwinrt 目录，避免硬编码版本号。
+# ---------------------------------------------------------------------------
+set(TS_CPPWINRT_ROOT "")
+if(WIN32)
+    # 注意：$ENV{ProgramFiles(x86)} 在 CMake 里不能直接用（变量名不能含括号），
+    # 因此这里按 x64 Windows 的两种安装位置 + 注册表 KitsRoot10 依次探测。
+    set(_ts_cppwinrt_bases "")
+    foreach(_ts_sdk_root
+            "C:/Program Files (x86)/Windows Kits/10"
+            "C:/Program Files/Windows Kits/10")
+        file(GLOB _ts_found "${_ts_sdk_root}/Include/*/cppwinrt/winrt/base.h")
+        list(APPEND _ts_cppwinrt_bases ${_ts_found})
+    endforeach()
+    if(NOT _ts_cppwinrt_bases)
+        get_filename_component(_ts_kits_root
+            "[HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Windows Kits\\Installed Roots;KitsRoot10]"
+            ABSOLUTE)
+        if(_ts_kits_root)
+            file(GLOB _ts_found "${_ts_kits_root}/Include/*/cppwinrt/winrt/base.h")
+            list(APPEND _ts_cppwinrt_bases ${_ts_found})
+        endif()
+    endif()
+    if(_ts_cppwinrt_bases)
+        list(SORT _ts_cppwinrt_bases)
+        list(LENGTH _ts_cppwinrt_bases _ts_cppwinrt_count)
+        math(EXPR _ts_cppwinrt_last "${_ts_cppwinrt_count} - 1")
+        list(GET _ts_cppwinrt_bases ${_ts_cppwinrt_last} _ts_cppwinrt_base)
+        get_filename_component(TS_CPPWINRT_ROOT "${_ts_cppwinrt_base}" DIRECTORY)
+        get_filename_component(TS_CPPWINRT_ROOT "${TS_CPPWINRT_ROOT}" DIRECTORY)
+        message(STATUS "C++/WinRT 头文件：${TS_CPPWINRT_ROOT}")
+    endif()
 endif()
 
 # ---------------------------------------------------------------------------
@@ -166,12 +204,43 @@ endif()
 #   - 旧 Win32 界面（TaskScheduler.exe）不依赖这个 DLL，可以继续作为回归对照。
 #
 # 所有导出符号见 src/bridge/ts_bridge.h；返回的缓冲区只能由 ts_bridge_free 释放。
+#
+# 0.5.0 追加（ABI 仍为 2，仅增加导出、不改结构体布局）：
+#   - ts_pick_filter.c  ：三种文件筛选器定义（纯数据，可离线测试）；
+#   - ts_activation.c   ：taskscheduler:// URI / Toast XML / 动作队列 / 待处理激活
+#                         （纯 C，可离线测试）；
+#   - ts_toast.cpp      ：C++/WinRT 真实 Toast + AUMID 快捷方式 + URL 协议 + 命名管道。
 # ---------------------------------------------------------------------------
-add_library(ts_bridge SHARED src/bridge/ts_bridge.c src/bridge/ts_file_list.c)
-target_compile_definitions(ts_bridge PRIVATE TS_BRIDGE_BUILD)
-target_link_libraries(ts_bridge PRIVATE ts_core comdlg32)
+if(NOT TS_CPPWINRT_ROOT)
+    message(FATAL_ERROR
+        "未找到 Windows SDK 的 C++/WinRT 头文件（cppwinrt/winrt/base.h）。"
+        "请安装 Windows SDK 10.0.17763+（含 C++/WinRT），或检查 Program Files (x86)/Windows Kits。")
+endif()
+
+add_library(ts_bridge SHARED
+    src/bridge/ts_bridge.c
+    src/bridge/ts_file_list.c
+    src/bridge/ts_pick_filter.c
+    src/bridge/ts_activation.c
+    src/bridge/ts_toast.cpp)
+target_compile_definitions(ts_bridge PRIVATE
+    TS_BRIDGE_BUILD
+    NOMINMAX
+    WINVER=0x0A00
+    _WIN32_WINNT=0x0A00
+    # C++/WinRT 的 base.h 在 C++17 下仍包含 <experimental/coroutine>；
+    # VS 2026 的 STL 把它标记为即将移除的硬错误，这里显式静音（不改变语义）。
+    _SILENCE_EXPERIMENTAL_COROUTINE_DEPRECATION_WARNINGS)
+target_include_directories(ts_bridge PRIVATE ${TS_CPPWINRT_ROOT})
+target_compile_features(ts_bridge PRIVATE cxx_std_17)
+# shell32：SetCurrentProcessExplicitAppUserModelID / SHGetKnownFolderPath / ShellLink
+# ole32  ：CoCreateInstance（IShellLink/IPersistFile）
+# propsys：IPropertyStore / InitPropVariantFromString（System.AppUserModel.ID）
+# windowsapp：WinRT 激活（RoGetActivationFactory 等）
+target_link_libraries(ts_bridge PRIVATE
+    ts_core comdlg32 shell32 ole32 propsys user32 advapi32 windowsapp)
 if(MSVC)
-    target_compile_options(ts_bridge PRIVATE /W4 /utf-8)
+    target_compile_options(ts_bridge PRIVATE /W4 /utf-8 /EHsc)
 endif()
 set_target_properties(ts_bridge PROPERTIES OUTPUT_NAME "ts_bridge")
 
@@ -190,9 +259,13 @@ endif()
 #         退出顺序（shutdown_begin → shutdown_ready → destroy）。
 # ---------------------------------------------------------------------------
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_bridge.c)
-    add_executable(ts_test_bridge tests/test_bridge.c)
+    # 0.5.0：把纯逻辑模块（激活 URI/XML/队列、筛选器定义）同时编进测试程序，
+    # 这样离线断言不必经过系统对话框/Toast；DLL 导出的失败路径仍走真实 DLL。
+    add_executable(ts_test_bridge tests/test_bridge.c
+        src/bridge/ts_activation.c
+        src/bridge/ts_pick_filter.c)
     target_include_directories(ts_test_bridge PRIVATE ${TS_INCLUDE_DIRS})
-    target_link_libraries(ts_test_bridge PRIVATE ts_bridge ts_core)
+    target_link_libraries(ts_test_bridge PRIVATE ts_bridge ts_core shell32)
     if(MSVC)
         target_compile_options(ts_test_bridge PRIVATE /W4 /utf-8)
     endif()
