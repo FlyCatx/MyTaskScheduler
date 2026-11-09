@@ -41,6 +41,9 @@ target_link_libraries(${BINARY_NAME} PRIVATE "gdi32.lib")
 # WTSRegisterSessionNotification / WTSUnRegisterSessionNotification
 # (WM_WTSSESSION_CHANGE lock/unlock monitoring).
 target_link_libraries(${BINARY_NAME} PRIVATE "wtsapi32.lib")
+# SetCurrentProcessExplicitAppUserModelID / protocol-activation forwarding
+# (0.5.0 actionable Windows notifications, see main.cpp).
+target_link_libraries(${BINARY_NAME} PRIVATE "shell32.lib")
 # RegisterSuspendResumeNotification / UnregisterSuspendResumeNotification
 # (WM_POWERBROADCAST suspend/resume). user32 is part of the default Windows
 # libraries; spelling it out keeps the power-event dependency visible here.
