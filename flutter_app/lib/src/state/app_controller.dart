@@ -24,8 +24,11 @@ import 'analysis/chunked_run_models.dart';
 import 'calendar_constraints.dart';
 import 'calendar_planner.dart';
 import 'commit_gate.dart';
+import 'conflict_suggestions.dart' show instantRangeLabel;
 import 'document_extractor.dart';
 import 'execution/effort_stats.dart';
+import 'execution/execution_deadline.dart';
+import 'execution/execution_deadline_controller.dart';
 import 'execution/execution_models.dart';
 import 'execution/timer_controller.dart';
 import 'external_calendar_service.dart';
@@ -949,6 +952,7 @@ class AppController extends ChangeNotifier {
 
   /// 窗口/电源生命周期钩子：应用被挂起/锁屏/睡眠前调用。
   Future<void> onAppSuspended() async {
+    await _executionDeadline?.handleAppSuspended();
     final t = timer;
     if (t == null) return;
     final result = await t.handleAwayDetected();
@@ -958,10 +962,15 @@ class AppController extends ChangeNotifier {
 
   Future<void> onAppResumed() async {
     final t = timer;
-    if (t == null) return;
+    if (t == null) {
+      await _executionDeadline?.handleAppResumed();
+      return;
+    }
     final result = await t.handleResumeFromAway();
     if (result.ok) _statusMessage = result.message;
     _notify();
+    // 恢复后补发未送达的到期提醒，或补做到期的自动完成。
+    await _executionDeadline?.handleAppResumed();
   }
 
   /// 当前查看版本的任务上下文（报告/详情卡用）。
@@ -996,6 +1005,418 @@ class AppController extends ChangeNotifier {
       if (t.taskId == taskId) return t;
     }
     return null;
+  }
+
+  // --------------------------------------- 执行截止与提醒（0.5.0 任务 13）
+
+  /// 任务执行截止/提醒控制器；null = 本构建没有启用（行为与 0.4.x 一致）。
+  ///
+  /// 由 bootstrap 创建并在 [AppController.initialize] 之后调用
+  /// [attachExecutionDeadline] 接线；测试可直接注入假时钟与假通知端口。
+  ExecutionDeadlineController? _executionDeadline;
+
+  ExecutionDeadlineController? get executionDeadline => _executionDeadline;
+
+  /// 接线：把截止控制器挂到本控制器，UI 重建跟随时限/提醒状态。
+  void attachExecutionDeadline(ExecutionDeadlineController deadline) {
+    if (identical(_executionDeadline, deadline)) return;
+    _executionDeadline?.removeListener(_notify);
+    _executionDeadline = deadline;
+    deadline.addListener(_notify);
+    _notify();
+  }
+
+  /// 曾被“到期自动完成”的任务 id（只读；执行回顾据此显示徽标）。
+  ///
+  /// 数据来源是已持久化的执行截止会话（`<dataRoot>/execution/deadlines.json` 的
+  /// `completionSource == 'auto'`）。手动结束/人工勾选/只停止计时/已取消不会进入；
+  /// 旧数据缺失来源时视为 manual，不误报。没有截止控制器时返回空集合。
+  Set<String> get executionAutoCompletedTaskIds =>
+      _executionDeadline?.autoCompletedTaskIds ?? const <String>{};
+
+  /// 当前会话里“计划时段已结束、等待延长/结束”的任务 id（清单角标用）。
+  ///
+  /// 只反映执行截止状态，不改任务完成/依赖；切换会话只显示该会话自己的待处理项。
+  Set<String> get executionPendingTaskIds {
+    final deadline = _executionDeadline;
+    final conversationId = _conversation?.id;
+    if (deadline == null || conversationId == null) return const <String>{};
+    return <String>{
+      for (final session in deadline.activeSessions)
+        if (session.conversationId == conversationId &&
+            (session.stage == ExecutionDeadlineStage.pending ||
+                session.stage == ExecutionDeadlineStage.secondReminder))
+          session.taskId,
+    };
+  }
+
+  /// 读取一个会话的当前版本（可能不在当前视图，用于跨会话的提醒/完成）。
+  Future<({Conversation conversation, PlanVersion version})?>
+      _executionLoadContext(String conversationId) async {
+    if (conversationId.trim().isEmpty) return null;
+    var conversation = _cache[conversationId];
+    if (conversation == null) {
+      try {
+        conversation = await store.loadConversation(conversationId);
+      } catch (_) {
+        conversation = null;
+      }
+      if (conversation != null) _cache[conversationId] = conversation;
+    }
+    final version = conversation?.currentVersion;
+    if (conversation == null || version == null) return null;
+    return (conversation: conversation, version: version);
+  }
+
+  TaskRecord? _taskRecordOf(PlanVersion version, String taskId) {
+    for (final t in version.tasks) {
+      if (t.id == taskId) return t;
+    }
+    return null;
+  }
+
+  /// 从版本里解析“有效截止”：当前生效甘特任务最后一段的结束时刻。
+  ///
+  /// 只有日期/尚无排程时 plannedEndUtc 为 null（不猜午夜）。
+  ExecutionDeadlineTarget? _deadlineTargetOf(
+      PlanVersion version, String taskId) {
+    final task = _taskRecordOf(version, taskId);
+    if (task == null) return null;
+    final segments = version.calendar.forTask(taskId);
+    DateTime? start;
+    DateTime? end;
+    for (final s in segments) {
+      if (start == null || s.start.isBefore(start)) start = s.start;
+      if (end == null || s.end.isAfter(end)) end = s.end;
+    }
+    return ExecutionDeadlineTarget(
+      taskName: task.name,
+      planVersionId: version.id,
+      planRevision: version.revision,
+      plannedStartUtc: start,
+      plannedEndUtc: end,
+      isDone: task.completion == Completion.done,
+    );
+  }
+
+  /// 截止控制器解析任务目标（跨会话按稳定会话 + 任务 ID 定位）。
+  Future<ExecutionDeadlineTarget?> executionDeadlineTargetFor(
+      String conversationId, String taskId) async {
+    final ctx = await _executionLoadContext(conversationId);
+    if (ctx == null) return null;
+    return _deadlineTargetOf(ctx.version, taskId);
+  }
+
+  /// 当前视图里某任务的有效截止（详情卡同步展示用；null = 无具体时刻）。
+  DateTime? executionDeadlineForTask(String taskId) {
+    final v = _viewVersion;
+    if (v == null) return null;
+    return _deadlineTargetOf(v, taskId)?.plannedEndUtc;
+  }
+
+  ExecutionTaskRef? _taskRefOfVersion(
+    Conversation conversation,
+    PlanVersion version,
+    String taskId,
+  ) {
+    final task = _taskRecordOf(version, taskId);
+    if (task == null) return null;
+    return ExecutionTaskRef(
+      conversationId: conversation.id,
+      taskId: task.id,
+      taskName: task.name,
+      planVersionId: version.id,
+      planRevision: version.revision,
+      estimateHours: task.estimatedHours,
+      lineageRootId: task.previousTaskId ?? task.id,
+    );
+  }
+
+  /// 截止控制器在“延长后恢复计时”时构造任务引用（跨会话安全）。
+  Future<ExecutionTaskRef?> executionTaskRefIn(
+      String conversationId, String taskId) async {
+    final ctx = await _executionLoadContext(conversationId);
+    if (ctx == null) return null;
+    final ref = _taskRefOfVersion(ctx.conversation, ctx.version, taskId);
+    if (ref != null) return ref;
+    return null;
+  }
+
+  /// 打开某个会话里的任务详情（通知正文点击/动作回调使用）。
+  Future<void> openExecutionTask(
+      String conversationId, String taskId) async {
+    if (_conversation?.id != conversationId) {
+      await openConversation(conversationId);
+    }
+    if (_conversation?.id != conversationId) return;
+    if (_viewVersion == null) return;
+    interaction.selectAndReveal(taskId);
+  }
+
+  /// “目标 = 已完成”的完成命令（自动完成/结束任务共用）。
+  ///
+  /// 幂等：已完成的记录直接成功且不重复释放依赖；禁止用裸 toggle 处理重试。
+  /// [atUtc] 是完成事实时间（自动完成取响应窗口结束时刻，而不是重试读取的时刻）。
+  Future<ExecutionCompletionOutcome> completeTaskFromExecution(
+    String conversationId,
+    String taskId,
+    DateTime atUtc,
+    String source,
+  ) async {
+    final ctx = await _executionLoadContext(conversationId);
+    if (ctx == null) {
+      return const ExecutionCompletionOutcome(
+          ok: false, message: '会话或计划版本已不存在，完成未提交');
+    }
+    final version = ctx.version;
+    final task = _taskRecordOf(version, taskId);
+    if (task == null) {
+      return const ExecutionCompletionOutcome(
+          ok: false, message: '任务已不存在，完成未提交');
+    }
+    if (task.completion == Completion.done) {
+      return const ExecutionCompletionOutcome(
+          ok: true, message: '任务已是完成状态', alreadyDone: true);
+    }
+    final tasks = version.tasks
+        .map((t) => t.id == taskId
+            ? t.copyWith(completion: Completion.done, clearCompletionNote: true)
+            : t)
+        .toList(growable: false);
+    final next = version.copyWith(tasks: tasks, revision: version.revision + 1);
+
+    // 当前正在看的版本：复用既有提交入口（重算/校验/撤销/完成事件）。
+    if (_conversation?.id == conversationId &&
+        _viewVersion?.id == version.id) {
+      if (hasActiveRunForCurrent) {
+        return const ExecutionCompletionOutcome(
+            ok: false, message: '当前会话正在分析中，完成将在稍后重试');
+      }
+      final ok = await _applyTasks(next, completionAtUtc: atUtc);
+      if (!ok) {
+        return ExecutionCompletionOutcome(
+            ok: false, message: _errorMessage ?? '完成未通过校验，已保留原状态');
+      }
+      _statusMessage = source == 'auto'
+          ? '「${task.name}」已按截止自动完成'
+          : '已完成「${task.name}」';
+      _notify();
+      return ExecutionCompletionOutcome(ok: true, message: _statusMessage!);
+    }
+
+    // 非当前视图：直接作用于该会话的当前版本，不切换用户所在会话。
+    if (_run != null && _run!.conversationId == conversationId) {
+      return const ExecutionCompletionOutcome(
+          ok: false, message: '该会话正在分析中，完成将在稍后重试');
+    }
+    final withSignatures =
+        next.copyWith(tasks: withComputedSignatures(next.tasks));
+    final snapshot = _compute(withSignatures.plan);
+    if (snapshot == null) {
+      return ExecutionCompletionOutcome(
+          ok: false, message: _errorMessage ?? '完成未通过校验，已保留原状态');
+    }
+    final versions = ctx.conversation.versions
+        .map((v) => v.id == withSignatures.id ? withSignatures : v)
+        .toList(growable: false);
+    final updated = ctx.conversation.copyWith(
+      versions: versions,
+      updatedAt: DateTime.now(),
+      activityAt: DateTime.now(),
+    );
+    _cache[conversationId] = updated;
+    await timer?.recordTaskCompletion(
+      conversationId: conversationId,
+      taskId: taskId,
+      planVersionId: withSignatures.id,
+      planRevision: withSignatures.revision,
+      atUtc: atUtc,
+    );
+    await store.saveConversation(updated);
+    _reindexSummaries();
+    await store.saveIndex(_summaries);
+    unawaited(_executionDeadline?.onTaskCompletionChanged(
+      conversationId,
+      taskId,
+      done: true,
+      source: source,
+    ));
+    _notify();
+    return ExecutionCompletionOutcome(
+        ok: true,
+        message: source == 'auto'
+            ? '「${task.name}」已按截止自动完成'
+            : '已完成「${task.name}」');
+  }
+
+  /// 延长：把任务最后一段的结束时刻保存到新截止（只改这一段，不搬动其它任务）。
+  Future<bool> applyExecutionExtension(
+    String conversationId,
+    String taskId,
+    DateTime newEndUtc,
+  ) async {
+    final ctx = await _executionLoadContext(conversationId);
+    if (ctx == null) return false;
+    final version = ctx.version;
+    final own = version.calendar.forTask(taskId);
+    if (own.isEmpty) {
+      _errorMessage = '该任务还没有甘特排程，无法延长';
+      _notify();
+      return false;
+    }
+    final last = own.reduce((a, b) => a.end.isAfter(b.end) ? a : b);
+    if (!newEndUtc.isAfter(last.start)) {
+      _errorMessage = '新截止必须晚于最后一段的开始时间';
+      _notify();
+      return false;
+    }
+    final schedule = version.calendar.copyWith(
+      segments: version.calendar.segments
+          .map((s) => s.id == last.id
+              ? s.copyWith(
+                  end: newEndUtc,
+                  source: SegmentSource.manual,
+                  revision: s.revision + 1,
+                )
+              : s)
+          .toList(growable: false),
+    );
+    final outcome = CalendarEditOutcome(
+      schedule: schedule,
+      tasks: version.tasks,
+      label: '延长任务排程',
+      message: '新的甘特结束时刻已保存',
+    );
+    // 当前正在看的版本：复用可撤销的日历提交入口。
+    if (_conversation?.id == conversationId &&
+        _viewVersion?.id == version.id) {
+      final ok = await applyCalendarEdit(outcome);
+      if (!ok) {
+        _errorMessage ??= '新的甘特结束时刻未能保存，原安排未改变';
+        _notify();
+      }
+      return ok;
+    }
+    if (_run != null && _run!.conversationId == conversationId) {
+      _errorMessage = '该会话正在分析中，暂时不能延长';
+      _notify();
+      return false;
+    }
+    final next = version.copyWith(
+      calendar: schedule.copyWith(
+        settings: withoutExternalOccupancies(schedule.settings),
+      ),
+      tasks: version.tasks,
+      revision: version.revision + 1,
+    );
+    final withSignatures =
+        next.copyWith(tasks: withComputedSignatures(next.tasks));
+    final snapshot = _compute(withSignatures.plan);
+    if (snapshot == null) {
+      _errorMessage ??= '新的甘特结束时刻未通过校验，已保留原安排';
+      _notify();
+      return false;
+    }
+    final versions = ctx.conversation.versions
+        .map((v) => v.id == withSignatures.id ? withSignatures : v)
+        .toList(growable: false);
+    final updated = ctx.conversation.copyWith(
+      versions: versions,
+      updatedAt: DateTime.now(),
+      activityAt: DateTime.now(),
+    );
+    _cache[conversationId] = updated;
+    await store.saveConversation(updated);
+    _reindexSummaries();
+    await store.saveIndex(_summaries);
+    _statusMessage = '新的甘特结束时刻已保存';
+    _notify();
+    return true;
+  }
+
+  List<SchedulingTask> _schedulingTasksOf(PlanVersion version) {
+    final snapshot = _compute(version.plan);
+    return <SchedulingTask>[
+      for (final t in version.tasks)
+        SchedulingTask.fromRecord(
+          t,
+          status: snapshot?.byId(t.id)?.status ??
+              (t.completion == Completion.done ? 'done' : 'unknown'),
+        ),
+    ];
+  }
+
+  /// 延长前预览：当前/新截止、潜在重叠与受影响的其它任务（只读）。
+  Future<ExecutionExtensionPreview> previewExecutionExtension(
+    String conversationId,
+    String taskId,
+    DateTime newEndUtc,
+  ) async {
+    final ctx = await _executionLoadContext(conversationId);
+    if (ctx == null) {
+      return ExecutionExtensionPreview(
+        currentDeadlineUtc: null,
+        newDeadlineUtc: newEndUtc,
+        error: '会话或计划版本已不存在',
+      );
+    }
+    final version = ctx.version;
+    final target = _deadlineTargetOf(version, taskId);
+    final own = version.calendar.forTask(taskId);
+    if (own.isEmpty) {
+      return ExecutionExtensionPreview(
+        currentDeadlineUtc: null,
+        newDeadlineUtc: newEndUtc,
+        error: '该任务还没有甘特排程，无法延长',
+      );
+    }
+    final last = own.reduce((a, b) => a.end.isAfter(b.end) ? a : b);
+    if (!newEndUtc.isAfter(last.start)) {
+      return ExecutionExtensionPreview(
+        currentDeadlineUtc: target?.plannedEndUtc,
+        newDeadlineUtc: newEndUtc,
+        error: '新截止必须晚于最后一段的开始时间',
+      );
+    }
+    final schedule = version.calendar.copyWith(
+      segments: version.calendar.segments
+          .map((s) => s.id == last.id
+              ? s.copyWith(
+                  end: newEndUtc,
+                  source: SegmentSource.manual,
+                  revision: s.revision + 1)
+              : s)
+          .toList(growable: false),
+    );
+    final now = timer?.clock.nowUtc ?? DateTime.now().toUtc();
+    final tasks = _schedulingTasksOf(version);
+    final conflicts = detectConflicts(
+      schedule: schedule,
+      tasks: tasks,
+      now: now,
+    );
+    final clock = schedule.settings.clock;
+    final conflictLabels = <String>[];
+    final otherNames = <String>{};
+    final nameById = <String, String>{for (final t in tasks) t.id: t.name};
+    for (final conflict in conflicts) {
+      if (conflict.taskId != taskId &&
+          (conflict.otherTaskId == null || conflict.otherTaskId != taskId)) {
+        continue;
+      }
+      conflictLabels.add(
+          '${conflict.kind.label}：${instantRangeLabel(clock, conflict.start, conflict.end)}');
+      for (final id in <String?>[conflict.taskId, conflict.otherTaskId]) {
+        if (id == null || id.isEmpty || id == taskId) continue;
+        otherNames.add(nameById[id] ?? id);
+      }
+    }
+    return ExecutionExtensionPreview(
+      currentDeadlineUtc: target?.plannedEndUtc,
+      newDeadlineUtc: newEndUtc,
+      conflicts: List<String>.unmodifiable(conflictLabels),
+      otherTaskNames: List<String>.unmodifiable(otherNames),
+    );
   }
 
   /// 偏差回顾：按时间范围（UTC 边界）聚合执行事实。
@@ -1057,8 +1478,14 @@ class AppController extends ChangeNotifier {
   }
 
   /// 完成/撤销完成事件与真实计划状态保持同步（不写实际耗时）。
+  ///
+  /// [completionAtUtc] 是这次完成事实的时间（自动完成取响应窗口结束时刻）；
+  /// null 时用计时器时钟的当前时刻。
   Future<void> _syncCompletionEvents(
-      PlanVersion? previous, PlanVersion next) async {
+    PlanVersion? previous,
+    PlanVersion next, {
+    DateTime? completionAtUtc,
+  }) async {
     final t = timer;
     final conv = _conversation;
     if (t == null || conv == null) return;
@@ -1077,6 +1504,7 @@ class AppController extends ChangeNotifier {
           taskId: entry.key,
           planVersionId: next.id,
           planRevision: next.revision,
+          atUtc: completionAtUtc,
         );
       } else if (!isDone && wasDone) {
         await t.undoTaskCompletion(entry.key);
@@ -3428,7 +3856,7 @@ class AppController extends ChangeNotifier {
 
   /// Applies edited tasks to the CURRENT version, recomputes the schedule through
   /// the C core, and persists. On validation failure the previous state is kept.
-  Future<bool> _applyTasks(PlanVersion next) async {
+  Future<bool> _applyTasks(PlanVersion next, {DateTime? completionAtUtc}) async {
     final c = _conversation;
     if (c == null) return false;
     final previous = _viewVersion;
@@ -3452,14 +3880,41 @@ class AppController extends ChangeNotifier {
     _viewVersion = withSignatures;
     _display = snapshot;
     // 完成事件跟随真实计划状态（只在完成状态真正变化时记录/撤销，不写实际耗时）。
-    await _syncCompletionEvents(previous, withSignatures);
+    await _syncCompletionEvents(previous, withSignatures,
+        completionAtUtc: completionAtUtc);
     await store.saveConversation(updated);
     _reindexSummaries();
     await store.saveIndex(_summaries);
+    // 人工勾选/撤销完成要让执行截止提醒收敛（旧提醒不能影响别的任务或重复释放依赖）。
+    _notifyDeadlineOfCompletionChanges(c.id, previous, withSignatures);
     _notify();
     return true;
   }
 
+  /// 计划里完成状态真的变化时，把结果同步给执行截止提醒：
+  /// 人工勾选完成 → 取消剩余提醒；撤销完成不复活旧会话。
+  void _notifyDeadlineOfCompletionChanges(
+    String conversationId,
+    PlanVersion? previous,
+    PlanVersion next,
+  ) {
+    final deadline = _executionDeadline;
+    if (deadline == null) return;
+    final before = <String, Completion>{
+      for (final task in previous?.tasks ?? const <TaskRecord>[])
+        task.id: task.completion,
+    };
+    for (final task in next.tasks) {
+      if (task.completion == Completion.done &&
+          before[task.id] != Completion.done) {
+        unawaited(deadline.onTaskCompletionChanged(
+          conversationId,
+          task.id,
+          done: true,
+        ));
+      }
+    }
+  }
 
   /// Notes produced by the last automatic pass ("容量不足…", "前置还未安排…"), keyed by
   /// task id. Transient on purpose: the persisted facts are the segments and the
@@ -4550,6 +5005,8 @@ class AppController extends ChangeNotifier {
     _draftTimer?.cancel();
     _draftTimer = null;
     await flushPendingWrites();
+    // 截止会话先落盘并停止轮询：重启后按持久阶段恢复补发/补做。
+    await _executionDeadline?.shutdown();
     // 活动计时保存检查点并暂停（不把退出到重启之间的时间算成工作）。
     await timer?.shutdown();
     // 日程命令在退出前排空：不能 dispose 后丢写入；实例锁由 bootstrap 释放。
@@ -4562,6 +5019,12 @@ class AppController extends ChangeNotifier {
     unawaited(flushPendingWrites());
     _disposed = true;
     _stopTimers();
+    final deadline = _executionDeadline;
+    if (deadline != null) {
+      deadline.removeListener(_notify);
+      deadline.dispose();
+      _executionDeadline = null;
+    }
     final run = _run;
     if (run != null) {
       try {

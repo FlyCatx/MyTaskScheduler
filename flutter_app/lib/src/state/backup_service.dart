@@ -1038,7 +1038,7 @@ class BackupService {
         final mapped = conversationIdMap[linked] ??
             (validConversationIds.contains(linked) ? linked : null);
         if (mapped == null) {
-          event = _withLinkedConversation(incoming, null);
+          event = _withLinkedConversation(incoming, null, clearLinkedTask: true);
           unlinked.add(incoming.id);
         } else if (mapped != linked) {
           event = _withLinkedConversation(incoming, mapped);
@@ -1075,10 +1075,14 @@ class BackupService {
   }
 
   /// 复制一条日程并替换其会话关联（模型是不可变值，没有通用的关联 copyWith）。
+  ///
+  /// 关联任务依附于会话：解除会话关联时必须同时清空 [linkedTaskId]，否则恢复后
+  /// 会留下无法定位的悬空任务引用；会话映射不变时原样保留。
   static ScheduleEvent _withLinkedConversation(
     ScheduleEvent event,
-    String? linkedConversationId,
-  ) =>
+    String? linkedConversationId, {
+    bool clearLinkedTask = false,
+  }) =>
       ScheduleEvent(
         id: event.id,
         revision: event.revision,
@@ -1094,6 +1098,7 @@ class BackupService {
         endDateExclusive: event.endDateExclusive,
         blocksScheduling: event.blocksScheduling,
         linkedConversationId: linkedConversationId,
+        linkedTaskId: clearLinkedTask ? null : event.linkedTaskId,
         repeat: event.repeat,
         reminder: event.reminder,
         exceptions: event.exceptions,

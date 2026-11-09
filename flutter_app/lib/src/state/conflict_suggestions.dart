@@ -374,15 +374,13 @@ List<ConflictSuggestion> suggestForConflict({
 
   out.add(ConflictSuggestion(
     kind: SuggestionKind.openTimetable,
-    label: '${SuggestionKind.openTimetable.label}（手动）',
+    label: SuggestionKind.openTimetable.label,
     affectedTaskIds: detail.taskIds,
     changes: <String>[
-      '在“可用时间/时间表”里调整每周可用范围、日期例外或课程占用；'
-          '降低约束（扩大可用时间、删除占用）只能由你明确操作。',
+      '打开时间表调整可用范围、日期例外或课程占用。',
       // 外部日历只读：时间表里删不掉，必须停用/更新来源或调整自己的安排。
       if (detail.source == ConflictSource.externalCalendar)
-        '外部日历来源是只读的：不能在时间表里删除这些占用；'
-            '请调整自己的安排，或在设置里停用/更新该外部来源。',
+        '外部日历是只读来源：请停用/更新来源，或调整自己的安排。',
     ],
     addedConflictCount: 0,
     deadlineRisk: false,
@@ -820,32 +818,25 @@ String _noSuggestionReason({
   required SchedulingTask? task,
 }) {
   if (segment != null && segment.source == SegmentSource.manual) {
-    return '这段安排是手动固定/拖动过的（manual 来源），程序不会自动挪动它；'
-        '请在甘特图上手动调整，或打开时间表修改可用时间。';
+    return '该时段已手动固定';
   }
   if (task != null && task.isDone) {
-    return '该任务已完成，历史安排只读，程序不会自动改动；请手动调整或保持现状。';
+    return '该任务已完成，历史安排只读';
   }
   switch (original.kind) {
     case ConflictKind.selfOverlap:
-      return '同一任务的两个片段互相重叠，且没有找到能保持时长、又不引入新冲突的空档；'
-          '请手动调整其中一段。';
+      return '同一任务两段时间重叠，且没有可用空档';
     case ConflictKind.taskOverlap:
-      return '与其他任务重叠，且没有找到既能消解重叠、又不引入新冲突的空档；'
-          '手动安排和其他任务预留不会被自动挪动。';
+      return '与其他任务重叠，且没有不引入新冲突的空档';
     case ConflictKind.unavailable:
-      return '在保持片段时长的前提下找不到可用空档；可用时间由用户时间表决定，'
-          '程序不会删除占用或擅自扩大可用时间。';
+      return '可用时间内没有足够空档';
     case ConflictKind.dependencyOrder:
-      return '这是任务先后顺序冲突，移动单段时间不一定能解决；'
-          '请调整依赖关系或手动安排前置任务。';
+      return '任务先后顺序冲突，需要调整依赖';
     case ConflictKind.uncertainDependency:
-      return '前置任务还没有安排，程序不会凭空假设它的时间；请先安排前置任务。';
+      return '前置任务还没有安排，无法自动排期';
     case ConflictKind.pastDeadline:
-      return '截止时间前没有足够空档，程序不会改写截止时间或减少工时；'
-          '请放宽截止时间或手动调整。';
+      return '截止时间前没有足够空档';
     case ConflictKind.outsideRange:
-      return '片段超出规划范围，程序不会自动扩大规划范围；'
-          '请在“可用时间”里调整规划范围。';
+      return '片段超出规划范围';
   }
 }
