@@ -72,6 +72,7 @@ class ScheduleOccurrence {
     required this.reminder,
     this.category,
     this.linkedConversationId,
+    this.linkedTaskId,
     this.startUtc,
     this.endUtc,
     this.startDate,
@@ -93,6 +94,9 @@ class ScheduleOccurrence {
   final bool blocksScheduling;
   final ScheduleReminderKind reminder;
   final String? linkedConversationId;
+
+  /// 稳定关联任务 ID（可空）；详情/周视图按 ID 解析标题，不做同名猜想。
+  final String? linkedTaskId;
   final bool isOverride;
 
   /// 定时实例：绝对 UTC 起止（半开区间）。
@@ -131,6 +135,7 @@ class ScheduleOccurrence {
         'blocksScheduling': blocksScheduling,
         'reminder': reminder.wireName,
         'linkedConversationId': linkedConversationId,
+        'linkedTaskId': linkedTaskId,
         if (!allDay) ...<String, dynamic>{
           'startUtc': startUtc?.toUtc().toIso8601String(),
           'endUtc': endUtc?.toUtc().toIso8601String(),
@@ -339,6 +344,7 @@ ScheduleOccurrence? _occurrenceFor({
       blocksScheduling: event.blocksScheduling,
       reminder: event.reminder,
       linkedConversationId: event.linkedConversationId,
+      linkedTaskId: event.linkedTaskId,
       startDate: startDate,
       endDateExclusive: endDateExclusive,
       isOverride: override != null,
@@ -393,6 +399,7 @@ ScheduleOccurrence? _occurrenceFor({
     blocksScheduling: event.blocksScheduling,
     reminder: event.reminder,
     linkedConversationId: event.linkedConversationId,
+    linkedTaskId: event.linkedTaskId,
     startUtc: startUtc,
     endUtc: endUtc,
     isOverride: override != null,
