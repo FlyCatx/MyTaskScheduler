@@ -119,12 +119,10 @@ class _ChunkedAnalysisDialogState extends State<ChunkedAnalysisDialog> {
           const Expanded(
             child: Text('分块分析', style: TextStyle(fontSize: 15)),
           ),
-          IconButton(
+          TsCloseButton(
             key: const Key('chunked-close-icon'),
             tooltip: _running ? '取消本次分析' : '关闭',
-            style: TsButtons.closeIcon(size: 28),
             onPressed: _closeOrCancel,
-            icon: const Icon(Icons.close, size: 16),
           ),
         ],
       ),
@@ -132,40 +130,32 @@ class _ChunkedAnalysisDialogState extends State<ChunkedAnalysisDialog> {
   }
 
   Widget _footer() {
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(20, 8, 20, 10),
-      child: Row(
-        mainAxisAlignment: MainAxisAlignment.end,
-        children: [
-          TextButton(
-            key: const Key('chunked-cancel'),
-            style: TsButtons.outline(),
-            onPressed: _closeOrCancel,
-            child: Text(_running ? '取消本次分析' : '关闭'),
+    return TsDialogActions(
+      actions: <TsDialogAction>[
+        TsDialogAction(
+          key: const Key('chunked-cancel'),
+          label: _running ? '取消本次分析' : '关闭',
+          role: TsDialogActionRole.secondary,
+          onPressed: _closeOrCancel,
+        ),
+        if (!_running && _result == null)
+          TsDialogAction(
+            key: const Key('chunked-start'),
+            label: '开始分块分析',
+            role: TsDialogActionRole.primary,
+            onPressed: _start,
           ),
-          if (!_running && _result == null) ...[
-            const SizedBox(width: 8),
-            FilledButton(
-              key: const Key('chunked-start'),
-              style: TsButtons.solid(),
-              onPressed: _start,
-              child: const Text('开始分块分析'),
-            ),
-          ],
-          if (!_running && _previewView != null) ...[
-            const SizedBox(width: 8),
-            FilledButton(
-              key: const Key('chunked-preview-confirm'),
-              style: TsButtons.solid(),
-              // 只有材料完整、无阻塞、无关键待确认项且基线未变时才可点。
-              onPressed: (_previewView!.canCommit && !_previewActionBusy)
-                  ? _confirmPreview
-                  : null,
-              child: Text(_previewActionBusy ? '正在提交…' : '确认生成计划'),
-            ),
-          ],
-        ],
-      ),
+        if (!_running && _previewView != null)
+          TsDialogAction(
+            key: const Key('chunked-preview-confirm'),
+            // 只有材料完整、无阻塞、无关键待确认项且基线未变时才可点。
+            label: _previewActionBusy ? '正在提交…' : '确认生成计划',
+            role: TsDialogActionRole.primary,
+            onPressed: (_previewView!.canCommit && !_previewActionBusy)
+                ? _confirmPreview
+                : null,
+          ),
+      ],
     );
   }
 
