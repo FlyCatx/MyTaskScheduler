@@ -122,6 +122,7 @@ class OcrService {
           : (_buildInfo?.engineVersion ?? 'unknown'),
       languages: probed.languages,
       problem: probed.problem,
+      languagePackMissing: probed.languagePackMissing,
       checkedAt: probed.checkedAt ?? DateTime.now(),
     );
     _availability = withPath;
@@ -147,7 +148,9 @@ class OcrService {
     final available = await availability();
     if (!available.available) {
       throw OcrClientException(OcrError(
-        code: available.problem != null && available.problem!.contains('语言')
+        code: available.languagePackMissing ||
+                (available.problem != null &&
+                    available.problem!.contains('语言'))
             ? OcrErrorCode.noLanguage
             : OcrErrorCode.hostMissing,
         message: available.problem ?? OcrErrorCode.hostMissing.defaultMessage,
@@ -295,7 +298,7 @@ class OcrService {
         languages: requestedLanguages,
         error: const OcrError(
           code: OcrErrorCode.unsupportedFormat,
-          message: '不支持的文件类型。本地 OCR 支持 PDF、PNG、JPEG 图片。',
+          message: OcrFileSupport.unsupportedMessage,
         ),
       );
     }

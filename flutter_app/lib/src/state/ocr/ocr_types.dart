@@ -16,6 +16,19 @@
 
 import 'dart:convert';
 
+/// 缺少识别语言时显示的“已核实”安装路径（任务 05）。
+///
+/// 本机核对环境：Windows 10 专业版 22H2（10.0.19045）中文界面——
+/// “设置 → 时间和语言 → 语言”页面存在，右侧为“首选语言”列表；
+/// 语言选项页由“选项”进入，语言功能中包含“光学字符识别”。Windows 11 把
+/// 页面改名为“语言和区域”、子页改名为“语言选项”，所以文案里同时给出两个名称。
+/// 本机已安装中文(简体，中国)/英语(美国) 的 OCR 识别组件，因此“缺少语言”的
+/// 失败状态由测试用合成状态覆盖，实机缺语言安装回归见交接说明。
+const String kOcrLanguageInstallPath =
+    'Windows 设置 → 时间和语言 → 语言（Windows 11 为“语言和区域”）→ '
+    '首选语言中选择“中文(简体)”或“English” → 选项（Windows 11 为“语言选项”）→ '
+    '“光学字符识别” → 安装';
+
 /// Stable machine-readable OCR error codes.
 ///
 /// Codes 1-6 are emitted by `ocr_host.exe`; the remaining ones are produced by
@@ -55,12 +68,11 @@ extension OcrErrorCodeInfo on OcrErrorCode {
   /// Default user-facing Chinese explanation. The host sends its own message,
   /// which is preferred; this is the fallback for locally generated failures.
   String get defaultMessage => switch (this) {
-        OcrErrorCode.encrypted =>
-          '文档已加密或密码不正确，无法读取页面。请先解除密码保护，或提供正确密码。',
+        OcrErrorCode.encrypted => '文档已加密或密码不正确，无法读取页面。请先解除密码保护，或提供正确密码。',
         OcrErrorCode.renderFailed => '页面渲染失败，无法进行识别。',
         OcrErrorCode.ocrFailed => '这一页没有识别出文字（空白、手写或非文字内容）。',
         OcrErrorCode.noLanguage =>
-          '本机没有可用的 OCR 语言组件。请在 Windows 设置 → 时间和语言 → 语言 中安装对应语言。',
+          '本机没有可用的 OCR 识别语言组件。修复方法：$kOcrLanguageInstallPath。',
         OcrErrorCode.tooLarge => '页面像素或页数超过本地上限。请降低 DPI 或分批处理。',
         OcrErrorCode.pageOutOfRange => '页码范围超出文档实际页数。',
         OcrErrorCode.hostMissing =>
@@ -69,7 +81,7 @@ extension OcrErrorCodeInfo on OcrErrorCode {
         OcrErrorCode.protocolError => '本地 OCR 组件输出无法解析（版本可能不匹配）。',
         OcrErrorCode.timeout => '本地 OCR 超时未完成。可以缩小页范围或降低 DPI 后重试。',
         OcrErrorCode.cancelled => '识别已取消。',
-        OcrErrorCode.unsupportedFormat => '不支持的文件类型。仅支持 PDF、PNG、JPEG。',
+        OcrErrorCode.unsupportedFormat => OcrFileSupport.unsupportedMessage,
       };
 
   static OcrErrorCode fromWire(String raw) {
@@ -168,6 +180,45 @@ enum OcrSourceKind {
         OcrSourceKind.unsupported => 'unsupported',
       };
 }
+
+/// 本地 OCR 可选择的文件格式（唯一事实源，任务 06）。
+///
+/// 帮助文案、文件控件提示、未选文件的占位和**入口扩展名校验**都从这里取值，
+/// 这样“窗口写明的格式”和“手上实际接受的格式”不会各写一份。原生文件面板的
+/// 默认筛选由 `NativeGateway.pickTextFiles(filter: PickFilter.ocr)` 按同一范围
+/// （PDF / PNG / JPG / JPEG，大小写不敏感，另附“所有文件”兜底）生成；
+/// 系统面板允许“所有文件”，所以绕过筛选返回的路径仍要经过 [acceptsPath]。
+class OcrFileSupport {
+  OcrFileSupport._();
+
+  /// 可接受的扩展名（统一小写比较）。JPG 与 JPEG 等价。
+  static const List<String> extensions = <String>['pdf', 'png', 'jpg', 'jpeg'];
+
+  /// 帮助正文里的格式名（与 [extensions] 同一范围）。
+  static const String formatNames = 'PDF、PNG、JPEG';
+
+  /// 文件控件/筛选名称里的单行写法。
+  static const String slashNames = 'PDF / PNG / JPEG';
+
+  /// 帮助弹窗正文：只说明格式与提取方式（联网边界与安装说明不在此常驻）。
+  static const String helpBody = '支持 PDF、PNG、JPEG。PDF 中已有文字的页面直接提取。';
+
+  /// 入口校验失败时给用户看的具体原因。
+  static const String unsupportedMessage =
+      '不支持的文件类型。本地 OCR 仅支持 PDF、PNG、JPG、JPEG。';
+
+  /// 小写扩展名（不含点）；没有扩展名时返回空串。
+  static String extensionOf(String path) {
+    final name = path.split(RegExp(r'[\\/]')).last;
+    final dot = name.lastIndexOf('.');
+    return dot < 0 ? '' : name.substring(dot + 1).toLowerCase();
+  }
+
+  /// 绕过原生筛选（手输路径/所有文件）返回的路径在应用入口再次校验。
+  static bool acceptsPath(String path) =>
+      extensions.contains(extensionOf(path));
+}
+
 /// Rectangle in rendered-image pixels (top-left origin).
 ///
 /// The rendered image size and DPI are stored next to it, so the same box can be
@@ -186,7 +237,8 @@ class OcrRect {
 
   static OcrRect? fromJson(Object? raw) {
     if (raw is! List || raw.length < 4) return null;
-    final values = raw.map((v) => v is num ? v.toDouble() : null).toList(growable: false);
+    final values =
+        raw.map((v) => v is num ? v.toDouble() : null).toList(growable: false);
     if (values.any((v) => v == null)) return null;
     return OcrRect(values[0]!, values[1]!, values[2]!, values[3]!);
   }
@@ -210,7 +262,8 @@ class OcrRect {
   }
 
   @override
-  String toString() => 'OcrRect(${x.toStringAsFixed(1)}, ${y.toStringAsFixed(1)}, '
+  String toString() =>
+      'OcrRect(${x.toStringAsFixed(1)}, ${y.toStringAsFixed(1)}, '
       '${width.toStringAsFixed(1)}x${height.toStringAsFixed(1)})';
 }
 
@@ -343,7 +396,9 @@ class OcrPageResult {
     final width = (m['width'] as num?)?.toInt();
     final height = (m['height'] as num?)?.toInt();
     if (page == null || page < 1 || text is! String) return null;
-    if (width == null || width <= 0 || height == null || height <= 0) return null;
+    if (width == null || width <= 0 || height == null || height <= 0) {
+      return null;
+    }
     final lines = <OcrLine>[];
     final rawLines = m['lines'];
     if (rawLines is List) {
@@ -489,8 +544,7 @@ class OcrJobResult {
   }
 
   /// Human-readable coverage line, e.g. "3/5 页成功，2 页失败".
-  String get coverageLabel =>
-      '${results.length}/${requestedPages.length} 页成功'
+  String get coverageLabel => '${results.length}/${requestedPages.length} 页成功'
       '${failures.isEmpty ? '' : '，${failures.length} 页失败'}'
       '${cancelled ? '（已取消）' : ''}';
 
@@ -687,7 +741,9 @@ class OcrSourceRef {
     final width = (m['width'] as num?)?.toInt();
     final height = (m['height'] as num?)?.toInt();
     if (sha.isEmpty || page == null || page < 1) return null;
-    if (width == null || height == null || width <= 0 || height <= 0) return null;
+    if (width == null || height == null || width <= 0 || height <= 0) {
+      return null;
+    }
     return OcrSourceRef(
       documentSha256: sha,
       page: page,
@@ -752,6 +808,7 @@ class OcrAvailability {
     this.pipelineVersion = '',
     this.languages = const <OcrLanguage>[],
     this.problem,
+    this.languagePackMissing = false,
     this.checkedAt,
   });
 
@@ -772,6 +829,12 @@ class OcrAvailability {
   /// Why OCR is unavailable (user-facing Chinese), or `null` when available.
   final String? problem;
 
+  /// True when the backend is unusable *specifically because no OCR recogniser
+  /// language pack is installed* (as opposed to a missing/broken host or another
+  /// failure). Set by the probe; the dialog uses it to show the verified
+  /// Windows Settings repair path instead of a generic error.
+  final bool languagePackMissing;
+
   final DateTime? checkedAt;
 
   bool get hasLanguages => languages.isNotEmpty;
@@ -784,7 +847,8 @@ class OcrAvailability {
       if (availableTag == wanted) return true;
       if (wanted.startsWith('zh') && availableTag.startsWith('zh')) return true;
       if (wanted.startsWith('en') && availableTag.startsWith('en')) return true;
-      if (availableTag.startsWith('$wanted-') || wanted.startsWith('$availableTag-')) {
+      if (availableTag.startsWith('$wanted-') ||
+          wanted.startsWith('$availableTag-')) {
         return true;
       }
     }
@@ -800,7 +864,8 @@ class OcrAvailability {
     ];
     final wanted = preferred?.trim() ?? '';
     if (wanted.isEmpty) return tags;
-    final index = tags.indexWhere((tag) => tag.toLowerCase() == wanted.toLowerCase());
+    final index =
+        tags.indexWhere((tag) => tag.toLowerCase() == wanted.toLowerCase());
     if (index > 0) {
       final first = tags.removeAt(index);
       tags.insert(0, first);
@@ -808,8 +873,17 @@ class OcrAvailability {
     return tags;
   }
 
-  static OcrAvailability unavailable(String problem, {String? hostPath}) =>
-      OcrAvailability(available: false, hostPath: hostPath, problem: problem);
+  static OcrAvailability unavailable(
+    String problem, {
+    String? hostPath,
+    bool languagePackMissing = false,
+  }) =>
+      OcrAvailability(
+        available: false,
+        hostPath: hostPath,
+        problem: problem,
+        languagePackMissing: languagePackMissing,
+      );
 }
 
 /// Build metadata written next to the host executable by
@@ -987,7 +1061,8 @@ class OcrLimits {
     return sorted;
   }
 
-  String describe() => 'DPI $minDpi-$maxDpi（默认 $defaultDpi），单次最多 $maxPagesPerJob 页，'
+  String describe() =>
+      'DPI $minDpi-$maxDpi（默认 $defaultDpi），单次最多 $maxPagesPerJob 页，'
       '每页最多 ${maxPixelsPerPage ~/ 1000000} MP / 最长边 $maxDimension 像素';
 }
 

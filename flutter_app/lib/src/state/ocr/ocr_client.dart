@@ -474,10 +474,11 @@ class OcrHostClient {
         engineVersion: hello.engineVersion,
         pipelineVersion: hello.pipelineVersion,
         languages: languages,
+        // 具体原因留在 problem 里；修复路径由界面用已核实常量展示，避免两处
+        // 系统设置路径写法不一致。
         problem: '本机没有安装任何 OCR 识别语言组件。'
-            '请在 Windows 设置 → 时间和语言 → 语言 中安装语言包'
-            '（至少简体中文或英文的“光学字符识别”组件）后重试。'
             '${protocolProblem == null ? '' : '（$protocolProblem）'}',
+        languagePackMissing: true,
         checkedAt: DateTime.now(),
       );
     }
