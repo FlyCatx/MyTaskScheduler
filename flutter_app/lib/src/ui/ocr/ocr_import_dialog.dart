@@ -5,20 +5,23 @@
 //   调整页范围 / DPI / 可选密码 → 本地识别（页级进度、可取消）→
 //   逐页预览与人工校对（低置信日期/数字标记）→ 确认加入材料。
 //
-// Boundaries made explicit in the UI:
+// Boundaries (behaviour, not a permanent paragraph in the help UI):
 //   * local OCR is fully offline (no upload, no Python/PATH dependency);
-//   * confirming adds *text* material; when the user later asks the configured
-//     model to analyse it, that text leaves the machine over the user's own
-//     connection — "local OCR" does not mean "the analysis is offline".
+//   * clicking help / picking a file / recognising / adding material never
+//     triggers a model request; only an explicit analysis request sends text.
+// The 使用说明 help itself only explains formats and extraction (任务 05).
 //
 // A partially failed job is never presented as complete: failed pages are listed
 // with their reasons, and confirming a partial material requires an explicit
 // second confirmation that names the missing pages.
 //
 // File selection is an injectable hook (like ExternalCalendarFilePicker), so
-// widget tests do not need a native dialog; production wires it in bootstrap:
+// widget tests do not need a native dialog; production wires it in app_shell:
 //   OcrFilePicker.defaultPick = () => gateway.pickTextFiles(
-//       title: '选择扫描件或图片（PDF / PNG / JPEG）');
+//       filter: PickFilter.ocr,
+//       title: '选择扫描 PDF 或图片（本地 OCR）');
+// The OCR-specific native filter only offers PDF/PNG/JPG/JPEG; a path that
+// bypasses it ("所有文件"/手输) is validated again here via [OcrFileSupport].
 
 import 'dart:math' as math;
 
@@ -69,7 +72,15 @@ Future<bool> showOcrImportDialog(
   return result ?? false;
 }
 
-enum _Phase { loading, select, detecting, configure, running, review, unavailable }
+enum _Phase {
+  loading,
+  select,
+  detecting,
+  configure,
+  running,
+  review,
+  unavailable
+}
 
 class _OcrImportDialog extends StatefulWidget {
   const _OcrImportDialog({
@@ -134,7 +145,6 @@ class _OcrImportDialogState extends State<_OcrImportDialog> {
     final index = math.max(path.lastIndexOf('\\'), path.lastIndexOf('/'));
     return index < 0 ? path : path.substring(index + 1);
   }
-
 
   String? get _password {
     final value = _passwordController.text.trim();
@@ -228,11 +238,13 @@ class _OcrImportDialogState extends State<_OcrImportDialog> {
   }
 
   Future<void> _detect(String path) async {
-    final kind = OcrSourceKind.fromPath(path);
-    if (kind == OcrSourceKind.unsupported) {
+    // 系统面板允许“所有文件”，手输路径也可能绕过筛选：入口再次校验扩展名，
+    // 范围与帮助文案/原生筛选一致（[OcrFileSupport]）。
+    if (!OcrFileSupport.acceptsPath(path)) {
       setState(() {
-        _phase = _Phase.select;
-        _error = '不支持的文件类型。本地 OCR 支持 PDF、PNG、JPEG 图片。';
+        // 已有识别结果时留在校对页，不清空旧结果。
+        _phase = _material != null ? _Phase.review : _Phase.select;
+        _error = OcrFileSupport.unsupportedMessage;
       });
       return;
     }
@@ -412,7 +424,8 @@ class _OcrImportDialogState extends State<_OcrImportDialog> {
     final material = _material;
     if (material == null) return;
     final pages = material.pages.map((page) => page.page).toSet();
-    final stale = _reviewControllers.keys.where((page) => !pages.contains(page)).toList();
+    final stale =
+        _reviewControllers.keys.where((page) => !pages.contains(page)).toList();
     for (final page in stale) {
       _reviewControllers.remove(page)?.dispose();
     }
@@ -438,7 +451,8 @@ class _OcrImportDialogState extends State<_OcrImportDialog> {
     final material = _material;
     final controller = _reviewControllers[page];
     if (material == null || controller == null) return;
-    final pageMaterial = material.pages.firstWhere((entry) => entry.page == page);
+    final pageMaterial =
+        material.pages.firstWhere((entry) => entry.page == page);
     controller.text = pageMaterial.originalText;
     setState(() {
       _material = material.applyReview(page, '');
@@ -593,7 +607,8 @@ class _OcrImportDialogState extends State<_OcrImportDialog> {
     final showPlan = detection != null && detection.pages.isNotEmpty;
     final bounded = constraints.maxHeight >= _boundedConfigureHeight;
 
-    final Widget plan = showPlan ? _pagePlanList(detection) : const SizedBox.shrink();
+    final Widget plan =
+        showPlan ? _pagePlanList(detection) : const SizedBox.shrink();
     final List<Widget> children = <Widget>[
       _fileRow(),
       const SizedBox(height: 8),
@@ -634,7 +649,8 @@ class _OcrImportDialogState extends State<_OcrImportDialog> {
       padding: const EdgeInsets.fromLTRB(20, 10, 8, 8),
       child: Row(
         children: [
-          Icon(Icons.document_scanner_outlined, size: 17, color: TsColors.accent),
+          Icon(Icons.document_scanner_outlined,
+              size: 17, color: TsColors.accent),
           const SizedBox(width: 8),
           const Expanded(
             child: Text(
@@ -644,17 +660,15 @@ class _OcrImportDialogState extends State<_OcrImportDialog> {
           ),
           IconButton(
             key: const Key('ocr-help'),
-            tooltip: '使用说明与联网边界',
+            tooltip: '使用说明',
             onPressed: _running ? null : () => _showHelp(context),
             style: TsButtons.closeIcon(size: 28),
             icon: const Icon(Icons.help_outline, size: 16),
           ),
-          IconButton(
+          TsCloseButton(
             key: const Key('ocr-dialog-close'),
             tooltip: '关闭',
             onPressed: _running ? null : () => Navigator.of(context).pop(false),
-            style: TsButtons.closeIcon(size: 28),
-            icon: const Icon(Icons.close, size: 16),
           ),
         ],
       ),
@@ -687,17 +701,23 @@ class _OcrImportDialogState extends State<_OcrImportDialog> {
       case _Phase.unavailable:
         return <Widget>[
           _errorBox(),
-          const SizedBox(height: 8),
-          if (_availability != null && _availability!.languages.isNotEmpty)
+          if (_availability?.languagePackMissing == true) ...[
+            const SizedBox(height: 8),
+            _languageInstallGuide(
+              afterInstall: '安装完成后回到本窗口点“重新检查”。',
+            ),
+          ] else if (_availability != null &&
+              _availability!.languages.isNotEmpty) ...[
+            const SizedBox(height: 8),
             Text(
               '已安装的识别语言：'
               '${_availability!.languages.map((language) => language.displayName).join('、')}',
               style: TextStyle(fontSize: 11.5, color: TsColors.textSecondary),
             ),
+          ],
           const SizedBox(height: 8),
           Text(
-            '本地 OCR 使用 Windows 自带的识别组件，不需要联网；缺少语言包时可在 '
-            'Windows 设置 → 时间和语言 → 语言 中安装对应语言的“光学字符识别”组件。',
+            '本地 OCR 使用 Windows 自带的识别组件，不需要联网。',
             style: TextStyle(
                 fontSize: 11.5, height: 1.5, color: TsColors.textFaint),
           ),
@@ -747,8 +767,8 @@ class _OcrImportDialogState extends State<_OcrImportDialog> {
         // 格式与文字层处理说明并入文件控件：按钮 Tooltip 随时可查，未选文件时
         // 控件内再给一行简短提示；不再在初始页单独占一段常驻说明。
         Tooltip(
-          message: '支持扫描型/混合文字层 PDF、PNG、JPEG；'
-              '文本型 PDF 优先使用原有文字层，不重复识别。',
+          // 格式范围与帮助正文、原生筛选同一来源（[OcrFileSupport]）。
+          message: OcrFileSupport.helpBody,
           child: OutlinedButton(
             key: const Key('ocr-pick-file'),
             onPressed: _running || _busy ? null : _pickFile,
@@ -763,17 +783,21 @@ class _OcrImportDialogState extends State<_OcrImportDialog> {
             mainAxisSize: MainAxisSize.min,
             children: [
               Text(
-                _filePath == null ? '尚未选择文件（PDF / PNG / JPEG）' : '已选择：$_fileName',
+                _filePath == null
+                    ? '尚未选择文件（${OcrFileSupport.slashNames}）'
+                    : '已选择：$_fileName',
                 key: const Key('ocr-file-name'),
                 overflow: TextOverflow.ellipsis,
                 style: TextStyle(
                   fontSize: 12,
-                  color: _filePath == null ? TsColors.textFaint : TsColors.textPrimary,
+                  color: _filePath == null
+                      ? TsColors.textFaint
+                      : TsColors.textPrimary,
                 ),
               ),
               if (_filePath == null)
                 Text(
-                  '扫描型/混合 PDF 与 PNG、JPEG；文本型 PDF 复用原文字层',
+                  OcrFileSupport.helpBody,
                   key: const Key('ocr-file-hint'),
                   overflow: TextOverflow.ellipsis,
                   style: TextStyle(fontSize: 10.5, color: TsColors.textFaint),
@@ -785,60 +809,88 @@ class _OcrImportDialogState extends State<_OcrImportDialog> {
     );
   }
 
-  /// 使用说明与联网边界（可从标题栏随时打开）。
+  /// “使用说明”：只讲支持格式、提取方式和当下要做的操作（任务 05）。
   ///
-  /// 初始页不再常驻“格式/文字层/联网边界”两段；必要说明保留在这个可达入口：
-  /// 本机 OCR 本地完成，只有用户主动发起模型分析时材料文字才经配置连接发送。
+  /// 联网边界（材料文字何时会发到模型）与语言安装说明都不在这个帮助里常驻；
+  /// 缺少识别语言时由识别失败/不可用状态给出具体原因和已核实的系统设置路径。
+  /// 动作区使用任务 02 的统一对话框动作组件（primary = 实心主按钮）。
   Future<void> _showHelp(BuildContext context) {
     return showDialog<void>(
       context: context,
-      builder: (dialogContext) => AlertDialog(
+      builder: (dialogContext) => Dialog(
         key: const Key('ocr-help-dialog'),
         backgroundColor: TsColors.surface,
         shape: const BezierRoundedRectangleBorder(radius: 14),
-        title: Row(
-          children: [
-            Icon(Icons.document_scanner_outlined, size: 17, color: TsColors.accent),
-            const SizedBox(width: 8),
-            const Text('本地 OCR 使用说明', style: TextStyle(fontSize: 15)),
-          ],
-        ),
-        content: ConstrainedBox(
-          constraints: const BoxConstraints(maxWidth: 560),
-          child: SingleChildScrollView(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Text(
-                  '• 支持扫描型 PDF、文字层+扫描混合 PDF，以及 PNG / JPEG 图片；'
-                  '文本型 PDF 优先使用原有文字层，不会重复识别。\n'
-                  '• 选择文件与识别都在本机完成，不需要联网，也不需要安装 Python。\n'
-                  '• 缺少识别语言时，在 Windows 设置 → 时间和语言 → 语言 中安装'
-                  '对应语言的“光学字符识别”组件后重试。',
+        child: SizedBox(
+          width: 600,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Padding(
+                padding: const EdgeInsets.fromLTRB(20, 14, 20, 8),
+                child: Row(
+                  children: [
+                    Icon(Icons.document_scanner_outlined,
+                        size: 17, color: TsColors.accent),
+                    const SizedBox(width: 8),
+                    const Text('本地 OCR 使用说明', style: TextStyle(fontSize: 15)),
+                  ],
+                ),
+              ),
+              Padding(
+                padding: const EdgeInsets.fromLTRB(20, 0, 20, 4),
+                child: Text(
+                  OcrFileSupport.helpBody,
                   key: const Key('ocr-help-body'),
                   style: TextStyle(
-                      fontSize: 12.5, height: 1.55, color: TsColors.textSecondary),
+                      fontSize: 12.5,
+                      height: 1.55,
+                      color: TsColors.textSecondary),
                 ),
-                const SizedBox(height: 10),
-                Text(
-                  '联网边界：只有你主动让已配置的模型分析材料时，材料文字才会通过'
-                  '该模型连接发送；发送范围取决于你选择的连接与材料。确认加入材料本身'
-                  '只写入本机，不会触发模型请求。',
-                  key: const Key('ocr-help-boundary'),
-                  style: TextStyle(
-                      fontSize: 12.5, height: 1.55, color: TsColors.textFaint),
-                ),
-              ],
-            ),
+              ),
+              TsDialogActions(
+                actions: <TsDialogAction>[
+                  TsDialogAction(
+                    key: const Key('ocr-help-close'),
+                    label: '知道了',
+                    role: TsDialogActionRole.primary,
+                    onPressed: () => Navigator.of(dialogContext).pop(),
+                  ),
+                ],
+              ),
+            ],
           ),
         ),
-        actions: [
-          TextButton(
-            key: const Key('ocr-help-close'),
-            style: TsButtons.inline(),
-            onPressed: () => Navigator.of(dialogContext).pop(),
-            child: const Text('知道了'),
+      ),
+    );
+  }
+
+  /// 缺少识别语言时的“修复方法 + 已核实路径 + 当下操作”。
+  ///
+  /// 只在确实没有 OCR 识别语言组件时出现；正常帮助和其它失败原因不常驻安装说明。
+  Widget _languageInstallGuide({required String afterInstall}) {
+    return Container(
+      key: const Key('ocr-language-install-guide'),
+      padding: const EdgeInsets.all(8),
+      decoration: BoxDecoration(
+        color: TsColors.waitingSoft,
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            '修复方法：$kOcrLanguageInstallPath。',
+            key: const Key('ocr-language-install-path'),
+            style:
+                TextStyle(fontSize: 11.5, height: 1.5, color: TsColors.waiting),
+          ),
+          const SizedBox(height: 2),
+          Text(
+            afterInstall,
+            style: TextStyle(
+                fontSize: 11.5, height: 1.5, color: TsColors.textSecondary),
           ),
         ],
       ),
@@ -949,7 +1001,8 @@ class _OcrImportDialogState extends State<_OcrImportDialog> {
       style: TextStyle(
         fontSize: 12,
         height: 1.45,
-        color: detection.detectionFailed ? TsColors.blocked : TsColors.textPrimary,
+        color:
+            detection.detectionFailed ? TsColors.blocked : TsColors.textPrimary,
       ),
     );
   }
@@ -975,9 +1028,8 @@ class _OcrImportDialogState extends State<_OcrImportDialog> {
           itemBuilder: (context, index) {
             final plan = visible[index];
             // 字号放大时页码/原因列同比加宽，避免“第 7 页”被折成两行或压到说明上。
-            final scale = MediaQuery.textScalerOf(context)
-                .scale(1.0)
-                .clamp(1.0, 2.0);
+            final scale =
+                MediaQuery.textScalerOf(context).scale(1.0).clamp(1.0, 2.0);
             return Padding(
               key: Key('ocr-page-plan-row-${plan.page}'),
               padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
@@ -1015,7 +1067,9 @@ class _OcrImportDialogState extends State<_OcrImportDialog> {
                     child: Text(
                       plan.explanation,
                       style: TextStyle(
-                          fontSize: 11, height: 1.35, color: TsColors.textFaint),
+                          fontSize: 11,
+                          height: 1.35,
+                          color: TsColors.textFaint),
                     ),
                   ),
                 ],
@@ -1058,7 +1112,8 @@ class _OcrImportDialogState extends State<_OcrImportDialog> {
       Text(
         '识别完全在本地进行。取消会终止本地 OCR 子进程；已完成的页会保留结果，'
         '但不会自动加入材料。',
-        style: TextStyle(fontSize: 11.5, height: 1.5, color: TsColors.textFaint),
+        style:
+            TextStyle(fontSize: 11.5, height: 1.5, color: TsColors.textFaint),
       ),
       if (_notice != null) ...[
         const SizedBox(height: 8),
@@ -1086,9 +1141,15 @@ class _OcrImportDialogState extends State<_OcrImportDialog> {
           key: const Key('ocr-review-summary'),
           style: TextStyle(fontSize: 11.5, color: TsColors.textSecondary),
         ),
-      if (job?.jobError != null) ...[
+      if (job != null && job.jobError != null) ...[
         const SizedBox(height: 8),
-        _errorBox(text: job!.jobError!.message),
+        _errorBox(text: job.jobError!.message),
+        if (job.jobError!.code == OcrErrorCode.noLanguage) ...[
+          const SizedBox(height: 6),
+          _languageInstallGuide(
+            afterInstall: '安装完成后点“重新识别失败页”补齐未识别的页。',
+          ),
+        ],
       ],
       if (job != null && job.failures.isNotEmpty) ...[
         const SizedBox(height: 8),
@@ -1104,19 +1165,16 @@ class _OcrImportDialogState extends State<_OcrImportDialog> {
       ],
       if (material != null) ...[
         const SizedBox(height: 8),
-        Text(
-          '逐页校对：识别原文与你的修改分开保存，下次重新识别不会覆盖你的校对。',
-          style: TextStyle(fontSize: 11.5, color: TsColors.textFaint),
-        ),
+        // 图10 红框的“逐页校对：识别原文与你的修改分开保存……”常驻段已删除，
+        // 连同它单独占用的空白行；只保留页数/待校对/风险提示与逐页编辑区。
         if (material.reviewHint != null) ...[
-          const SizedBox(height: 4),
           Text(
             material.reviewHint!,
             key: const Key('ocr-review-hint'),
             style: TextStyle(fontSize: 11.5, color: TsColors.waiting),
           ),
+          const SizedBox(height: 8),
         ],
-        const SizedBox(height: 8),
         ...material.pages.map(_reviewPageCard),
       ],
       if (_error != null && job?.jobError == null) ...[
@@ -1147,7 +1205,9 @@ class _OcrImportDialogState extends State<_OcrImportDialog> {
                 child: Text(
                   '第 ${failure.page} 页：${failure.code.wire} — ${failure.message}',
                   style: TextStyle(
-                      fontSize: 11, height: 1.35, color: TsColors.textSecondary),
+                      fontSize: 11,
+                      height: 1.35,
+                      color: TsColors.textSecondary),
                 ),
               )),
         ],
@@ -1221,7 +1281,8 @@ class _OcrImportDialogState extends State<_OcrImportDialog> {
                       ),
                       child: Text(
                         '待确认 ${flag.kind.label}：${flag.text}',
-                        style: TextStyle(fontSize: 10.5, color: TsColors.waiting),
+                        style:
+                            TextStyle(fontSize: 10.5, color: TsColors.waiting),
                       ),
                     ),
                   ),
