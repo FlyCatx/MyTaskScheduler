@@ -5,12 +5,12 @@ library;
 
 const String kAppName = 'TaskScheduler';
 
-/// Product version shown to users: 0.4.0.
-const String kAppVersion = '0.4.0';
+/// Product version shown to users: 0.5.0.
+const String kAppVersion = '0.5.0';
 
 /// 与 pubspec 的三段式版本保持一致（不含构建号；构建号见 VERSION.txt）。
 /// 发布目录与 pubspec 使用同一产品版本，不能把它们说成两个产品。
-const String kAppVersionSemver = '0.4.0';
+const String kAppVersionSemver = '0.5.0';
 
 /// The single local account. There is deliberately no login system: this label only
 /// exists as the entry point to the settings dialog.
