@@ -13,6 +13,7 @@ import 'package:taskscheduler_flutter/src/ui/execution/effort_review_dialog.dart
 import 'package:taskscheduler_flutter/src/ui/theme.dart';
 
 import 'execution_test_support.dart';
+import '../widget/date_picker_test_harness.dart';
 
 ({ExecutionLedger ledger, EffortReviewService service, List<ExecutionTaskInfo> tasks})
     _fixture() {
@@ -150,8 +151,8 @@ void main() {
       tester.widget<Text>(find.byKey(const Key('effort-review-remaining'))).data,
       contains('建议'),
     );
-    // “已完成但未记录”的任务在任务行显示“实际 未知”。
-    expect(find.textContaining('实际 未知'), findsWidgets);
+    // “已完成但未记录”的任务在任务行显示“实际 —”（未知 ≠ 0，但不写 0）。
+    expect(find.textContaining('实际 —'), findsWidgets);
     // 标题栏几何（R4-A）：关闭锚定右内缘、日期在其左侧。
     _expectTitleAnchored(tester);
   });
@@ -165,15 +166,33 @@ void main() {
     expect(find.textContaining('范围 30 分钟'), findsWidgets);
   });
 
-  testWidgets('切换到自定义日期范围', (tester) async {
+  testWidgets('切换到自定义日期范围：应用前不刷新，应用后标题/报告用已应用范围',
+      (tester) async {
     final f = _fixture();
     await _openDialog(tester, service: f.service, tasks: f.tasks);
+    // 应用前标题仍是已生效的“今日”范围。
+    expect(
+      tester.widget<Text>(find.byKey(const Key('effort-review-range'))).data,
+      contains('今日'),
+    );
     await tester.tap(find.text('自定义'));
     await tester.pumpAndSettle();
-    await tester.enterText(
-        find.byKey(const Key('effort-review-from')), '2026-10-30');
-    await tester.enterText(
-        find.byKey(const Key('effort-review-to')), '2026-11-04');
+    expect(find.byKey(const Key('effort-review-from')), findsOneWidget);
+    expect(find.byKey(const Key('effort-review-to')), findsOneWidget);
+    expect(
+      tester.widget<Text>(find.byKey(const Key('effort-review-range'))).data,
+      contains('今日'),
+      reason: '切到自定义但未应用前，报告/标题仍显示已生效范围',
+    );
+    await pickDateFromField(
+        tester, const Key('effort-review-from'), DateTime.utc(2026, 10, 30));
+    await pickDateFromField(
+        tester, const Key('effort-review-to'), DateTime.utc(2026, 11, 4));
+    expect(
+      tester.widget<Text>(find.byKey(const Key('effort-review-range'))).data,
+      contains('今日'),
+      reason: '选完日期但未点应用，不能提前刷新',
+    );
     await tester.tap(find.byKey(const Key('effort-review-apply')));
     await tester.pumpAndSettle();
     final rangeText =
@@ -236,7 +255,58 @@ void main() {
     expect(find.byKey(const Key('effort-review-export')), findsNothing);
   });
 
-  testWidgets('范围内没有记录时明确提示未知≠0', (tester) async {
+  testWidgets('自定义：起止相同合法，跨年范围可应用，CSV 用已应用范围', (tester) async {
+    final f = _fixture();
+    String? csv;
+    await _openDialog(
+      tester,
+      service: f.service,
+      tasks: f.tasks,
+      onExport: (name, content, path) async {
+        csv = content;
+        return true;
+      },
+    );
+    await tester.tap(find.text('自定义'));
+    await tester.pumpAndSettle();
+
+    // 1) 起止相同（同一天）合法，可直接应用。
+    await pickDateFromField(
+        tester, const Key('effort-review-from'), DateTime.utc(2026, 11, 4));
+    await pickDateFromField(
+        tester, const Key('effort-review-to'), DateTime.utc(2026, 11, 4));
+    expect(find.byKey(const Key('effort-review-range-error')), findsNothing);
+    await tester.tap(find.byKey(const Key('effort-review-apply')));
+    await tester.pumpAndSettle();
+    expect(
+      tester.widget<Text>(find.byKey(const Key('effort-review-range'))).data,
+      '自定义 2026-11-04 ~ 2026-11-04',
+    );
+
+    // 2) 跨年范围（2026-12-30 → 2027-01-02）仍可应用；中间逆序会就地报错。
+    await pickDateFromField(
+        tester, const Key('effort-review-from'), DateTime.utc(2026, 12, 30));
+    // 结束仍是 2026-11-04，此刻逆序（保留草稿并报错）。
+    expect(find.text('结束日期须等于或晚于开始日期'), findsOneWidget);
+    await pickDateFromField(
+        tester, const Key('effort-review-to'), DateTime.utc(2027, 1, 2));
+    expect(find.byKey(const Key('effort-review-range-error')), findsNothing);
+    await tester.tap(find.byKey(const Key('effort-review-apply')));
+    await tester.pumpAndSettle();
+    final rangeText =
+        tester.widget<Text>(find.byKey(const Key('effort-review-range'))).data;
+    expect(rangeText, contains('2026-12-30'));
+    expect(rangeText, contains('2027-01-02'));
+    // CSV 统计范围 = 已应用的跨年范围。
+    await tester.tap(find.byKey(const Key('effort-review-export')));
+    await tester.pumpAndSettle();
+    expect(csv, isNotNull);
+    expect(csv, contains('2026-12-30'));
+    expect(csv, contains('2027-01-02'));
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('范围内没有记录时显示「暂无执行记录」', (tester) async {
     final service = EffortReviewService(
       ledger: ExecutionLedger(),
       localTime: shanghaiLocalTime,
@@ -244,6 +314,10 @@ void main() {
     );
     await _openDialog(tester, service: service, tasks: const <ExecutionTaskInfo>[]);
     expect(find.byKey(const Key('effort-review-empty')), findsOneWidget);
-    expect(find.textContaining('未知 ≠ 0'), findsOneWidget);
+    expect(
+      tester.widget<Text>(find.byKey(const Key('effort-review-empty'))).data,
+      '暂无执行记录',
+    );
+    expect(find.textContaining('未知 ≠ 0'), findsNothing);
   });
 }
