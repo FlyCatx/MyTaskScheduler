@@ -261,4 +261,72 @@ void main() {
     expect(result.complete, isFalse);
     expect(result.warnings.join('；'), contains('400'));
   });
+
+  test('DST 时区的每周重复跨换季仍保持当地钟点 09:00', () {
+    // 2026 年纽约夏令时：3 月 8 日开始、11 月 1 日结束。
+    final weekly = _event(
+      timezoneId: 'America/New_York',
+      startDate: '2026-03-02', // 周一
+      startMinute: 9 * 60,
+      endMinute: 10 * 60,
+      repeat: const ScheduleRepeatRule.weekly(weekdays: <int>[1]),
+    );
+    final spring = expandScheduleEvents(
+      events: <ScheduleEvent>[weekly],
+      query: _queryLocal('America/New_York', '2026-03-02', '2026-03-16'),
+    );
+    expect(spring.complete, isTrue);
+    expect(spring.occurrences.map((o) => o.originalDate),
+        <String>['2026-03-02', '2026-03-09']);
+    // 换季前 EST（UTC-5）与换季后 EDT（UTC-4）的 UTC 时刻不同，但当地都是 09:00。
+    expect(spring.occurrences.first.startUtc, DateTime.utc(2026, 3, 2, 14));
+    expect(spring.occurrences.last.startUtc, DateTime.utc(2026, 3, 9, 13));
+    for (final occurrence in spring.occurrences) {
+      final wall = wallOf(occurrence.startUtc!, 'America/New_York');
+      expect(wall!.hour, 9);
+      expect(wall.minute, 0);
+    }
+
+    // 回拨：10 月 26 日（EDT）→ 11 月 2 日（EST）当地仍 09:00。
+    final fallEvent = _event(
+      timezoneId: 'America/New_York',
+      startDate: '2026-10-19', // 周一
+      startMinute: 9 * 60,
+      endMinute: 10 * 60,
+      repeat: const ScheduleRepeatRule.weekly(weekdays: <int>[1]),
+    );
+    final fall = expandScheduleEvents(
+      events: <ScheduleEvent>[fallEvent],
+      query: _queryLocal('America/New_York', '2026-10-19', '2026-11-09'),
+    );
+    expect(fall.complete, isTrue);
+    final nov2 = fall.occurrences
+        .firstWhere((occurrence) => occurrence.originalDate == '2026-11-02');
+    expect(nov2.startUtc, DateTime.utc(2026, 11, 2, 14));
+    expect(wallOf(nov2.startUtc!, 'America/New_York')!.hour, 9);
+  });
+
+  test('实例携带稳定的关联任务 ID，排序不改变身份', () {
+    final event = ScheduleEvent(
+      id: 'ev-linked',
+      revision: 0,
+      title: '联调',
+      timezoneId: 'Asia/Shanghai',
+      startDate: '2026-11-09',
+      startMinute: 9 * 60,
+      endMinute: 10 * 60,
+      linkedConversationId: 'conv-1',
+      linkedTaskId: 'task-7',
+      createdAtUtc: DateTime.utc(2026, 11, 1),
+      updatedAtUtc: DateTime.utc(2026, 11, 1),
+    );
+    final result = expandScheduleEvents(
+      events: <ScheduleEvent>[event],
+      query: _queryLocal('Asia/Shanghai', '2026-11-09', '2026-11-11'),
+    );
+    expect(result.complete, isTrue);
+    expect(result.occurrences.single.linkedTaskId, 'task-7');
+    expect(result.occurrences.single.linkedConversationId, 'conv-1');
+    expect(result.occurrences.single.toJson()['linkedTaskId'], 'task-7');
+  });
 }

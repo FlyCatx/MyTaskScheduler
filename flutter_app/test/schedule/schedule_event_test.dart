@@ -14,6 +14,7 @@ ScheduleEvent _event({
   ScheduleReminderKind reminder = ScheduleReminderKind.none,
   List<ScheduleException> exceptions = const <ScheduleException>[],
   String? linkedConversationId,
+  String? linkedTaskId,
 }) =>
     ScheduleEvent(
       id: id,
@@ -29,6 +30,7 @@ ScheduleEvent _event({
       reminder: reminder,
       exceptions: exceptions,
       linkedConversationId: linkedConversationId,
+      linkedTaskId: linkedTaskId,
       createdAtUtc: DateTime.utc(2026, 11, 1, 0),
       updatedAtUtc: DateTime.utc(2026, 11, 1, 0),
     );
@@ -222,5 +224,76 @@ void main() {
       event.exceptionsNoLongerMatching(const ScheduleRepeatRule.none()),
       <String>['ev-1@2026-11-11'],
     );
+  });
+
+  test('关联任务稳定 ID：JSON 往返、旧记录缺失默认 null', () {
+    final linked = _event(
+      linkedConversationId: 'conv-1',
+      linkedTaskId: 'task-42',
+    );
+    final parsed = ScheduleEvent.tryParse(linked.toJson());
+    expect(parsed, isNotNull);
+    expect(parsed!.linkedConversationId, 'conv-1');
+    expect(parsed.linkedTaskId, 'task-42');
+    expect(parsed.toJson(), linked.toJson());
+
+    // 旧数据没有 linkedTaskId 字段：解析为 null，不把整条记录判为损坏。
+    final legacy = Map<String, dynamic>.from(linked.toJson())
+      ..remove('linkedTaskId');
+    final parsedLegacy = ScheduleEvent.tryParse(legacy);
+    expect(parsedLegacy, isNotNull);
+    expect(parsedLegacy!.linkedTaskId, isNull);
+
+    // 复制/应用草稿保留该字段。
+    final copied = parsed.copyWith(revision: 2);
+    expect(copied.linkedTaskId, 'task-42');
+    final draft = ScheduleDraft.fromEvent(parsed);
+    expect(draft.linkedTaskId, 'task-42');
+    final applied = parsed.appliedDraft(
+      draft,
+      revision: 3,
+      updatedAtUtc: DateTime.utc(2026, 11, 2),
+    );
+    expect(applied.linkedTaskId, 'task-42');
+  });
+
+  test('关联任务必须依附关联会话且标识合法', () {
+    // 只有任务没有会话：严格解析拒绝，草稿校验也给明确原因。
+    final withoutConversation = Map<String, dynamic>.from(
+      _event(linkedTaskId: 'task-1').toJson(),
+    );
+    expect(ScheduleEvent.tryParse(withoutConversation), isNull);
+    final draft = const ScheduleDraft(
+      title: '写报告',
+      timezoneId: 'Asia/Shanghai',
+      startDate: '2026-11-09',
+      startMinute: 540,
+      endMinute: 600,
+      linkedTaskId: 'task-1',
+    );
+    expect(draft.validate(), '关联任务前需要先选择关联会话');
+
+    // 非法标识（空白/过长）被拒绝。
+    final badWhitespace = Map<String, dynamic>.from(
+      _event(linkedConversationId: 'conv-1', linkedTaskId: 'bad task').toJson(),
+    );
+    expect(ScheduleEvent.tryParse(badWhitespace), isNull);
+    final ok = const ScheduleDraft(
+      title: '写报告',
+      timezoneId: 'Asia/Shanghai',
+      startDate: '2026-11-09',
+      startMinute: 540,
+      endMinute: 600,
+      linkedConversationId: 'conv-1',
+      linkedTaskId: 'task-1',
+    );
+    expect(ok.validate(), isNull);
+    final event = ok.toEvent(
+      id: 'ev-2',
+      revision: 1,
+      nowUtc: DateTime.utc(2026, 11, 1),
+    );
+    expect(event.linkedTaskId, 'task-1');
+    expect(event.linkedConversationId, 'conv-1');
   });
 }

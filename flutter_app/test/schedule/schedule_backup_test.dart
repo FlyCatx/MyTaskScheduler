@@ -32,6 +32,7 @@ ScheduleEvent _timedEvent({
   int revision = 1,
   String title = '例会',
   String? linkedConversationId,
+  String? linkedTaskId,
   ScheduleRepeatRule repeat = const ScheduleRepeatRule.none(),
   List<ScheduleException> exceptions = const <ScheduleException>[],
   DateTime? deletedAtUtc,
@@ -48,6 +49,7 @@ ScheduleEvent _timedEvent({
       startMinute: startMinute,
       endMinute: endMinute,
       linkedConversationId: linkedConversationId,
+      linkedTaskId: linkedTaskId,
       repeat: repeat,
       reminder: ScheduleReminderKind.minutes15,
       exceptions: exceptions,
@@ -549,7 +551,11 @@ void main() {
       conversations: <Conversation>[_conversation(id: 'conv-A')],
       includeSchedules: true,
       schedules: _scheduleSection(<ScheduleEvent>[
-        _timedEvent(id: 'ev-linked', linkedConversationId: 'conv-A'),
+        _timedEvent(
+          id: 'ev-linked',
+          linkedConversationId: 'conv-A',
+          linkedTaskId: 'task-1',
+        ),
         _timedEvent(
           id: 'ev-local-linked',
           linkedConversationId: 'conv-local',
@@ -559,6 +565,7 @@ void main() {
         _timedEvent(
           id: 'ev-dangling',
           linkedConversationId: 'conv-gone',
+          linkedTaskId: 'task-gone',
           startMinute: 13 * 60,
           endMinute: 14 * 60,
         ),
@@ -579,6 +586,8 @@ void main() {
     expect(restored.warning, contains('解除关联'));
     expect(dstSchedules.snapshot.events['ev-linked']!.linkedConversationId,
         'conv-A');
+    // 会话映射不变时保留稳定任务引用。
+    expect(dstSchedules.snapshot.events['ev-linked']!.linkedTaskId, 'task-1');
     expect(
       dstSchedules.snapshot.events['ev-local-linked']!.linkedConversationId,
       'conv-local',
@@ -587,7 +596,66 @@ void main() {
       dstSchedules.snapshot.events['ev-dangling']!.linkedConversationId,
       isNull,
     );
+    // 解除会话关联时必须同时清空任务引用，避免备份恢复后悬空误跳。
+    expect(dstSchedules.snapshot.events['ev-dangling']!.linkedTaskId, isNull);
     expect(await dstStore.loadConversation('conv-A'), isNotNull);
+  });
+
+  test('备份导出/恢复往返保留 linkedTaskId；旧备份缺失字段默认 null', () async {
+    final src = temp('schedule-task-src');
+    await seedConversation(SessionStore(src), conversationId: 'conv-1');
+    final srcSchedules = await openSchedule(src);
+    await srcSchedules.open();
+    await srcSchedules.saveSnapshot(ScheduleSnapshot(
+      revision: 1,
+      events: <String, ScheduleEvent>{
+        'ev-task': _timedEvent(
+          id: 'ev-task',
+          linkedConversationId: 'conv-1',
+          linkedTaskId: 'task-42',
+        ),
+      },
+    ));
+    final backupPath = _p(<String>[src.path, 'task-backup.json']);
+    await service(src, scheduleStore: srcSchedules).exportBackup(backupPath);
+
+    final dst = temp('schedule-task-dst');
+    await seedConversation(SessionStore(dst), conversationId: 'conv-1');
+    final dstSchedules = await openSchedule(dst);
+    final restored = await service(
+      dst,
+      scheduleStore: dstSchedules,
+      reloadSchedule: () async {
+        await dstSchedules.reload();
+      },
+    ).restoreBackup(backupPath);
+    expect(restored.ok, isTrue, reason: restored.error);
+    expect(restored.restoredScheduleEventCount, 1);
+    expect(dstSchedules.snapshot.events['ev-task']!.linkedTaskId, 'task-42');
+
+    // 旧备份（事件 JSON 没有 linkedTaskId）恢复后默认 null，不判损坏。
+    final legacyPath = writeBackup(
+      dst,
+      conversations: <Conversation>[_conversation(id: 'conv-old')],
+      includeSchedules: true,
+      schedules: <String, dynamic>{
+        'schemaVersion': BackupService.scheduleSchemaVersion,
+        'revision': 1,
+        'events': <Map<String, dynamic>>[
+          Map<String, dynamic>.from(_timedEvent(id: 'ev-legacy').toJson())
+            ..remove('linkedTaskId'),
+        ],
+      },
+    );
+    final legacy = await service(
+      dst,
+      scheduleStore: dstSchedules,
+      reloadSchedule: () async {
+        await dstSchedules.reload();
+      },
+    ).restoreBackup(legacyPath);
+    expect(legacy.ok, isTrue, reason: legacy.error);
+    expect(dstSchedules.snapshot.events['ev-legacy']!.linkedTaskId, isNull);
   });
 
   test('部分恢复：新增/相同/冲突分别计数并给出 warning', () async {
