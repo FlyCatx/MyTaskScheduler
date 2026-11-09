@@ -329,6 +329,7 @@ class ScheduleEvent {
     this.endDateExclusive,
     this.blocksScheduling = true,
     this.linkedConversationId,
+    this.linkedTaskId,
     this.repeat = const ScheduleRepeatRule.none(),
     this.reminder = ScheduleReminderKind.none,
     this.exceptions = const <ScheduleException>[],
@@ -364,6 +365,12 @@ class ScheduleEvent {
 
   /// 系列级单值关联（可空）；不决定日程作用域。
   final String? linkedConversationId;
+
+  /// 稳定关联任务 ID（属于 [linkedConversationId] 指向的会话）；null = 未关联。
+  ///
+  /// 任务改名后仍按 ID 定位；删除或换会话后由编辑器清除。旧数据缺失该字段时
+  /// 解析为 null（向后兼容，不把整个库判为损坏）。
+  final String? linkedTaskId;
 
   final ScheduleRepeatRule repeat;
   final ScheduleReminderKind reminder;
@@ -431,6 +438,7 @@ class ScheduleEvent {
         endDateExclusive: draft.allDay ? draft.endDateExclusive : null,
         blocksScheduling: draft.blocksScheduling,
         linkedConversationId: trimOrNull(draft.linkedConversationId),
+        linkedTaskId: trimOrNull(draft.linkedTaskId),
         repeat: draft.repeat,
         reminder: draft.reminder,
         exceptions: exceptions ?? this.exceptions,
@@ -460,6 +468,7 @@ class ScheduleEvent {
         endDateExclusive: endDateExclusive,
         blocksScheduling: blocksScheduling,
         linkedConversationId: linkedConversationId,
+        linkedTaskId: linkedTaskId,
         repeat: repeat,
         reminder: reminder,
         exceptions: exceptions ?? this.exceptions,
@@ -485,6 +494,7 @@ class ScheduleEvent {
         if (allDay) 'endDateExclusive': endDateExclusive,
         'blocksScheduling': blocksScheduling,
         'linkedConversationId': linkedConversationId,
+        'linkedTaskId': linkedTaskId,
         'repeat': repeat.toJson(),
         'reminder': reminder.wireName,
         'exceptions': exceptions.map((e) => e.toJson()).toList(growable: false),
@@ -564,6 +574,19 @@ class ScheduleEvent {
       }
     }
 
+    // 旧记录没有 linkedTaskId：缺失/空 = 未关联任务，不算损坏。
+    String? linkedTaskId;
+    final linkedTaskRaw = j['linkedTaskId'];
+    if (linkedTaskRaw != null && '$linkedTaskRaw'.trim().isNotEmpty) {
+      linkedTaskId = '$linkedTaskRaw'.trim();
+      if (linkedTaskId.length > 80 ||
+          linkedTaskId.contains(RegExp(r'\s'))) {
+        return null;
+      }
+      // 任务引用必须依附在一个会话上，否则无法按 ID 定位。
+      if (linkedConversationId == null) return null;
+    }
+
     final repeat = ScheduleRepeatRule.tryParse(j['repeat']);
     if (repeat == null) return null;
     final until = repeat.untilDate;
@@ -613,6 +636,7 @@ class ScheduleEvent {
       endDateExclusive: endDateExclusive,
       blocksScheduling: blocksRaw,
       linkedConversationId: linkedConversationId,
+      linkedTaskId: linkedTaskId,
       repeat: repeat,
       reminder: reminder,
       exceptions: List<ScheduleException>.unmodifiable(exceptions),
@@ -638,6 +662,7 @@ class ScheduleDraft {
     this.endDateExclusive,
     this.blocksScheduling = true,
     this.linkedConversationId,
+    this.linkedTaskId,
     this.repeat = const ScheduleRepeatRule.none(),
     this.reminder = ScheduleReminderKind.none,
   });
@@ -654,6 +679,7 @@ class ScheduleDraft {
   final String? endDateExclusive;
   final bool blocksScheduling;
   final String? linkedConversationId;
+  final String? linkedTaskId;
   final ScheduleRepeatRule repeat;
   final ScheduleReminderKind reminder;
 
@@ -699,6 +725,15 @@ class ScheduleDraft {
     }
     if (allDay && reminder.isTimedOnly) return '全天日程不能选择定时提醒';
     if (!allDay && reminder.isAllDayOnly) return '定时日程不能选择全天提醒';
+    final linkedTask = linkedTaskId?.trim();
+    if (linkedTask != null && linkedTask.isNotEmpty) {
+      if ((linkedConversationId ?? '').trim().isEmpty) {
+        return '关联任务前需要先选择关联会话';
+      }
+      if (linkedTask.length > 80 || linkedTask.contains(RegExp(r'\s'))) {
+        return '关联任务标识不合法';
+      }
+    }
     return null;
   }
 
@@ -726,6 +761,7 @@ class ScheduleDraft {
       endDateExclusive: allDay ? endDateExclusive : null,
       blocksScheduling: blocksScheduling,
       linkedConversationId: trimOrNull(linkedConversationId),
+      linkedTaskId: trimOrNull(linkedTaskId),
       repeat: repeat,
       reminder: reminder,
       exceptions: exceptions,
@@ -748,6 +784,7 @@ class ScheduleDraft {
         endDateExclusive: event.endDateExclusive,
         blocksScheduling: event.blocksScheduling,
         linkedConversationId: event.linkedConversationId,
+        linkedTaskId: event.linkedTaskId,
         repeat: event.repeat,
         reminder: event.reminder,
       );
