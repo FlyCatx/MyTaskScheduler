@@ -10,8 +10,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <wchar.h>
 
 #include "ts_bridge.h"
+#include "ts_activation.h"
+#include "ts_pick_filter.h"
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -472,6 +475,316 @@ static void test_cancel(TsBridge *bridge)
 }
 
 /* ------------------------------------------------------------------ */
+/* 0.5.0：文件筛选器定义（纯数据，逐项核对扩展名/显示名）               */
+/* ------------------------------------------------------------------ */
+
+static int wcontains(const wchar_t *hay, const wchar_t *needle)
+{
+    return hay != NULL && needle != NULL && wcsstr(hay, needle) != NULL;
+}
+
+/*
+ * GetOpenFileNameW 的过滤器是“显示名\0扩展名\0…”的**多段**字符串，
+ * wcsstr 只能看到第一段；这里逐段扫描。
+ */
+static int wfilter_contains(const wchar_t *filter, const wchar_t *needle)
+{
+    const wchar_t *p = filter;
+    if (filter == NULL || needle == NULL) return 0;
+    while (*p != L'\0') {
+        if (wcsstr(p, needle) != NULL) return 1;
+        p += wcslen(p) + 1;
+    }
+    return 0;
+}
+
+static int wfilter_double_nul(const wchar_t *filter)
+{
+    const wchar_t *p = filter;
+    if (filter == NULL) return 0;
+    while (*p != L'\0') p += wcslen(p) + 1;
+    return p[1] == L'\0';
+}
+
+static void test_pick_filter_definitions(void)
+{
+    const TsPickFilterSpec *spec;
+
+    printf("\n-- 文件筛选器定义（kind 0/1/2 + 未知 kind）--\n");
+
+    spec = ts_pick_filter_spec(TS_PICK_FILTER_DOCUMENT);
+    check(spec != NULL && spec->kind == 0, "filter：kind 0 存在且规范化");
+    if (spec != NULL) {
+        check(wfilter_contains(spec->filter, L"*.txt") &&
+              wfilter_contains(spec->filter, L"*.md") &&
+              wfilter_contains(spec->filter, L"*.pdf") &&
+              wfilter_contains(spec->filter, L"*.docx") &&
+              wfilter_contains(spec->filter, L"*.pptx"),
+              "filter 0：保留旧文档扩展名（txt/md/pdf/docx/pptx）");
+        check(wfilter_contains(spec->filter, L"*.ics") &&
+              wfilter_contains(spec->filter, L"*.ical"),
+              "filter 0：保留旧日历扩展名（ics/ical）");
+        check(wfilter_contains(spec->filter, L"所有文件"), "filter 0：保留“所有文件”入口");
+        check(spec->default_ext != NULL && wcscmp(spec->default_ext, L"txt") == 0,
+              "filter 0：默认扩展名仍为 txt（旧行为）");
+        /* GetOpenFileNameW 约定：过滤器以双 NUL 结尾。 */
+        check(wfilter_double_nul(spec->filter), "filter 0：双 NUL 结尾");
+    }
+
+    spec = ts_pick_filter_spec(TS_PICK_FILTER_OCR);
+    check(spec != NULL && spec->kind == 1, "filter：kind 1（OCR）存在");
+    if (spec != NULL) {
+        check(wfilter_contains(spec->filter, L"PDF") &&
+              wfilter_contains(spec->filter, L"PNG") &&
+              wfilter_contains(spec->filter, L"JPEG"),
+              "filter 1：显示名明确列出 PDF/PNG/JPEG");
+        check(wfilter_contains(spec->filter, L"*.pdf") &&
+              wfilter_contains(spec->filter, L"*.png") &&
+              wfilter_contains(spec->filter, L"*.jpg") &&
+              wfilter_contains(spec->filter, L"*.jpeg"),
+              "filter 1：扩展名含 pdf/png/jpg/jpeg");
+        check(wfilter_contains(spec->filter, L"所有文件"), "filter 1：保留“所有文件”入口");
+        check(!wfilter_contains(spec->filter, L"*.txt"), "filter 1：不列普通文本扩展名");
+        check(!wfilter_contains(spec->filter, L"*.docx"), "filter 1：不列 Office 扩展名");
+        check(!wfilter_contains(spec->filter, L"*.ics"), "filter 1：不列日历扩展名");
+        check(wfilter_double_nul(spec->filter), "filter 1：双 NUL 结尾");
+    }
+
+    spec = ts_pick_filter_spec(TS_PICK_FILTER_CALENDAR);
+    check(spec != NULL && spec->kind == 2, "filter：kind 2（日历）存在");
+    if (spec != NULL) {
+        check(wfilter_contains(spec->filter, L"*.ics") &&
+              wfilter_contains(spec->filter, L"*.ical"),
+              "filter 2：扩展名含 ics/ical");
+        check(wfilter_contains(spec->filter, L"所有文件"), "filter 2：保留“所有文件”入口");
+        check(!wfilter_contains(spec->filter, L"*.pdf"), "filter 2：不列 PDF");
+        check(spec->default_ext != NULL && wcscmp(spec->default_ext, L"ics") == 0,
+              "filter 2：默认扩展名为 ics");
+    }
+
+    check(ts_pick_filter_spec(-1) == NULL, "filter：负数 kind 被拒绝");
+    check(ts_pick_filter_spec(3) == NULL, "filter：未定义 kind 被拒绝");
+}
+
+/* ------------------------------------------------------------------ */
+/* 0.5.0：通知 XML / URI / 动作队列 / 待处理文件（纯逻辑，无 WinRT）    */
+/* ------------------------------------------------------------------ */
+
+static const char *PAYLOAD_JSON =
+    "{\"taskId\":\"task-1\",\"executionId\":\"exec-2\",\"deadline\":1730000000000}";
+
+static void test_activation_xml_and_uri(void)
+{
+    char *uri;
+    char *json;
+    char *xml;
+    TsActivationQueue *queue;
+
+    printf("\n-- 可操作通知：URI/XML/队列/待处理激活 --\n");
+
+    /* 构造：三个动作都带同一身份 */
+    uri = ts_activation_build_uri("open", PAYLOAD_JSON);
+    check(uri != NULL, "uri：可构造 open");
+    if (uri != NULL) {
+        check(contains(uri, "taskscheduler://open?taskId=task-1"), "uri：open 指向本任务");
+        check(contains(uri, "executionId=exec-2"), "uri：携带执行 ID");
+        check(contains(uri, "deadline=1730000000000"), "uri：携带期限身份");
+        free(uri);
+    }
+    uri = ts_activation_build_uri("extend", PAYLOAD_JSON);
+    check(uri != NULL && contains(uri, "taskscheduler://extend?"), "uri：可构造 extend");
+    free(uri);
+    uri = ts_activation_build_uri("finish", PAYLOAD_JSON);
+    check(uri != NULL && contains(uri, "taskscheduler://finish?"), "uri：可构造 finish");
+    free(uri);
+    check(ts_activation_build_uri("bogus", PAYLOAD_JSON) == NULL, "uri：未知动作被拒绝");
+    check(ts_activation_build_uri("open", "{\"taskId\":\"t\"}") == NULL,
+          "uri：缺执行/期限身份被拒绝");
+    check(ts_activation_build_uri("open", "not json") == NULL, "uri：非法 JSON 被拒绝");
+
+    /* 解析：正文点击 / 两个按钮 */
+    json = ts_activation_parse_uri(
+        "taskscheduler://open?taskId=t9&executionId=e9&deadline=1700000000123");
+    check(json != NULL, "parse：可解析 open");
+    if (json != NULL) {
+        check(contains(json, "\"action\":\"open\""), "parse：action=open");
+        check(contains(json, "\"taskId\":\"t9\""), "parse：taskId 原样回传");
+        check(contains(json, "\"executionId\":\"e9\""), "parse：executionId 原样回传");
+        check(contains(json, "\"deadline\":\"1700000000123\""),
+              "parse：deadline 原样回传（字符串）");
+        free(json);
+    }
+    json = ts_activation_parse_uri(
+        "TASKSCHEDULER://Extend?taskId=t&executionId=e&deadline=1");
+    check(json != NULL && contains(json, "\"action\":\"extend\""),
+          "parse：大小写不敏感且规范化为小写");
+    free(json);
+    check(ts_activation_parse_uri(
+              "taskscheduler://open?taskId=%E4%B8%AD%E6%96%87&executionId=e&deadline=1") != NULL,
+          "parse：percent-encoded 身份可解析");
+    {
+        char *cn = ts_activation_parse_uri(
+            "taskscheduler://finish?taskId=%E4%B8%AD%E6%96%87&executionId=e&deadline=1");
+        check(cn != NULL && contains(cn, "中文"), "parse：percent-decode 为 UTF-8");
+        free(cn);
+    }
+    check(ts_activation_parse_uri("https://open?taskId=t&executionId=e&deadline=1") == NULL,
+          "parse：非本协议被拒绝");
+    check(ts_activation_parse_uri("taskscheduler://bogus?taskId=t&executionId=e&deadline=1") == NULL,
+          "parse：未知动作被拒绝");
+    check(ts_activation_parse_uri("taskscheduler://open?taskId=t&executionId=e") == NULL,
+          "parse：缺 deadline 被拒绝（禁止用猜测目标）");
+    check(ts_activation_parse_uri("taskscheduler://open") == NULL,
+          "parse：无身份参数被拒绝");
+    check(ts_activation_parse_uri("") == NULL, "parse：空串安全返回 NULL");
+    check(ts_activation_parse_uri(NULL) == NULL, "parse：NULL 安全返回 NULL");
+
+    /* Toast XML：正文点击=open，两个按钮=extend/finish，身份带 amp 转义 */
+    xml = ts_activation_build_toast_xml("前端页面开发 · 计划时段已结束", "任务待处理",
+                                        PAYLOAD_JSON, NULL, NULL);
+    check(xml != NULL, "xml：可构造");
+    if (xml != NULL) {
+        check(contains(xml, "<toast activationType=\"protocol\""), "xml：使用 protocol 激活");
+        check(contains(xml, "launch=\"taskscheduler://open?"), "xml：正文点击=open");
+        check(contains(xml, "延长时间"), "xml：按钮 1 为“延长时间”");
+        check(contains(xml, "结束任务"), "xml：按钮 2 为“结束任务”");
+        check(contains(xml, "arguments=\"taskscheduler://extend?"), "xml：按钮 1 路由 extend");
+        check(contains(xml, "arguments=\"taskscheduler://finish?"), "xml：按钮 2 路由 finish");
+        check(contains(xml, "&amp;executionId="), "xml：URI 中的 & 被转义为 &amp;");
+        check(contains(xml, "taskId=task-1"), "xml：身份参数进入两个按钮");
+        free(xml);
+    }
+    {
+        char *escaped = ts_activation_build_toast_xml("<标题&>", "\"正文\"", PAYLOAD_JSON,
+                                                      NULL, NULL);
+        check(escaped != NULL && contains(escaped, "&lt;标题&amp;&gt;"),
+              "xml：标题/正文 XML 转义");
+        free(escaped);
+    }
+    check(ts_activation_build_toast_xml("t", "b", "{\"taskId\":\"x\"}", NULL, NULL) == NULL,
+          "xml：缺身份被拒绝");
+
+    /* 队列：FIFO，取空后返回 NULL */
+    queue = ts_activation_queue_create();
+    check(queue != NULL, "queue：可创建");
+    if (queue != NULL) {
+        check(ts_activation_queue_push_uri(queue,
+              "taskscheduler://open?taskId=a&executionId=e1&deadline=1") == 0,
+              "queue：push_uri 解析并入队");
+        check(ts_activation_queue_push_uri(queue,
+              "taskscheduler://extend?taskId=b&executionId=e2&deadline=2") == 0,
+              "queue：第二条入队");
+        check(ts_activation_queue_push_uri(queue, "https://x") != 0,
+              "queue：非本协议不入队");
+        json = ts_activation_queue_take(queue);
+        check(json != NULL && contains(json, "\"taskId\":\"a\""), "queue：FIFO 第一条");
+        free(json);
+        json = ts_activation_queue_take(queue);
+        check(json != NULL && contains(json, "\"action\":\"extend\""), "queue：FIFO 第二条");
+        free(json);
+        check(ts_activation_queue_take(queue) == NULL, "queue：取空后返回 NULL");
+        ts_activation_queue_destroy(queue);
+    }
+
+    /* 待处理激活文件：应用未运行时第二实例写入，启动后 drain 取走 */
+    {
+        char dir[MAX_PATH];
+        char *pending_path;
+        int queued;
+        join_path(dir, sizeof(dir), "ts_pending_activation_test");
+        CreateDirectoryA(dir, NULL);
+        pending_path = ts_activation_pending_path(dir);
+        check(pending_path != NULL, "pending：可构造路径");
+        if (pending_path != NULL) {
+            check(contains(pending_path, "pending_activation.txt"),
+                  "pending：文件名为 pending_activation.txt");
+            queue = ts_activation_queue_create();
+            check(ts_activation_append_pending(pending_path,
+                  "taskscheduler://open?taskId=p1&executionId=e1&deadline=11") == 0,
+                  "pending：追加第一条");
+            check(ts_activation_append_pending(pending_path,
+                  "taskscheduler://finish?taskId=p2&executionId=e2&deadline=22") == 0,
+                  "pending：追加第二条");
+            queued = ts_activation_drain_pending(queue, pending_path);
+            check(queued == 2, "pending：drain 取走两条");
+            json = ts_activation_queue_take(queue);
+            check(json != NULL && contains(json, "\"taskId\":\"p1\""),
+                  "pending：顺序保持（第一条 open）");
+            free(json);
+            json = ts_activation_queue_take(queue);
+            check(json != NULL && contains(json, "\"action\":\"finish\""),
+                  "pending：第二条为 finish");
+            free(json);
+            check(ts_activation_drain_pending(queue, pending_path) == 0,
+                  "pending：再次 drain 为空（不重复投递）");
+            ts_activation_queue_destroy(queue);
+            DeleteFileA(pending_path);
+            free(pending_path);
+        }
+        RemoveDirectoryA(dir);
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* 0.5.0：ABI 导出失败路径（真实 DLL，不写系统注册表/不弹通知）          */
+/* ------------------------------------------------------------------ */
+
+static void test_notification_abi_failures(TsBridge *bridge)
+{
+    TsBridgeBuffer buf;
+    int rc;
+
+    printf("\n-- 可操作通知 ABI：失败路径与空参保护 --\n");
+
+    memset(&buf, 0, sizeof(buf));
+    rc = ts_bridge_prepare_notifications(NULL, "TaskScheduler.Test", NULL, &buf);
+    check(rc != 0, "prepare：bridge 为 NULL 时返回失败");
+    check(buf.data != NULL && contains(buf.data, "\"ok\":false"),
+          "prepare：失败仍返回 JSON 原因");
+    ts_bridge_free(&buf);
+
+    memset(&buf, 0, sizeof(buf));
+    rc = ts_bridge_prepare_notifications(bridge, NULL, NULL, &buf);
+    check(rc != 0 && buf.data != NULL && contains(buf.data, "AUMID"),
+          "prepare：AUMID 为空被拒绝并说明原因");
+    ts_bridge_free(&buf);
+
+    /* 不存在的 exe：必须在写注册表/快捷方式之前失败（测试不污染系统）。 */
+    memset(&buf, 0, sizeof(buf));
+    rc = ts_bridge_prepare_notifications(bridge, "TaskScheduler.Test",
+                                         "C:\\definitely\\not\\here\\nope.exe", &buf);
+    check(rc != 0 && buf.data != NULL && contains(buf.data, "可执行文件不存在"),
+          "prepare：无效 exe 路径被拒绝");
+    ts_bridge_free(&buf);
+
+    /* 未 prepare 就投递：明确失败而不是崩溃。 */
+    memset(&buf, 0, sizeof(buf));
+    rc = ts_bridge_show_execution_notification(bridge, "标题", "正文", PAYLOAD_JSON, &buf);
+    check(rc == 0, "show：未 prepare 返回 0（失败）");
+    check(buf.data != NULL && contains(buf.data, "notPrepared"),
+          "show：失败原因是 notPrepared");
+    ts_bridge_free(&buf);
+
+    memset(&buf, 0, sizeof(buf));
+    rc = ts_bridge_show_execution_notification(NULL, "标题", "正文", PAYLOAD_JSON, &buf);
+    check(rc == 0 && buf.data != NULL && contains(buf.data, "\"accepted\":false"),
+          "show：bridge 为 NULL 时安全失败");
+    ts_bridge_free(&buf);
+
+    /* 队列为空：take 返回 0 且不写缓冲区。 */
+    memset(&buf, 0, sizeof(buf));
+    rc = ts_bridge_take_execution_action(bridge, &buf);
+    check(rc == 0 && buf.data == NULL && buf.length == 0,
+          "take：空闲时返回 0 且不产生动作");
+    ts_bridge_free(&buf);
+
+    memset(&buf, 0, sizeof(buf));
+    check(ts_bridge_take_execution_action(NULL, &buf) == 0,
+          "take：bridge 为 NULL 时安全返回 0");
+    ts_bridge_free(&buf);
+}
+
+/* ------------------------------------------------------------------ */
 
 int main(void)
 {
@@ -559,7 +872,34 @@ int main(void)
         rc = ts_bridge_pick_file(bridge, "标题", NULL, &errBuf);
         check(rc != 0, "pick_file：输出参数为 NULL 时返回失败");
         ts_bridge_free(&errBuf);
+
+        /* 0.5.0：带 filter_kind 的新导出。未知 kind 必须立即失败（不弹窗）。 */
+        memset(&pathBuf, 0, sizeof(pathBuf));
+        memset(&errBuf, 0, sizeof(errBuf));
+        rc = ts_bridge_pick_file_filtered(bridge, "标题", 99, &pathBuf, &errBuf);
+        check(rc != 0, "pick_file_filtered：未知 filter_kind 返回失败");
+        check(errBuf.data != NULL && contains(errBuf.data, "未知的文件筛选用途"),
+              "pick_file_filtered：未知 kind 给出可读原因");
+        ts_bridge_free(&pathBuf);
+        ts_bridge_free(&errBuf);
+
+        memset(&pathBuf, 0, sizeof(pathBuf));
+        memset(&errBuf, 0, sizeof(errBuf));
+        rc = ts_bridge_pick_file_filtered(NULL, "标题", 1, &pathBuf, &errBuf);
+        check(rc != 0, "pick_file_filtered：bridge 为 NULL 时返回失败");
+        ts_bridge_free(&pathBuf);
+        ts_bridge_free(&errBuf);
+
+        memset(&pathBuf, 0, sizeof(pathBuf));
+        memset(&errBuf, 0, sizeof(errBuf));
+        rc = ts_bridge_pick_file_filtered(bridge, "标题", 1, NULL, &errBuf);
+        check(rc != 0, "pick_file_filtered：输出参数为 NULL 时返回失败");
+        ts_bridge_free(&errBuf);
     }
+
+    test_pick_filter_definitions();
+    test_activation_xml_and_uri();
+    test_notification_abi_failures(bridge);
 
     /* 关闭顺序：先 begin，轮询 ready，再 destroy */
     check(ts_bridge_shutdown_begin(bridge) == 0, "shutdown_begin：接受关闭请求");
@@ -607,4 +947,3 @@ int main(void)
     printf("\n结果：%d 通过，%d 失败\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
 }
-
