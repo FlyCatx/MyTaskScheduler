@@ -10,9 +10,125 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:ffi';
+import 'dart:io';
 
 import '../model/settings.dart';
 import 'bridge_ffi.dart';
+
+/// 0.5.0：系统文件对话框的筛选预设（与原生 `filter_kind` 一一对应）。
+///
+/// * [document] — 通用文档导入（0.4.0 行为：TXT/MD/PDF/DOCX/PPTX + ICS + 所有文件）；
+/// * [ocr]      — OCR 专用：PDF / PNG / JPG / JPEG + 所有文件；
+/// * [calendar] — 日历：ICS / ICAL + 所有文件。
+///
+/// “所有文件”与手输路径仍可能返回其它类型，入口仍必须做大小写不敏感的扩展名
+/// 校验（原生层只保证系统面板的显示名与默认筛选一致）。
+enum PickFilter { document, ocr, calendar }
+
+/// 执行通知使用的 AppUserModelID。
+///
+/// 必须与 `flutter_app/windows/runner/main.cpp` 的
+/// `SetCurrentProcessExplicitAppUserModelID` 以及开始菜单快捷方式的
+/// `System.AppUserModel.ID` 完全一致，否则系统会丢弃 Toast。
+const String kExecutionAppUserModelId = 'TaskScheduler.Desktop';
+
+/// 结果：`prepareExecutionNotifications`。
+///
+/// [ok] 表示原生通道就绪（开始菜单 AUMID 快捷方式 + URL 协议 + WinRT Toast +
+/// 命名管道）。失败时 [errorKind]/[error] 可直接展示并记录；[raw] 保留原生
+/// status JSON 全量字段，便于写入投递账本。
+class ExecutionNotificationsStatus {
+  final bool ok;
+  final String? errorKind;
+  final String? error;
+  final String appUserModelId;
+  final bool shortcutReady;
+  final bool protocolReady;
+  final bool toastSettingEnabled;
+  final String? channel;
+  final Map<String, dynamic> raw;
+
+  const ExecutionNotificationsStatus({
+    required this.ok,
+    required this.appUserModelId,
+    this.errorKind,
+    this.error,
+    this.shortcutReady = false,
+    this.protocolReady = false,
+    this.toastSettingEnabled = false,
+    this.channel,
+    this.raw = const <String, dynamic>{},
+  });
+
+  factory ExecutionNotificationsStatus.unsupported(String appUserModelId,
+          [String message = '当前 ts_bridge.dll 不支持可操作系统通知']) =>
+      ExecutionNotificationsStatus(
+        ok: false,
+        appUserModelId: appUserModelId,
+        errorKind: 'unsupported',
+        error: message,
+        raw: const <String, dynamic>{'errorKind': 'unsupported'},
+      );
+
+  factory ExecutionNotificationsStatus.fromJson(
+      String appUserModelId, Map<String, dynamic> j) {
+    return ExecutionNotificationsStatus(
+      ok: j['ok'] == true,
+      appUserModelId: (j['aumid'] as String?) ?? appUserModelId,
+      errorKind: j['errorKind'] as String?,
+      error: j['error'] as String?,
+      shortcutReady: j['shortcutReady'] == true,
+      protocolReady: j['protocolReady'] == true,
+      toastSettingEnabled: j['toastSettingEnabled'] == true,
+      channel: (j['channel'] as String?)?.isEmpty == true
+          ? null
+          : (j['channel'] as String?),
+      raw: j,
+    );
+  }
+}
+
+/// 结果：`showExecutionNotification`。
+///
+/// [accepted] 是原生“系统接受”的返回值；失败时 [errorKind]/[error] 说明原因
+/// （旧 DLL 为 `unsupported`，策略关闭为 `policy`/`disabled`，未 prepare 为
+/// `notPrepared`）。调用方在 `accepted == false` 时必须走前台等价操作并记录。
+class ExecutionNotificationResult {
+  final bool accepted;
+  final String? errorKind;
+  final String? error;
+  final String? channel;
+  final Map<String, dynamic> raw;
+
+  const ExecutionNotificationResult({
+    required this.accepted,
+    this.errorKind,
+    this.error,
+    this.channel,
+    this.raw = const <String, dynamic>{},
+  });
+
+  factory ExecutionNotificationResult.unsupported(
+          [String message = '当前 ts_bridge.dll 不支持可操作系统通知']) =>
+      ExecutionNotificationResult(
+        accepted: false,
+        errorKind: 'unsupported',
+        error: message,
+        raw: const <String, dynamic>{'errorKind': 'unsupported'},
+      );
+
+  factory ExecutionNotificationResult.fromJson(Map<String, dynamic> j) {
+    return ExecutionNotificationResult(
+      accepted: j['accepted'] == true,
+      errorKind: j['errorKind'] as String?,
+      error: j['error'] as String?,
+      channel: (j['channel'] as String?)?.isEmpty == true
+          ? null
+          : (j['channel'] as String?),
+      raw: j,
+    );
+  }
+}
 
 /// Runtime information reported by the native layer. Never contains secrets.
 class BridgeInfo {
@@ -639,21 +755,110 @@ class NativeGateway implements SettingsBridge {
     }
   }
 
-  /// Opens the system "open file" dialog. Returns null when the user cancels.
+  /// Opens the system "open file" dialog. Returns null/empty when the user cancels.
   ///
   /// Opens the system "open file" dialog, allowing several files at once.
+  ///
+  /// [filter] chooses the native preset (0.5.0): [PickFilter.document] keeps the
+  /// exact 0.4.0 behaviour; [PickFilter.ocr] lists PDF / PNG / JPG / JPEG;
+  /// [PickFilter.calendar] lists ICS / ICAL. An old DLL without
+  /// `ts_bridge_pick_file_filtered` falls back to the legacy dialog (no crash);
+  /// callers must still validate extensions themselves in that case.
   ///
   /// Returns the chosen absolute paths (empty when the user cancelled).
   /// The dialog is modal and runs on the calling thread, so it is invoked only from
   /// a direct user action (never while an analysis is running).
-  Future<List<String>> pickTextFiles(
-      {String title = '添加材料（TXT / MD / PDF / DOCX / PPTX，可多选）'}) async {
+  Future<List<String>> pickTextFiles({
+    String title = '添加材料（TXT / MD / PDF / DOCX / PPTX，可多选）',
+    PickFilter filter = PickFilter.document,
+  }) async {
     _ensureAlive();
-    final result = _bindings.pickFiles(_handle, title: title);
+    final result = _bindings.pickFiles(_handle,
+        title: title, filterKind: _filterKind(filter));
     if (result.error != null) {
       throw NativeCallException('dialog', result.error!);
     }
     return result.paths;
+  }
+
+  static int _filterKind(PickFilter filter) {
+    switch (filter) {
+      case PickFilter.document:
+        return 0;
+      case PickFilter.ocr:
+        return 1;
+      case PickFilter.calendar:
+        return 2;
+    }
+  }
+
+  /// True when the loaded DLL exports `ts_bridge_pick_file_filtered`.
+  bool get supportsPickFileFilters => _bindings.supportsFileFilters;
+
+  /// True when the loaded DLL exports the 0.5.0 execution-notification surface.
+  bool get supportsExecutionNotifications =>
+      _bindings.supportsExecutionNotifications;
+
+  /// Prepares the interactive Windows notification channel (AUMID shortcut,
+  /// `taskscheduler://` protocol, named pipe, WinRT toast capability probe).
+  ///
+  /// Synchronous and idempotent; failures never throw: they are reported through
+  /// [ExecutionNotificationsStatus.ok] / `errorKind` so the caller can record the
+  /// delivery channel and fall back to an in-app equivalent operation.
+  ExecutionNotificationsStatus prepareExecutionNotifications({
+    String appUserModelId = kExecutionAppUserModelId,
+    String? exePath,
+  }) {
+    _ensureAlive();
+    final exe = exePath ?? File(Platform.resolvedExecutable).path;
+    final res = _bindings.prepareExecutionNotifications(_handle, appUserModelId, exe);
+    final json = _tryDecode(res.json) ?? _tryDecode(res.error);
+    if (json == null) {
+      return ExecutionNotificationsStatus(
+        ok: false,
+        appUserModelId: appUserModelId,
+        errorKind: 'decode',
+        error: res.error ?? '原生 prepare 返回了非 JSON 内容',
+      );
+    }
+    return ExecutionNotificationsStatus.fromJson(appUserModelId, json);
+  }
+
+  /// Shows a real actionable Windows toast; returns whether the OS accepted it.
+  ///
+  /// [payload] must contain `taskId`, `executionId` and `deadline` (passed through
+  /// verbatim as the notification identity; no timezone conversion is done here).
+  /// The same identity is echoed back by [takeExecutionActionJson].
+  ExecutionNotificationResult showExecutionNotification({
+    required String title,
+    required String body,
+    required Map<String, dynamic> payload,
+  }) {
+    _ensureAlive();
+    final res = _bindings.showExecutionNotification(
+        _handle, title, body, jsonEncode(payload));
+    final json = _tryDecode(res.json) ?? _tryDecode(res.error);
+    if (json == null) {
+      return ExecutionNotificationResult(
+        accepted: false,
+        errorKind: 'winrt',
+        error: res.error ?? '原生 show 返回了非 JSON 内容',
+      );
+    }
+    return ExecutionNotificationResult.fromJson(json);
+  }
+
+  /// Takes one pending notification action as raw JSON, or null when none.
+  ///
+  /// Shape: `{"action":"open|extend|finish","taskId":…,"executionId":…,"deadline":…}`.
+  /// Old DLLs / empty queue both return null (never throw).
+  String? takeExecutionActionJson() {
+    try {
+      _ensureAlive();
+      return _bindings.takeExecutionAction(_handle);
+    } catch (_) {
+      return null;
+    }
   }
 
   /// Shows a Windows notification (tray balloon). Returns false when the OS refuses

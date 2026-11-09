@@ -84,6 +84,34 @@ typedef _PickFileNative = Int32 Function(
 typedef _PickFileDart = int Function(
     Pointer<Void>, Pointer<Utf8>, Pointer<TsBridgeBuffer>, Pointer<TsBridgeBuffer>);
 
+/// `ts_bridge_pick_file_filtered(bridge, title, kind, out_path, out_error)` (0.5.0).
+///
+/// Optional symbol: old 0.4.0 DLLs only export `ts_bridge_pick_file`, so the
+/// binding is resolved lazily and falls back to the legacy call (capability check,
+/// never a crash).
+typedef _PickFileFilteredNative = Int32 Function(Pointer<Void>, Pointer<Utf8>, Int32,
+    Pointer<TsBridgeBuffer>, Pointer<TsBridgeBuffer>);
+typedef _PickFileFilteredDart = int Function(Pointer<Void>, Pointer<Utf8>, int,
+    Pointer<TsBridgeBuffer>, Pointer<TsBridgeBuffer>);
+
+/// `ts_bridge_prepare_notifications(bridge, aumid, exe_path, out_status)` (0.5.0).
+typedef _PrepareNotificationsNative = Int32 Function(
+    Pointer<Void>, Pointer<Utf8>, Pointer<Utf8>, Pointer<TsBridgeBuffer>);
+typedef _PrepareNotificationsDart = int Function(
+    Pointer<Void>, Pointer<Utf8>, Pointer<Utf8>, Pointer<TsBridgeBuffer>);
+
+/// `ts_bridge_show_execution_notification(bridge, title, body, payload, out_result)`.
+typedef _ShowExecutionNotificationNative = Int32 Function(Pointer<Void>,
+    Pointer<Utf8>, Pointer<Utf8>, Pointer<Utf8>, Pointer<TsBridgeBuffer>);
+typedef _ShowExecutionNotificationDart = int Function(Pointer<Void>,
+    Pointer<Utf8>, Pointer<Utf8>, Pointer<Utf8>, Pointer<TsBridgeBuffer>);
+
+/// `ts_bridge_take_execution_action(bridge, out_action)`.
+typedef _TakeExecutionActionNative = Int32 Function(
+    Pointer<Void>, Pointer<TsBridgeBuffer>);
+typedef _TakeExecutionActionDart = int Function(
+    Pointer<Void>, Pointer<TsBridgeBuffer>);
+
 typedef _ShutdownReadyNative = Int32 Function(Pointer<Void>);
 typedef _ShutdownReadyDart = int Function(Pointer<Void>);
 
@@ -170,6 +198,16 @@ class BridgeBindings {
       library.lookupFunction<_DestroyNative, _DestroyDart>('ts_bridge_destroy');
   late final _PickFileDart _pickFile = library
       .lookupFunction<_PickFileNative, _PickFileDart>('ts_bridge_pick_file');
+  // ---- 0.5.0 optional surface. An old DLL simply lacks the symbol; callers get
+  //      a documented fallback instead of a `lookupFunction` exception/crash.
+  _PickFileFilteredDart? _pickFileFiltered;
+  bool _pickFileFilteredResolved = false;
+  _PrepareNotificationsDart? _prepareNotifications;
+  bool _prepareNotificationsResolved = false;
+  _ShowExecutionNotificationDart? _showExecutionNotification;
+  bool _showExecutionNotificationResolved = false;
+  _TakeExecutionActionDart? _takeExecutionAction;
+  bool _takeExecutionActionResolved = false;
   late final _NotifyDart _notify = library
       .lookupFunction<_NotifyNative, _NotifyDart>(
           'ts_bridge_show_notification');
@@ -270,6 +308,71 @@ class BridgeBindings {
     } on BridgeUnavailableException {
       return false;
     }
+  }
+
+  /// True when the DLL exports `ts_bridge_pick_file_filtered` (0.5.0 filters).
+  bool get supportsFileFilters => _resolvePickFileFiltered() != null;
+
+  /// True when the DLL exports the 0.5.0 interactive-notification surface.
+  bool get supportsExecutionNotifications =>
+      _resolvePrepareNotifications() != null &&
+      _resolveShowExecutionNotification() != null &&
+      _resolveTakeExecutionAction() != null;
+
+  _PickFileFilteredDart? _resolvePickFileFiltered() {
+    if (!_pickFileFilteredResolved) {
+      _pickFileFilteredResolved = true;
+      try {
+        _pickFileFiltered = library.lookupFunction<_PickFileFilteredNative,
+            _PickFileFilteredDart>('ts_bridge_pick_file_filtered');
+      } catch (_) {
+        _pickFileFiltered = null;
+      }
+    }
+    return _pickFileFiltered;
+  }
+
+  _PrepareNotificationsDart? _resolvePrepareNotifications() {
+    if (!_prepareNotificationsResolved) {
+      _prepareNotificationsResolved = true;
+      try {
+        _prepareNotifications = library.lookupFunction<
+            _PrepareNotificationsNative,
+            _PrepareNotificationsDart>('ts_bridge_prepare_notifications');
+      } catch (_) {
+        _prepareNotifications = null;
+      }
+    }
+    return _prepareNotifications;
+  }
+
+  _ShowExecutionNotificationDart? _resolveShowExecutionNotification() {
+    if (!_showExecutionNotificationResolved) {
+      _showExecutionNotificationResolved = true;
+      try {
+        _showExecutionNotification = library.lookupFunction<
+            _ShowExecutionNotificationNative,
+            _ShowExecutionNotificationDart>(
+                'ts_bridge_show_execution_notification');
+      } catch (_) {
+        _showExecutionNotification = null;
+      }
+    }
+    return _showExecutionNotification;
+  }
+
+  _TakeExecutionActionDart? _resolveTakeExecutionAction() {
+    if (!_takeExecutionActionResolved) {
+      _takeExecutionActionResolved = true;
+      try {
+        _takeExecutionAction = library.lookupFunction<
+            _TakeExecutionActionNative,
+            _TakeExecutionActionDart>('ts_bridge_take_execution_action');
+      } catch (_) {
+        _takeExecutionAction = null;
+      }
+    }
+    return _takeExecutionAction;
   }
 
   static BridgeBindings open({List<String>? extraDirectories}) {
@@ -555,13 +658,22 @@ class BridgeBindings {
   bool takeNotificationClick(Pointer<Void> bridge) =>
       _notifyClicked(bridge) == 1;
 
+  /// Opens the system "open file" dialog with the requested filter preset.
+  ///
+  /// [filterKind] mirrors the native `filter_kind`: 0 = document (legacy
+  /// behaviour), 1 = OCR (PDF/PNG/JPG/JPEG), 2 = calendar (ICS/ICAL). 0.4.0 DLLs
+  /// without `ts_bridge_pick_file_filtered` fall back to the legacy dialog; the
+  /// Dart entry point must still validate extensions in that case.
   ({List<String> paths, String? error}) pickFiles(Pointer<Void> bridge,
-      {String? title}) {
+      {String? title, int filterKind = 0}) {
     final titlePtr = (title ?? '').toNativeUtf8();
     final outPath = calloc<TsBridgeBuffer>();
     final outErr = calloc<TsBridgeBuffer>();
     try {
-      final rc = _pickFile(bridge, titlePtr, outPath, outErr);
+      final filtered = _resolvePickFileFiltered();
+      final rc = filtered != null
+          ? filtered(bridge, titlePtr, filterKind, outPath, outErr)
+          : _pickFile(bridge, titlePtr, outPath, outErr);
       if (rc != 0) {
         return (
           paths: const <String>[],
@@ -587,6 +699,71 @@ class BridgeBindings {
     }
   }
 
+  /// `ts_bridge_prepare_notifications` — returns the native status JSON.
+  ///
+  /// When the symbol is missing (0.4.0 DLL) returns a structured `unsupported`
+  /// failure instead of throwing.
+  RawCallResult prepareExecutionNotifications(
+      Pointer<Void> bridge, String appUserModelId, String exePath) {
+    final prepare = _resolvePrepareNotifications();
+    if (prepare == null) {
+      return const RawCallResult.failure(
+          '{"ok":false,"errorKind":"unsupported","error":"当前 ts_bridge.dll 不支持可操作系统通知（0.5.0 能力缺失）"}');
+    }
+    final aumidPtr = appUserModelId.toNativeUtf8();
+    final exePtr = exePath.toNativeUtf8();
+    final buf = calloc<TsBridgeBuffer>();
+    try {
+      return _consume(prepare(bridge, aumidPtr, exePtr, buf), buf);
+    } finally {
+      calloc.free(aumidPtr);
+      calloc.free(exePtr);
+      calloc.free(buf);
+    }
+  }
+
+  /// `ts_bridge_show_execution_notification` — true when the OS accepted the toast.
+  ///
+  /// The native result JSON (success or failure reason) is always returned in
+  /// [RawCallResult.json] / [RawCallResult.error]; `ok` mirrors "accepted".
+  RawCallResult showExecutionNotification(
+      Pointer<Void> bridge, String title, String body, String payloadJson) {
+    final show = _resolveShowExecutionNotification();
+    if (show == null) {
+      return const RawCallResult.failure(
+          '{"ok":false,"accepted":false,"errorKind":"unsupported","error":"当前 ts_bridge.dll 不支持可操作系统通知（0.5.0 能力缺失）"}');
+    }
+    final titlePtr = title.toNativeUtf8();
+    final bodyPtr = body.toNativeUtf8();
+    final payloadPtr = payloadJson.toNativeUtf8();
+    final buf = calloc<TsBridgeBuffer>();
+    try {
+      final rc = show(bridge, titlePtr, bodyPtr, payloadPtr, buf);
+      final result = _consume(rc == 1 ? 0 : 1, buf);
+      // rc==1 → success; rc==0 → failure whose payload is still the result JSON.
+      return result;
+    } finally {
+      calloc.free(titlePtr);
+      calloc.free(bodyPtr);
+      calloc.free(payloadPtr);
+      calloc.free(buf);
+    }
+  }
+
+  /// `ts_bridge_take_execution_action` — action JSON or null when nothing pending.
+  String? takeExecutionAction(Pointer<Void> bridge) {
+    final take = _resolveTakeExecutionAction();
+    if (take == null) return null;
+    final buf = calloc<TsBridgeBuffer>();
+    try {
+      final rc = take(bridge, buf);
+      if (rc != 1) return null;
+      return _tryRead(buf);
+    } finally {
+      calloc.free(buf);
+    }
+  }
+
   /// Reads a buffer without failing when it is empty, then frees it.
   String? _tryRead(Pointer<TsBridgeBuffer> buf) {
     try {
@@ -608,4 +785,3 @@ class BridgeUnavailableException implements Exception {
   @override
   String toString() => 'BridgeUnavailableException: $message';
 }
-
