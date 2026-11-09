@@ -14,7 +14,9 @@ import 'package:flutter/material.dart';
 import '../../state/execution/effort_review_service.dart';
 import '../../state/execution/effort_stats.dart';
 import '../theme.dart';
+import '../widgets/bezier_menu.dart';
 import '../widgets/bezier_ui.dart';
+import '../widgets/date_range_picker.dart';
 
 class EffortReviewDialog extends StatefulWidget {
   const EffortReviewDialog({
@@ -26,6 +28,7 @@ class EffortReviewDialog extends StatefulWidget {
     this.onExport,
     this.initialConversationId,
     this.initialTaskId,
+    this.autoCompletedTaskIds = const <String>{},
   });
 
   final EffortReviewService service;
@@ -43,6 +46,11 @@ class EffortReviewDialog extends StatefulWidget {
   final String? initialConversationId;
   final String? initialTaskId;
 
+  /// “到期自动完成”的任务 id（0.5.0 任务 13 的执行结果来源；由接线方注入）。
+  /// 只影响展示：命中时在任务折叠行显示“到期自动完成”徽标；默认空集合保持
+  /// 旧调用方/旧数据完全不变。
+  final Set<String> autoCompletedTaskIds;
+
   static Future<void> show(
     BuildContext context, {
     required EffortReviewService service,
@@ -53,6 +61,7 @@ class EffortReviewDialog extends StatefulWidget {
         onExport,
     String? initialConversationId,
     String? initialTaskId,
+    Set<String>? autoCompletedTaskIds,
   }) {
     return showDialog<void>(
       context: context,
@@ -64,6 +73,8 @@ class EffortReviewDialog extends StatefulWidget {
         onExport: onExport,
         initialConversationId: initialConversationId,
         initialTaskId: initialTaskId,
+        autoCompletedTaskIds:
+            autoCompletedTaskIds ?? const <String>{},
       ),
     );
   }
@@ -73,11 +84,30 @@ class EffortReviewDialog extends StatefulWidget {
 }
 
 class _EffortReviewDialogState extends State<EffortReviewDialog> {
+  /// 自定义范围逆序时的就地错误（保留草稿，只阻止刷新）。
+  static const String _reversedRangeMessage = '结束日期须等于或晚于开始日期';
+
+  /// 未知实际耗时的展示值（未知 ≠ 0，但不把“未知”堆到每个数字上）。
+  static const String _unknownActualLabel = '—';
+
+  /// 从未产生执行事实时的展示文案。
+  static const String _noRecordLabel = '暂无执行记录';
+
   late EffortReviewPreset _preset;
   String? _conversationId;
   String? _taskId;
-  late final TextEditingController _fromCtrl;
-  late final TextEditingController _toCtrl;
+
+  /// 本地“今天”（注入 service 的时区/时钟，测试可复现）。
+  late final DateTime _today;
+
+  /// 已应用到报告的日期范围；标题/报告/CSV 只读它。
+  late DateTime _appliedFrom;
+  late DateTime _appliedTo;
+
+  /// 「自定义」字段的草稿；只有点「应用」才写入已应用值。
+  late DateTime _draftFrom;
+  late DateTime _draftTo;
+
   final ScrollController _dailyScroll = ScrollController();
   EffortReviewReport? _report;
   String? _rangeError;
@@ -103,23 +133,24 @@ class _EffortReviewDialogState extends State<EffortReviewDialog> {
     _preset = widget.initialPreset;
     _conversationId = widget.initialConversationId;
     _taskId = widget.initialTaskId;
-    final today = EffortReviewService.todayLocalDate(
+    _today = EffortReviewService.todayLocalDate(
       widget.service.nowUtc,
       widget.service.localTime,
     );
-    _fromCtrl = TextEditingController(text: formatLocalDate(today));
-    _toCtrl = TextEditingController(text: formatLocalDate(today));
+    _appliedFrom = _today;
+    _appliedTo = _today;
+    _draftFrom = _today;
+    _draftTo = _today;
     _recompute();
   }
 
   @override
   void dispose() {
-    _fromCtrl.dispose();
-    _toCtrl.dispose();
     _dailyScroll.dispose();
     super.dispose();
   }
 
+  /// 用“已应用范围”生成报告。草稿只影响字段显示，不进入这里。
   void _recompute() {
     final tasks = widget.tasks;
     final conversations = widget.conversations;
@@ -140,18 +171,11 @@ class _EffortReviewDialogState extends State<EffortReviewDialog> {
             taskId: _taskId,
           );
         case EffortReviewPreset.custom:
-          final from = parseLocalDate(_fromCtrl.text);
-          final to = parseLocalDate(_toCtrl.text);
-          if (from == null || to == null) {
-            _report = null;
-            _rangeError = '日期格式应为 YYYY-MM-DD';
-            return;
-          }
           _report = widget.service.custom(
             tasks: tasks,
             conversations: conversations,
-            fromLocalDate: from,
-            toLocalDate: to,
+            fromLocalDate: _appliedFrom,
+            toLocalDate: _appliedTo,
             conversationId: _conversationId,
             taskId: _taskId,
           );
@@ -161,6 +185,52 @@ class _EffortReviewDialogState extends State<EffortReviewDialog> {
       _report = null;
       _rangeError = '生成执行回顾失败：$e';
     }
+  }
+
+  /// 切换「今日/本周/自定义」。切到自定义只重置草稿、不刷新报告——应用前的
+  /// 标题/报告/CSV 必须继续显示上一次已生效的范围。
+  void _changePreset(int index) {
+    final next = EffortReviewPreset.values[index];
+    setState(() {
+      _preset = next;
+      _rangeError = null;
+      if (next == EffortReviewPreset.custom) {
+        _draftFrom = _appliedFrom;
+        _draftTo = _appliedTo;
+        return;
+      }
+      _recompute();
+    });
+  }
+
+  void _onDraftFromChanged(DateTime date) {
+    setState(() {
+      _draftFrom = date;
+      _rangeError =
+          _draftTo.isBefore(_draftFrom) ? _reversedRangeMessage : null;
+    });
+  }
+
+  void _onDraftToChanged(DateTime date) {
+    setState(() {
+      _draftTo = date;
+      _rangeError =
+          _draftTo.isBefore(_draftFrom) ? _reversedRangeMessage : null;
+    });
+  }
+
+  /// 只有合法草稿才能应用：逆序时保留输入并就地报错，阻止刷新。
+  void _applyDraft() {
+    if (_draftTo.isBefore(_draftFrom)) {
+      setState(() => _rangeError = _reversedRangeMessage);
+      return;
+    }
+    setState(() {
+      _appliedFrom = _draftFrom;
+      _appliedTo = _draftTo;
+      _rangeError = null;
+      _recompute();
+    });
   }
 
   @override
@@ -222,12 +292,11 @@ class _EffortReviewDialogState extends State<EffortReviewDialog> {
           overflow: TextOverflow.ellipsis,
           style: rangeStyle,
         );
-    final closeButton = IconButton(
+    final closeButton = TsCloseButton(
       key: const Key('effort-review-close-icon'),
       tooltip: '关闭',
-      style: TsButtons.closeIcon(size: 28),
+      size: 28,
       onPressed: () => Navigator.of(context).pop(),
-      icon: const Icon(Icons.close, size: 16),
     );
     return Padding(
       padding: const EdgeInsets.fromLTRB(
@@ -342,7 +411,7 @@ class _EffortReviewDialogState extends State<EffortReviewDialog> {
                   _contentPaddingH, 24),
               child: Center(
                 child: Text(
-                  '这个范围内没有执行记录（未知 ≠ 0）',
+                  _noRecordLabel,
                   key: const Key('effort-review-empty'),
                   style: TextStyle(fontSize: 12, color: TsColors.textSecondary),
                 ),
@@ -364,46 +433,40 @@ class _EffortReviewDialogState extends State<EffortReviewDialog> {
   }
 
   /// 底部动作固定：导出回执（有的话）与 导出 CSV / 关闭 永远不随正文滚动。
+  /// 使用统一的 [TsDialogActions]：导出是左端轻量动作，关闭是右端次要按钮。
   Widget _footer(EffortReviewReport? report) {
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(
-          _contentPaddingH, 8, _contentPaddingH, 10),
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
-          if (_exportMessage != null)
-            Padding(
-              padding: const EdgeInsets.only(bottom: 4),
-              child: Text(
-                _exportMessage!,
-                key: const Key('effort-review-export-message'),
-                style: TextStyle(fontSize: 11, color: TsColors.textSecondary),
-              ),
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        if (_exportMessage != null)
+          Padding(
+            padding: const EdgeInsets.fromLTRB(_contentPaddingH, 8, _contentPaddingH, 0),
+            child: Text(
+              _exportMessage!,
+              key: const Key('effort-review-export-message'),
+              style: TextStyle(fontSize: 11, color: TsColors.textSecondary),
             ),
-          Row(
-            mainAxisAlignment: MainAxisAlignment.end,
-            children: [
-              if (widget.onExport != null) ...[
-                TextButton.icon(
-                  key: const Key('effort-review-export'),
-                  style: TsButtons.inline(),
-                  onPressed: report == null ? null : _export,
-                  icon: const Icon(Icons.download_outlined, size: 14),
-                  label: const Text('导出 CSV'),
-                ),
-                const SizedBox(width: 8),
-              ],
-              TextButton(
-                key: const Key('effort-review-close'),
-                style: TsButtons.outline(),
-                onPressed: () => Navigator.of(context).pop(),
-                child: const Text('关闭'),
-              ),
-            ],
           ),
-        ],
-      ),
+        TsDialogActions(
+          actions: [
+            if (widget.onExport != null)
+              TsDialogAction(
+                key: const Key('effort-review-export'),
+                label: '导出 CSV',
+                icon: Icons.download_outlined,
+                role: TsDialogActionRole.leading,
+                onPressed: report == null ? null : _export,
+              ),
+            TsDialogAction(
+              key: const Key('effort-review-close'),
+              label: '关闭',
+              role: TsDialogActionRole.secondary,
+              onPressed: () => Navigator.of(context).pop(),
+            ),
+          ],
+        ),
+      ],
     );
   }
 
@@ -439,44 +502,35 @@ class _EffortReviewDialogState extends State<EffortReviewDialog> {
                   BezierSegmentItem('自定义'),
                 ],
                 selected: _preset.index,
-                onChanged: (index) {
-                  setState(() {
-                    _preset = EffortReviewPreset.values[index];
-                    _recompute();
-                  });
-                },
+                onChanged: _changePreset,
               ),
               if (_preset == EffortReviewPreset.custom) ...[
                 SizedBox(
-                  width: 126,
-                  child: TextField(
+                  width: 162,
+                  child: DatePickerField(
                     key: const Key('effort-review-from'),
-                    controller: _fromCtrl,
-                    decoration: const InputDecoration(
-                      labelText: '开始日期',
-                      hintText: 'YYYY-MM-DD',
-                      isDense: true,
-                    ),
-                    style: const TextStyle(fontSize: 12),
+                    value: _draftFrom,
+                    label: '开始日期',
+                    today: _today,
+                    onChanged: _onDraftFromChanged,
                   ),
                 ),
                 SizedBox(
-                  width: 126,
-                  child: TextField(
+                  width: 162,
+                  child: DatePickerField(
                     key: const Key('effort-review-to'),
-                    controller: _toCtrl,
-                    decoration: const InputDecoration(
-                      labelText: '结束日期',
-                      hintText: 'YYYY-MM-DD',
-                      isDense: true,
-                    ),
-                    style: const TextStyle(fontSize: 12),
+                    value: _draftTo,
+                    label: '结束日期',
+                    today: _today,
+                    onChanged: _onDraftToChanged,
                   ),
                 ),
                 TextButton(
                   key: const Key('effort-review-apply'),
                   style: TsButtons.inline(),
-                  onPressed: () => setState(_recompute),
+                  // 逆序草稿直接禁用「应用」：保留输入、就地报错，阻止刷新。
+                  onPressed:
+                      _draftTo.isBefore(_draftFrom) ? null : _applyDraft,
                   child: const Text('应用'),
                 ),
               ],
@@ -528,8 +582,9 @@ class _EffortReviewDialogState extends State<EffortReviewDialog> {
     });
   }
 
-  /// 一个有界宽度的下拉：按钮里显示省略后的选中项，展开后的选项最多两行、
-  /// 可读到完整名称；箭头与整块按钮都可点击（下拉热区）。
+  /// 有界宽度的统一菜单选择器（0.5.0 任务 02）：按钮里显示省略后的选中项，
+  /// 展开后限高滚动、当前项勾选、长名称悬停可读，Esc/键盘/Tab 可用。
+  /// 可空值（“全部会话 / 全部任务”）通过 [BezierMenuSelect] 正确上报 null。
   Widget _dropdown<T>({
     required Key key,
     required String label,
@@ -539,28 +594,9 @@ class _EffortReviewDialogState extends State<EffortReviewDialog> {
     required ValueChanged<T?> onChanged,
   }) {
     final exists = options.any((option) => option.$1 == value);
-    final textStyle = TextStyle(
-      fontFamily: kUiFontFamily,
-      fontFamilyFallback: kUiFontFallback,
-      fontSize: 11.5,
-      color: TsColors.textPrimary,
-    );
-    Widget optionText(String text, {int maxLines = 1}) => Text(
-          text,
-          maxLines: maxLines,
-          overflow: TextOverflow.ellipsis,
-          style: textStyle,
-        );
-    final items = <DropdownMenuItem<T>>[
-      for (final option in options)
-        DropdownMenuItem<T>(
-          value: option.$1,
-          child: ConstrainedBox(
-            constraints: const BoxConstraints(minWidth: 160, maxWidth: 320),
-            child: optionText(option.$2, maxLines: 2),
-          ),
-        ),
-    ];
+    final current = exists
+        ? options.firstWhere((option) => option.$1 == value).$2
+        : (options.isEmpty ? '—' : options.first.$2);
     return Row(
       mainAxisSize: MainAxisSize.min,
       children: [
@@ -568,25 +604,20 @@ class _EffortReviewDialogState extends State<EffortReviewDialog> {
             style: TextStyle(fontSize: 11.5, color: TsColors.textSecondary)),
         SizedBox(
           width: width,
-          child: DropdownButton<T>(
+          child: BezierMenuSelect<T>(
             key: key,
-            value: exists ? value : null,
-            isDense: true,
-            // 有界宽度内省略选中项；点击箭头仍然命中整个按钮热区。
-            isExpanded: true,
-            underline: const SizedBox.shrink(),
-            // 显式带应用字体：DropdownButton 的 style 会替换默认文本样式，
-            // 不写字族时在测试/无系统回退的环境里会退化成方框。
-            style: textStyle,
-            items: items,
-            selectedItemBuilder: (context) => <Widget>[
+            label: current,
+            width: width,
+            menuWidth: 320,
+            items: <BezierMenuItem<T>>[
               for (final option in options)
-                Align(
-                  alignment: AlignmentDirectional.centerStart,
-                  child: optionText(option.$2),
+                BezierMenuItem<T>(
+                  value: option.$1,
+                  label: option.$2,
+                  selected: option.$1 == value,
                 ),
             ],
-            onChanged: onChanged,
+            onSelected: (selected) => onChanged(selected),
           ),
         ),
       ],
@@ -728,6 +759,28 @@ class _EffortReviewDialogState extends State<EffortReviewDialog> {
   Widget _taskTile(
       BuildContext context, EffortReviewReport report, TaskEffort task) {
     final records = report.recordsFor(task.taskId);
+    // 四种状态按数据区分，不用一句“未知 ≠ 0”概括：
+    //   * 从未记录：factsKnown == false → “暂无执行记录 / 实际 —”；
+    //   * 范围外有记录：实际已知、范围投入 0 分钟；
+    //   * 已确认零投入：实际 0 分钟（仍显示真实的 0）；
+    //   * 待校正：标题旁保留醒目标记，展开区仍列待校正时长。
+    final rangeLabel = task.factsKnown
+        ? '范围投入 ${formatEffortDuration(task.rangeConfirmed)}'
+        : _noRecordLabel;
+    final plannedDeviation =
+        task.plannedStartUtc == null && task.plannedEndUtc == null
+            ? ''
+            : '｜计划偏差 开始 ${formatEffortHours(task.startDeviationHours)}'
+                ' / 结束 ${formatEffortHours(task.endDeviationHours)}';
+    final pendingLabel = task.totalPending > Duration.zero
+        ? '｜待校正 ${formatEffortDuration(task.totalPending)}'
+        : '';
+    final subtitleText = '$rangeLabel｜实际 ${_formatActualHours(task.actualHours)}｜'
+        '基线 ${formatEffortHours(task.baselineHours)}｜'
+        '偏差 ${formatEffortHours(task.deviationHours)}'
+        '${task.deviationPercent == null ? '' : '（${formatEffortPercent(task.deviationPercent)}）'}｜'
+        '建议剩余 ${formatEffortHours(task.suggestedRemainingHours)}'
+        '$plannedDeviation$pendingLabel';
     return ExpansionTile(
           key: Key('effort-review-task-${task.taskId}'),
           tilePadding: const EdgeInsets.symmetric(horizontal: 4),
@@ -748,6 +801,19 @@ class _EffortReviewDialogState extends State<EffortReviewDialog> {
                 const SizedBox(width: 6),
                 _tag('未归属', TsColors.pending),
               ],
+              if (task.openCorrectionCount > 0) ...[
+                const SizedBox(width: 6),
+                _tag('待校正', TsColors.pending),
+              ],
+              if (widget.autoCompletedTaskIds.contains(task.taskId)) ...[
+                const SizedBox(width: 6),
+                _tag(
+                  '到期自动完成',
+                  TsColors.waiting,
+                  key: Key(
+                      'effort-review-auto-completed-${task.taskId}'),
+                ),
+              ],
               if (task.isDone) ...[
                 const SizedBox(width: 6),
                 _tag('已完成', TsColors.done),
@@ -755,22 +821,17 @@ class _EffortReviewDialogState extends State<EffortReviewDialog> {
             ],
           ),
           subtitle: Text(
-            '范围投入 ${formatEffortDuration(task.rangeConfirmed)}｜'
-            '实际 ${task.actualHours == null ? kEffortUnknownLabel : formatEffortHours(task.actualHours)}｜'
-            '基线 ${formatEffortHours(task.baselineHours)}｜'
-            '偏差 ${formatEffortHours(task.deviationHours)}'
-            '${task.deviationPercent == null ? '' : '（${formatEffortPercent(task.deviationPercent)}）'}｜'
-            '建议剩余 ${formatEffortHours(task.suggestedRemainingHours)}'
-            '${task.plannedStartUtc == null && task.plannedEndUtc == null ? '' : '｜计划偏差 开始 ${formatEffortHours(task.startDeviationHours)} / 结束 ${formatEffortHours(task.endDeviationHours)}'}',
+            subtitleText,
             style: TextStyle(fontSize: 10.5, color: TsColors.textSecondary),
           ),
           children: <Widget>[
             if (records.isEmpty)
               Padding(
+                key: Key('effort-review-no-record-${task.taskId}'),
                 padding: const EdgeInsets.only(top: 2, bottom: 4),
                 child: Text(
-                  '没有执行记录：实际耗时未知（不是 0 分钟）',
-                  style: TextStyle(fontSize: 11, color: TsColors.pending),
+                  _noRecordLabel,
+                  style: TextStyle(fontSize: 11, color: TsColors.textSecondary),
                 ),
               ),
             for (final effort in records)
@@ -805,6 +866,16 @@ class _EffortReviewDialogState extends State<EffortReviewDialog> {
         );
   }
 
+  /// 实际耗时的展示映射（只改界面，不改聚合/CSV 的“未知”空值语义）：
+  ///   * 从未产生执行事实 → `—`（未知 ≠ 0）；
+  ///   * 已确认投入为 0 → `0 分钟`（真实的零值保留）；
+  ///   * 其余按现有小时文案。
+  String _formatActualHours(double? hours) {
+    if (hours == null) return _unknownActualLabel;
+    if (hours == 0) return formatEffortDuration(Duration.zero);
+    return formatEffortHours(hours);
+  }
+
   String _rangeText(RecordEffort effort) {
     final localTime = widget.service.localTime;
     final start = effort.firstConfirmedStartUtc;
@@ -820,8 +891,9 @@ class _EffortReviewDialogState extends State<EffortReviewDialog> {
     return '${format(start)} ~ ${format(end)}';
   }
 
-  Widget _tag(String text, Color color) {
+  Widget _tag(String text, Color color, {Key? key}) {
     return Container(
+      key: key,
       padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
       decoration: BoxDecoration(
         color: color.withValues(alpha: 0.14),
