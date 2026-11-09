@@ -15,7 +15,8 @@ void main() {
     test('fromWire maps known codes and defaults to protocolError', () {
       expect(OcrErrorCodeInfo.fromWire('encrypted'), OcrErrorCode.encrypted);
       expect(OcrErrorCodeInfo.fromWire('TOO_LARGE'), OcrErrorCode.tooLarge);
-      expect(OcrErrorCodeInfo.fromWire('something_new'), OcrErrorCode.protocolError);
+      expect(OcrErrorCodeInfo.fromWire('something_new'),
+          OcrErrorCode.protocolError);
       expect(OcrErrorCodeInfo.fromWire(''), OcrErrorCode.protocolError);
     });
 
@@ -49,6 +50,48 @@ void main() {
     });
   });
 
+  group('OcrFileSupport', () {
+    test('accepts exactly PDF/PNG/JPG/JPEG, case-insensitively', () {
+      for (final path in <String>[
+        r'C:\docs\scan.pdf',
+        r'C:\docs\SCAN.PDF',
+        r'C:\docs\page.png',
+        r'C:\docs\PAGE.PNG',
+        r'C:\docs\photo.jpg',
+        r'C:\docs\PHOTO.JPG',
+        r'C:\docs\photo.jpeg',
+        r'C:\docs\PHOTO.JPEG',
+        r'C:\docs\scan.Pdf',
+      ]) {
+        expect(OcrFileSupport.acceptsPath(path), isTrue, reason: path);
+      }
+    });
+
+    test('rejects TXT/DOCX/ICS and missing extensions', () {
+      for (final path in <String>[
+        r'C:\docs\notes.txt',
+        r'C:\docs\report.docx',
+        r'C:\docs\calendar.ics',
+        r'C:\docs\no-extension',
+        r'C:\docs\scan.pdf.exe',
+        '',
+      ]) {
+        expect(OcrFileSupport.acceptsPath(path), isFalse, reason: path);
+      }
+    });
+
+    test('help copy, filter names and validation share one format range', () {
+      expect(OcrFileSupport.extensions, <String>['pdf', 'png', 'jpg', 'jpeg']);
+      expect(OcrFileSupport.helpBody, '支持 PDF、PNG、JPEG。PDF 中已有文字的页面直接提取。');
+      expect(OcrFileSupport.formatNames, isNotEmpty);
+      expect(OcrFileSupport.slashNames, contains('PDF'));
+      // 入口提示覆盖同一批格式（JPG 与 JPEG 都写出来）。
+      for (final label in <String>['PDF', 'PNG', 'JPG', 'JPEG']) {
+        expect(OcrFileSupport.unsupportedMessage, contains(label));
+      }
+    });
+  });
+
   group('OcrAvailability', () {
     const availability = OcrAvailability(
       available: true,
@@ -69,8 +112,10 @@ void main() {
     });
 
     test('preferredTags puts the requested language first', () {
-      expect(availability.preferredTags('zh-Hans-CN'), <String>['zh-Hans-CN', 'en-US']);
-      expect(availability.preferredTags('de-DE'), <String>['en-US', 'zh-Hans-CN']);
+      expect(availability.preferredTags('zh-Hans-CN'),
+          <String>['zh-Hans-CN', 'en-US']);
+      expect(
+          availability.preferredTags('de-DE'), <String>['en-US', 'zh-Hans-CN']);
       expect(availability.preferredTags(), <String>['en-US', 'zh-Hans-CN']);
     });
 
@@ -79,6 +124,17 @@ void main() {
       expect(unavailable.available, isFalse);
       expect(unavailable.problem, '找不到组件');
       expect(unavailable.languages, isEmpty);
+      expect(unavailable.languagePackMissing, isFalse);
+    });
+
+    test('languagePackMissing distinguishes a missing language pack', () {
+      final missing = OcrAvailability.unavailable(
+        '本机没有安装任何 OCR 识别语言组件。',
+        languagePackMissing: true,
+      );
+      expect(missing.languagePackMissing, isTrue);
+      expect(kOcrLanguageInstallPath, contains('时间和语言'));
+      expect(kOcrLanguageInstallPath, contains('光学字符识别'));
     });
   });
 
@@ -143,7 +199,8 @@ void main() {
         isNull,
       );
       expect(
-        const OcrProgress(phase: OcrPhase.recognizing, totalPages: 2, completed: 5)
+        const OcrProgress(
+                phase: OcrPhase.recognizing, totalPages: 2, completed: 5)
             .fraction,
         1.0,
       );
@@ -175,7 +232,10 @@ void main() {
     test('invalid JSON returns null instead of guessing', () {
       expect(OcrSourceRef.fromJson(null), isNull);
       expect(OcrSourceRef.fromJson(<String, Object?>{'page': 1}), isNull);
-      expect(OcrSourceRef.fromJson(<String, Object?>{'documentSha256': 'x', 'page': 0}), isNull);
+      expect(
+          OcrSourceRef.fromJson(
+              <String, Object?>{'documentSha256': 'x', 'page': 0}),
+          isNull);
     });
   });
 

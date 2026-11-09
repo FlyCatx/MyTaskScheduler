@@ -60,20 +60,23 @@ void main() {
         request: request,
         pages: request.pages,
         texts: <int, String>{
-          for (final page in request.pages) page: '第 $page 页：日期 2026-11-04，工时 2.5小时',
+          for (final page in request.pages)
+            page: '第 $page 页：日期 2026-11-04，工时 2.5小时',
         },
       );
 
-    /// Bounded pump loop: the dialog shows an indeterminate progress indicator
+  /// Bounded pump loop: the dialog shows an indeterminate progress indicator
   /// while the local backend is probed, so pumpAndSettle can never settle.
   /// Pumping explicitly is both faster and deterministic.
   Future<void> settle(WidgetTester tester,
-      {Duration step = const Duration(milliseconds: 120), int maxSteps = 40}) async {
+      {Duration step = const Duration(milliseconds: 120),
+      int maxSteps = 40}) async {
     await tester.pump();
     for (var i = 0; i < maxSteps; i++) {
       await tester.pump(step);
     }
   }
+
   Future<_DialogHarness> openDialog(
     WidgetTester tester, {
     OcrPickFiles? pickFiles,
@@ -110,8 +113,8 @@ void main() {
     return harness;
   }
 
-
-  testWidgets('unavailable OCR backend explains what is missing and offers retry',
+  testWidgets(
+      'unavailable OCR backend explains what is missing and offers retry',
       (tester) async {
     fakeClient.probeResult = OcrAvailability.unavailable(
       '找不到本地 OCR 组件 ocr_host.exe。请确认安装包完整。',
@@ -140,7 +143,8 @@ void main() {
     // Configure phase: suggested range + page plan are visible.
     expect(find.byKey(const Key('ocr-detection-summary')), findsOneWidget);
     expect(find.byKey(const Key('ocr-page-plan')), findsOneWidget);
-    final spec = tester.widget<TextField>(find.byKey(const Key('ocr-page-spec')));
+    final spec =
+        tester.widget<TextField>(find.byKey(const Key('ocr-page-spec')));
     expect(spec.controller!.text, '1-3');
     expect(find.textContaining('第 1 页'), findsWidgets);
     // Start local OCR.
@@ -171,7 +175,55 @@ void main() {
     expect(find.byKey(const Key('ocr-import-dialog')), findsNothing);
   });
 
-  testWidgets('partial OCR failure lists missing pages and confirms only successes',
+  testWidgets('restore original re-inserts the untouched OCR text',
+      (tester) async {
+    fakeClient.runHandler = (request) async => completeJob(request);
+    final file = writeFile('scan.pdf', 'pdf-bytes');
+    final harness = await openDialog(
+      tester,
+      pickFiles: () async => <String>[file.path],
+    );
+    await tester.tap(find.byKey(const Key('ocr-pick-file')));
+    await settle(tester);
+    await tester.tap(find.byKey(const Key('ocr-start')));
+    await settle(tester);
+    final original = tester
+        .widget<TextField>(find.byKey(const Key('ocr-review-text-1')))
+        .controller!
+        .text;
+    await tester.enterText(
+      find.byKey(const Key('ocr-review-text-1')),
+      '人工手改内容',
+    );
+    await tester.pump();
+    expect(
+      tester
+          .widget<TextField>(find.byKey(const Key('ocr-review-text-1')))
+          .controller!
+          .text,
+      '人工手改内容',
+    );
+    // 恢复识别原文：编辑框回到原始识别文本，且该页不再算人工校对。
+    await tester.tap(find.byKey(const Key('ocr-reset-review-1')));
+    await tester.pump();
+    expect(
+      tester
+          .widget<TextField>(find.byKey(const Key('ocr-review-text-1')))
+          .controller!
+          .text,
+      original,
+    );
+    await tester.tap(find.byKey(const Key('ocr-confirm')));
+    await settle(tester);
+    await tester.tap(find.byKey(const Key('ocr-partial-confirm-accept')));
+    await settle(tester);
+    expect(harness.confirmed, isNotNull);
+    expect(harness.confirmed!.pages.first.reviewedText, isNull);
+    expect(harness.confirmed!.pages.first.originalText, original);
+  });
+
+  testWidgets(
+      'partial OCR failure lists missing pages and confirms only successes',
       (tester) async {
     fakeClient.runHandler = (request) async => OcrJobResult(
           sourcePath: request.filePath,
@@ -182,7 +234,8 @@ void main() {
             fakeJobResult(request: request, pages: <int>[1]).results.single,
           ],
           failures: const <OcrPageFailure>[
-            OcrPageFailure(page: 2, code: OcrErrorCode.ocrFailed, message: '该页没有识别出文字。'),
+            OcrPageFailure(
+                page: 2, code: OcrErrorCode.ocrFailed, message: '该页没有识别出文字。'),
           ],
           engine: 'Windows.Media.Ocr',
           engineVersion: 'Windows.Media.Ocr/test',
@@ -227,7 +280,8 @@ void main() {
             fakeJobResult(request: request, pages: <int>[1]).results.single,
           ],
           failures: const <OcrPageFailure>[
-            OcrPageFailure(page: 2, code: OcrErrorCode.ocrFailed, message: '失败'),
+            OcrPageFailure(
+                page: 2, code: OcrErrorCode.ocrFailed, message: '失败'),
             OcrPageFailure(page: 3, code: OcrErrorCode.timeout, message: '超时'),
           ],
           engine: 'Windows.Media.Ocr',
@@ -286,7 +340,8 @@ void main() {
     expect(find.byKey(const Key('ocr-start')), findsOneWidget);
   });
 
-  testWidgets('cancelling a running job keeps the dialog and reports cancellation',
+  testWidgets(
+      'cancelling a running job keeps the dialog and reports cancellation',
       (tester) async {
     final completer = Completer<OcrJobResult>();
     fakeClient.runHandler = (request) => completer.future;
@@ -306,9 +361,12 @@ void main() {
       totalPages: 3,
       requestedPages: const <int>[1, 2, 3],
       failures: const <OcrPageFailure>[
-        OcrPageFailure(page: 1, code: OcrErrorCode.cancelled, message: '识别已取消，该页未完成。'),
-        OcrPageFailure(page: 2, code: OcrErrorCode.cancelled, message: '识别已取消，该页未完成。'),
-        OcrPageFailure(page: 3, code: OcrErrorCode.cancelled, message: '识别已取消，该页未完成。'),
+        OcrPageFailure(
+            page: 1, code: OcrErrorCode.cancelled, message: '识别已取消，该页未完成。'),
+        OcrPageFailure(
+            page: 2, code: OcrErrorCode.cancelled, message: '识别已取消，该页未完成。'),
+        OcrPageFailure(
+            page: 3, code: OcrErrorCode.cancelled, message: '识别已取消，该页未完成。'),
       ],
       cancelled: true,
       engine: 'Windows.Media.Ocr',
@@ -321,7 +379,8 @@ void main() {
     expect(find.byKey(const Key('ocr-confirm')), findsOneWidget);
   });
 
-  testWidgets('missing file picker is reported instead of silently doing nothing',
+  testWidgets(
+      'missing file picker is reported instead of silently doing nothing',
       (tester) async {
     await openDialog(tester);
     expect(find.byKey(const Key('ocr-pick-file')), findsOneWidget);
@@ -354,6 +413,196 @@ void main() {
     expect(find.byKey(const Key('ocr-import-dialog')), findsOneWidget);
     expect(find.textContaining('没有被保存'), findsOneWidget);
     expect(find.byKey(const Key('ocr-confirm')), findsOneWidget);
+  });
+
+  // ------------------------------------------------------- 任务 05：帮助弹窗
+
+  testWidgets('help only explains formats; closing it keeps the dialog state',
+      (tester) async {
+    await openDialog(tester);
+    expect(find.byTooltip('使用说明'), findsOneWidget);
+
+    await tester.tap(find.byKey(const Key('ocr-help')));
+    await settle(tester);
+    expect(find.byKey(const Key('ocr-help-dialog')), findsOneWidget);
+    // 黄框正文：只有格式与提取方式。
+    expect(find.text(OcrFileSupport.helpBody), findsWidgets);
+    // 红框联网边界整段退出帮助；安装说明也不在正常帮助里常驻。
+    expect(find.byKey(const Key('ocr-help-boundary')), findsNothing);
+    expect(find.textContaining('联网边界'), findsNothing);
+    expect(find.textContaining('模型'), findsNothing);
+    expect(find.textContaining('光学字符识别'), findsNothing);
+    expect(find.textContaining('安装'), findsNothing);
+    // “知道了”用任务 02 的统一主按钮（实心主色），不是行内文字按钮。
+    final closeButton = tester.widget<FilledButton>(
+      find.byKey(const Key('ocr-help-close')),
+    );
+    expect(closeButton.style?.backgroundColor, isNotNull);
+
+    await tester.tap(find.byKey(const Key('ocr-help-close')));
+    await settle(tester);
+    expect(find.byKey(const Key('ocr-help-dialog')), findsNothing);
+    // 只关闭最上层帮助，主对话框与已选文件状态保留。
+    expect(find.byKey(const Key('ocr-import-dialog')), findsOneWidget);
+    expect(find.byKey(const Key('ocr-pick-file')), findsOneWidget);
+    expect(find.byKey(const Key('ocr-error')), findsNothing);
+    // 打开/关闭帮助不会触发本地识别或模型请求。
+    expect(fakeClient.runRequests, isEmpty);
+  });
+
+  testWidgets('help opened from the review page keeps reviewed text',
+      (tester) async {
+    fakeClient.runHandler = (request) async => completeJob(request);
+    final file = writeFile('scan.pdf', 'pdf-bytes');
+    await openDialog(tester, pickFiles: () async => <String>[file.path]);
+    await tester.tap(find.byKey(const Key('ocr-pick-file')));
+    await settle(tester);
+    await tester.tap(find.byKey(const Key('ocr-start')));
+    await settle(tester);
+    await tester.enterText(
+      find.byKey(const Key('ocr-review-text-1')),
+      '人工校对后的第一页',
+    );
+    await tester.pump();
+
+    await tester.tap(find.byKey(const Key('ocr-help')));
+    await settle(tester);
+    expect(find.byKey(const Key('ocr-help-dialog')), findsOneWidget);
+    await tester.tap(find.byKey(const Key('ocr-help-close')));
+    await settle(tester);
+
+    expect(find.byKey(const Key('ocr-help-dialog')), findsNothing);
+    final reviewed = tester.widget<TextField>(
+      find.byKey(const Key('ocr-review-text-1')),
+    );
+    expect(reviewed.controller!.text, '人工校对后的第一页');
+    expect(find.byKey(const Key('ocr-review-text-3')), findsOneWidget);
+  });
+
+  // ------------------------------------------- 任务 05：缺少识别语言的失败状态
+
+  testWidgets('missing OCR language shows the verified settings path',
+      (tester) async {
+    fakeClient.probeResult = OcrAvailability(
+      available: false,
+      hostPath: fakeHostLocation().path,
+      languages: const <OcrLanguage>[],
+      problem: '本机没有安装任何 OCR 识别语言组件。',
+      languagePackMissing: true,
+      checkedAt: DateTime.now(),
+    );
+    await openDialog(tester);
+    expect(find.byKey(const Key('ocr-import-dialog')), findsOneWidget);
+    // 具体原因 + 已核实的系统设置路径 + 当下操作。
+    expect(find.textContaining('没有安装任何 OCR 识别语言组件'), findsWidgets);
+    expect(find.byKey(const Key('ocr-language-install-guide')), findsOneWidget);
+    expect(find.byKey(const Key('ocr-language-install-path')), findsOneWidget);
+    expect(find.textContaining('时间和语言'), findsWidgets);
+    expect(find.textContaining('光学字符识别'), findsWidgets);
+    expect(find.textContaining('重新检查'), findsWidgets);
+    expect(find.byKey(const Key('ocr-retry-availability')), findsOneWidget);
+  });
+
+  testWidgets('other OCR failures do not show language install instructions',
+      (tester) async {
+    fakeClient.probeResult = OcrAvailability.unavailable(
+      '找不到本地 OCR 组件 ocr_host.exe。请确认安装包完整。',
+      hostPath: fakeHostLocation().path,
+    );
+    await openDialog(tester);
+    expect(find.byKey(const Key('ocr-language-install-guide')), findsNothing);
+    expect(find.textContaining('光学字符识别'), findsNothing);
+  });
+
+  testWidgets('job-level missing language shows the install guide',
+      (tester) async {
+    fakeClient.runHandler = (request) async => OcrJobResult(
+          sourcePath: request.filePath,
+          sourceKind: request.kind.wire,
+          totalPages: 1,
+          requestedPages: request.pages,
+          failures: const <OcrPageFailure>[
+            OcrPageFailure(
+              page: 1,
+              code: OcrErrorCode.noLanguage,
+              message: '本机没有该语言的 OCR 识别组件。',
+            ),
+          ],
+          engine: 'Windows.Media.Ocr',
+          engineVersion: 'Windows.Media.Ocr/test',
+          dpi: request.dpi,
+          jobError: const OcrError(
+            code: OcrErrorCode.noLanguage,
+            message: '请求的语言在本机没有可用的 OCR 识别组件。',
+          ),
+        );
+    final file = writeFile('scan.pdf', 'pdf-bytes');
+    await openDialog(tester, pickFiles: () async => <String>[file.path]);
+    await tester.tap(find.byKey(const Key('ocr-pick-file')));
+    await settle(tester);
+    await tester.tap(find.byKey(const Key('ocr-start')));
+    await settle(tester);
+    expect(find.byKey(const Key('ocr-language-install-guide')), findsOneWidget);
+    expect(find.textContaining('时间和语言'), findsWidgets);
+    expect(find.textContaining('光学字符识别'), findsWidgets);
+  });
+
+  // ------------------------------------------------ 任务 06：格式范围与入口校验
+
+  testWidgets('OCR accepts uppercase .PDF and .JPG extensions', (tester) async {
+    final pdf = writeFile('SCAN.PDF', 'pdf-bytes');
+    await openDialog(tester, pickFiles: () async => <String>[pdf.path]);
+    await tester.tap(find.byKey(const Key('ocr-pick-file')));
+    await settle(tester);
+    expect(find.byKey(const Key('ocr-detection-summary')), findsOneWidget);
+    expect(find.byKey(const Key('ocr-error')), findsNothing);
+
+    await tester.tap(find.byKey(const Key('ocr-dialog-close')));
+    await settle(tester);
+
+    final jpg = writeFile('PHOTO.JPG', 'jpg-bytes');
+    await openDialog(tester, pickFiles: () async => <String>[jpg.path]);
+    await tester.tap(find.byKey(const Key('ocr-pick-file')));
+    await settle(tester);
+    expect(find.byKey(const Key('ocr-page-plan')), findsOneWidget);
+    expect(find.byKey(const Key('ocr-error')), findsNothing);
+  });
+
+  for (final name in <String>['notes.txt', 'report.docx', 'calendar.ics']) {
+    testWidgets('OCR rejects $name returned by the native dialog',
+        (tester) async {
+      final file = writeFile(name, 'not-an-ocr-source');
+      await openDialog(tester, pickFiles: () async => <String>[file.path]);
+      await tester.tap(find.byKey(const Key('ocr-pick-file')));
+      await settle(tester);
+      expect(find.byKey(const Key('ocr-error')), findsOneWidget);
+      expect(find.textContaining('仅支持 PDF、PNG、JPG、JPEG'), findsOneWidget);
+      // 拒绝发生在应用入口：不会交给识别器，也不会触发模型请求。
+      expect(fakeClient.runRequests, isEmpty);
+      expect(find.byKey(const Key('ocr-detection-summary')), findsNothing);
+    });
+  }
+
+  testWidgets('cancelling the picker after results keeps the reviewed pages',
+      (tester) async {
+    fakeClient.runHandler = (request) async => completeJob(request);
+    var picks = 0;
+    final file = writeFile('scan.pdf', 'pdf-bytes');
+    await openDialog(tester, pickFiles: () async {
+      picks++;
+      return picks == 1 ? <String>[file.path] : const <String>[];
+    });
+    await tester.tap(find.byKey(const Key('ocr-pick-file')));
+    await settle(tester);
+    await tester.tap(find.byKey(const Key('ocr-start')));
+    await settle(tester);
+    expect(find.byKey(const Key('ocr-review-text-1')), findsOneWidget);
+
+    await tester.tap(find.byKey(const Key('ocr-pick-file')));
+    await settle(tester);
+    expect(find.byKey(const Key('ocr-review-text-1')), findsOneWidget);
+    expect(find.byKey(const Key('ocr-review-text-3')), findsOneWidget);
+    expect(find.byKey(const Key('ocr-error')), findsNothing);
   });
 }
 
